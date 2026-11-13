@@ -1,15 +1,23 @@
-use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::{
     Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::Line,
     widgets::{Block, Paragraph},
 };
 
-use crate::model::{Entry, EntryId, Snapshot, Status, display_text, plain};
+use crate::model::{Entry, EntryId, Snapshot, Status, display_text};
+
+mod list;
+mod presentation;
+use list::{Group, GroupBy, GroupKey, groups, matching_indices};
+use presentation::{
+    COLUMN_LABELS, clip_text, columns, compact_line, home_path, measure_columns, shortcuts,
+    status_color, status_text, wrap_details,
+};
 
 #[derive(Debug)]
 pub enum Action {
@@ -22,57 +30,21 @@ struct HitRegion {
     entry: Entry,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum GroupBy {
-    #[default]
-    None,
-    Agent,
-    Status,
-    Cwd,
-    Session,
+struct GroupHit {
+    area: Rect,
+    key: GroupKey,
 }
 
-impl GroupBy {
-    fn next(self) -> Self {
-        match self {
-            Self::None => Self::Agent,
-            Self::Agent => Self::Status,
-            Self::Status => Self::Cwd,
-            Self::Cwd => Self::Session,
-            Self::Session => Self::None,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::None => "None",
-            Self::Agent => "Agent",
-            Self::Status => "Status",
-            Self::Cwd => "CWD",
-            Self::Session => "Session",
-        }
-    }
-
-    fn compare(self, a: &Entry, b: &Entry) -> Ordering {
-        match self {
-            Self::None => Ordering::Equal,
-            Self::Agent => a.id.agent.cmp(&b.id.agent),
-            Self::Status => a.status.cmp(&b.status),
-            Self::Cwd => (a.working_dir.is_none(), &a.working_dir)
-                .cmp(&(b.working_dir.is_none(), &b.working_dir)),
-            Self::Session => {
-                (&a.location.session, &a.id.session).cmp(&(&b.location.session, &b.id.session))
-            }
-        }
-    }
-
-    fn sort(self, snapshot: &mut Snapshot) {
-        snapshot.sort();
-        if !matches!(self, Self::None | Self::Status) {
-            // Stable sorting keeps status priority, location, and identity order within each group.
-            snapshot.entries.sort_by(|a, b| self.compare(a, b));
-        }
-    }
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ListRow {
+    Agent(usize),
+    Header {
+        key: GroupKey,
+        label: String,
+        first: usize,
+        count: usize,
+        collapsed: bool,
+    },
 }
 
 /// View and input state only. The caller supplies snapshots and runs navigation.
@@ -82,26 +54,48 @@ pub struct App {
     pub message: String,
     pub connected: bool,
     pub navigating: bool,
+    pub client: Option<String>,
+    pub diagnostic: String,
     group_by: GroupBy,
+    collapsed: BTreeSet<GroupKey>,
+    query: String,
+    filter_edit: Option<String>,
     selected: Option<EntryId>,
     selection_missing: bool,
     received_snapshot: bool,
     scroll: usize,
     reveal_selection: bool,
     details: bool,
+    help: bool,
     details_scroll: usize,
     details_limit: usize,
     viewport: Rect,
     hits: Vec<HitRegion>,
+    group_hits: Vec<GroupHit>,
 }
 
 impl App {
-    /// Use this method for updates so that clicks cannot use an old list layout.
     pub fn replace_snapshot(&mut self, mut snapshot: Snapshot) {
-        self.group_by.sort(&mut snapshot);
-        self.hits.clear();
         let old_row = self.selected_row();
+        self.group_by.sort(&mut snapshot);
+        self.clear_hits();
         self.snapshot = snapshot;
+        let keys: BTreeSet<_> = self
+            .snapshot
+            .entries
+            .iter()
+            .flat_map(|entry| {
+                [
+                    GroupBy::Agent,
+                    GroupBy::Status,
+                    GroupBy::Cwd,
+                    GroupBy::Session,
+                ]
+                .into_iter()
+                .filter_map(|mode| mode.key(entry))
+            })
+            .collect();
+        self.collapsed.retain(|key| keys.contains(key));
         if self.selection_missing || (self.selected.is_some() && self.selected_index().is_none()) {
             self.selection_removed();
         } else if !self.received_snapshot {
@@ -111,96 +105,167 @@ impl App {
         self.received_snapshot = true;
     }
 
+    fn clear_hits(&mut self) {
+        self.hits.clear();
+        self.group_hits.clear();
+    }
+
     pub fn discard_redraw_click(&mut self) {
-        if !self.details {
+        if !self.details && !self.help {
             self.message = "List redrawn; click again to select the displayed row".into();
         }
     }
 
     pub fn handle_event(&mut self, event: Event) -> Option<Action> {
-        // Resolve clicks from the last draw, never from a newly sorted row index.
-        let clicked = match &event {
-            Event::Mouse(mouse)
-                if !self.details && mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
+        if let Event::Key(key) = &event {
+            if key.kind == KeyEventKind::Release {
+                return None;
+            }
+            if matches!(key.code, KeyCode::Char('c' | 'C'))
+                && key.modifiers.contains(KeyModifiers::CONTROL)
             {
-                self.hits
-                    .iter()
-                    .find(|hit| contains(hit.area, mouse.column, mouse.row))
-                    .map(|hit| hit.entry.clone())
+                return Some(Action::Quit);
             }
-            _ => None,
-        };
-        // Preserve targets for motion, release, and other non-mutating input.
-        // Selection, scroll, and resize need a draw before another click.
-        let invalidates = match &event {
-            Event::Key(key) => {
-                key.kind != KeyEventKind::Release
-                    && match key.code {
-                        KeyCode::Up | KeyCode::Down | KeyCode::Enter => true,
-                        KeyCode::Char('g') => !self.details,
-                        KeyCode::Tab | KeyCode::BackTab => {
-                            !self.details && self.group_by != GroupBy::None
-                        }
-                        _ => false,
+            if self.filter_edit.is_some() {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.query = self.filter_edit.take().unwrap_or_default();
+                        self.filter_changed();
                     }
+                    KeyCode::Enter => {
+                        self.filter_edit = None;
+                        self.clear_hits();
+                    }
+                    KeyCode::Backspace => {
+                        let length = ratatui::text::Span::raw(self.query.as_str())
+                            .styled_graphemes(Style::default())
+                            .last()
+                            .map_or(0, |g| g.symbol.len());
+                        self.query.truncate(self.query.len().saturating_sub(length));
+                        self.filter_changed();
+                    }
+                    KeyCode::Char(c)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        if self.query.chars().count() < 256 && !c.is_control() {
+                            self.query.push(c);
+                            self.filter_changed();
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Down => {
+                        self.clear_hits();
+                        self.move_selection(key.code == KeyCode::Down);
+                    }
+                    _ => {}
+                }
+                return None;
             }
-            Event::Mouse(mouse) => matches!(
-                mouse.kind,
-                MouseEventKind::Down(MouseButton::Left)
-                    | MouseEventKind::ScrollDown
-                    | MouseEventKind::ScrollUp
-            ),
-            Event::Resize(_, _) => true,
-            _ => false,
-        };
-        if invalidates {
-            self.hits.clear();
-        }
-
-        match event {
-            Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
-                KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    Some(Action::Quit)
+            if self.details || self.help {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.close_overlay(),
+                    KeyCode::Char('w') if self.details => self.close_overlay(),
+                    KeyCode::Char('?') if self.help => self.close_overlay(),
+                    KeyCode::Up | KeyCode::Down => {
+                        self.scroll_details(key.code == KeyCode::Down, 1)
+                    }
+                    KeyCode::PageUp | KeyCode::PageDown => self.scroll_details(
+                        key.code == KeyCode::PageDown,
+                        usize::from(self.viewport.height).max(1),
+                    ),
+                    _ => {}
                 }
-                KeyCode::Esc if self.details => {
-                    self.toggle_details();
+                return None;
+            }
+            let mutating = matches!(
+                key.code,
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Enter
+                    | KeyCode::Char('j' | 'k' | 'g' | 'G' | 'a' | 'A' | '/' | '?' | 'w')
+            ) || (self.group_by != GroupBy::None
+                && matches!(key.code, KeyCode::Tab | KeyCode::BackTab));
+            if mutating {
+                self.clear_hits();
+            }
+            return match key.code {
+                KeyCode::Char('q') => Some(Action::Quit),
+                KeyCode::Esc if !self.query.is_empty() => {
+                    self.query.clear();
+                    self.filter_changed();
                     None
                 }
-                KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
-                KeyCode::Char('w') => {
-                    self.toggle_details();
+                KeyCode::Esc => Some(Action::Quit),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.move_selection(false);
                     None
                 }
-                KeyCode::Char('g') if !self.details => {
-                    self.group_by = self.group_by.next();
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.move_selection(true);
+                    None
+                }
+                KeyCode::Char('g' | 'G') => {
+                    self.group_by = if key.code == KeyCode::Char('G') {
+                        self.group_by.previous()
+                    } else {
+                        self.group_by.next()
+                    };
                     self.group_by.sort(&mut self.snapshot);
                     self.reveal_selection = true;
                     None
                 }
-                KeyCode::Tab | KeyCode::BackTab if !self.details => {
+                KeyCode::Tab | KeyCode::BackTab => {
                     self.move_group(key.code == KeyCode::Tab);
                     None
                 }
-                KeyCode::Up | KeyCode::Down if self.details => {
-                    self.scroll_details(key.code == KeyCode::Down, 1);
+                KeyCode::Left | KeyCode::Right => {
+                    self.fold_selected(key.code == KeyCode::Left);
                     None
                 }
-                KeyCode::Up => {
-                    self.move_selection(false);
+                KeyCode::Char('a' | 'A') => {
+                    self.move_attention(key.code == KeyCode::Char('a'));
                     None
                 }
-                KeyCode::Down => {
-                    self.move_selection(true);
+                KeyCode::Char('/') => {
+                    self.filter_edit = Some(self.query.clone());
                     None
                 }
-                KeyCode::Enter if !self.details => self.navigate_selected(),
+                KeyCode::Char('?') => {
+                    self.help = true;
+                    self.reset_overlay();
+                    None
+                }
+                KeyCode::Char('w') => {
+                    self.toggle_details();
+                    None
+                }
+                KeyCode::Enter => self.navigate_selected(),
                 _ => None,
-            },
-            Event::Mouse(mouse) if self.details => {
-                if matches!(
-                    mouse.kind,
-                    MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
-                ) && contains(self.viewport, mouse.column, mouse.row)
+            };
+        }
+        if let Event::Paste(value) = &event {
+            if self.filter_edit.is_some() {
+                let remaining = 256usize.saturating_sub(self.query.chars().count());
+                let value: String = value
+                    .chars()
+                    .map(|c| if c.is_whitespace() { ' ' } else { c })
+                    .collect();
+                self.query
+                    .extend(display_text(&value).chars().take(remaining));
+                self.filter_changed();
+            }
+            return None;
+        }
+        match event {
+            Event::Mouse(mouse) if self.details || self.help => {
+                if contains(self.viewport, mouse.column, mouse.row)
+                    && matches!(
+                        mouse.kind,
+                        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                    )
                 {
                     self.scroll_details(mouse.kind == MouseEventKind::ScrollDown, 3);
                 }
@@ -208,6 +273,23 @@ impl App {
             }
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
+                    let group = self
+                        .group_hits
+                        .iter()
+                        .find(|hit| contains(hit.area, mouse.column, mouse.row))
+                        .map(|hit| hit.key.clone());
+                    let clicked = self
+                        .hits
+                        .iter()
+                        .find(|hit| contains(hit.area, mouse.column, mouse.row))
+                        .map(|hit| hit.entry.clone());
+                    self.clear_hits();
+                    if let Some(key) = group {
+                        if self.current_groups().iter().any(|group| group.key == key) {
+                            self.toggle_group(key);
+                        }
+                        return None;
+                    }
                     let entry = clicked?;
                     if !self.snapshot.entries.contains(&entry) {
                         self.message =
@@ -216,12 +298,14 @@ impl App {
                     }
                     self.selected = Some(entry.id);
                     self.selection_missing = false;
+                    self.filter_edit = None;
                     self.message.clear();
                     self.navigate_selected()
                 }
                 MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
                     if contains(self.viewport, mouse.column, mouse.row) =>
                 {
+                    self.clear_hits();
                     let limit = self
                         .list_rows()
                         .len()
@@ -231,15 +315,15 @@ impl App {
                     } else {
                         self.scroll.saturating_sub(3).min(limit)
                     };
-                    // Scrolling does not choose a navigation target.
                     self.reveal_selection = false;
                     None
                 }
                 _ => None,
             },
             Event::Resize(_, _) => {
+                self.clear_hits();
                 self.viewport = Rect::default();
-                if !self.details {
+                if !self.details && !self.help {
                     self.reveal_selection = true;
                 }
                 None
@@ -248,281 +332,39 @@ impl App {
         }
     }
 
-    pub fn draw(&mut self, frame: &mut Frame) {
-        self.hits.clear();
-        self.viewport = Rect::default();
-        let area = frame.area();
-        if area.width == 0 || area.height == 0 {
-            self.details_limit = 0;
-            return;
-        }
-        self.group_by.sort(&mut self.snapshot);
-        if self.selected.is_some() && self.selected_index().is_none() {
-            self.selection_removed();
-        }
-        if self.details {
-            self.draw_details(frame);
-            return;
-        }
-
-        // Keep the status and help visible. Omit headings in very short views.
-        let title_height = u16::from(area.height >= 4);
-        let header_height = if area.height >= 6 {
-            2
-        } else {
-            u16::from(area.height >= 5)
-        };
-        let footer_height = area.height.min(2);
-        let body = Rect::new(
-            area.x,
-            area.y + title_height + header_height,
-            area.width,
-            area.height - title_height - header_height - footer_height,
-        );
-        self.viewport = body;
-        let height = usize::from(body.height);
-        let rows = self.list_rows();
-        self.scroll = self.scroll.min(rows.len().saturating_sub(height));
-        if height > 0 && self.reveal_selection {
-            if let Some(index) = self.selected_row() {
-                if index < self.scroll {
-                    self.scroll = index;
-                } else if index >= self.scroll + height {
-                    self.scroll = index + 1 - height;
-                }
-            }
-            self.reveal_selection = false;
-        }
-
-        if title_height > 0 {
-            let count = self.snapshot.entries.len();
-            let mut visible = rows
-                .iter()
-                .skip(self.scroll)
-                .take(height)
-                .filter_map(|row| *row);
-            let first = visible.next().map_or(0, |index| index + 1);
-            let last = visible.next_back().map_or(first, |index| index + 1);
-            let grouping = if self.group_by == GroupBy::None {
-                String::new()
-            } else {
-                format!("Group by: {} | ", self.group_by.label())
-            };
-            frame.render_widget(
-                Paragraph::new(format!(
-                    "brachio | {grouping}{count} agents | {first}-{last}"
-                ))
-                .style(Style::default().add_modifier(Modifier::BOLD)),
-                Rect::new(area.x, area.y, area.width, 1),
-            );
-        }
-        if header_height > 0 {
-            let header = Rect::new(area.x, area.y + title_height, area.width, 1);
-            let [_, name, status, directory, session, tab, pane] = columns(header);
-            let style = Style::default().add_modifier(Modifier::BOLD);
-            frame.render_widget(Paragraph::new("Agent").style(style), name);
-            frame.render_widget(Paragraph::new("Status").style(style), status);
-            for (label, column) in [
-                ("Working directory", directory),
-                ("Session", session),
-                ("Tab", tab),
-                ("Pane", pane),
-            ] {
-                frame.render_widget(Paragraph::new(label).style(style), column);
-            }
-            if header_height == 2 {
-                frame.render_widget(
-                    Paragraph::new("─".repeat(usize::from(area.width)))
-                        .style(Style::default().fg(Color::DarkGray)),
-                    Rect::new(area.x, header.y + 1, area.width, 1),
-                );
-            }
-        }
-
-        if self.snapshot.entries.is_empty() {
-            frame.render_widget(Paragraph::new("No agents with reported status."), body);
-        } else {
-            for (row, index) in rows.iter().skip(self.scroll).take(height).enumerate() {
-                let row_area = Rect::new(body.x, body.y + row as u16, body.width, 1);
-                let Some(index) = index else {
-                    continue;
-                };
-                let entry = &self.snapshot.entries[*index];
-                let selected = self.selected.as_ref() == Some(&entry.id);
-                let style = if selected {
-                    Style::default().bg(Color::DarkGray).fg(Color::White)
-                } else {
-                    Style::default()
-                };
-                frame.render_widget(Block::default().style(style), row_area);
-                let [marker, name, status, directory, session, tab, pane] = columns(row_area);
-                frame.render_widget(
-                    Paragraph::new(if selected { ">" } else { " " }).style(style),
-                    marker,
-                );
-                // Separate clipped columns keep long Unicode names off the status/location.
-                frame.render_widget(
-                    Paragraph::new(clip_text(&entry.name, name.width, false)).style(style),
-                    name,
-                );
-                frame.render_widget(
-                    Paragraph::new(entry.status.label())
-                        .style(style.fg(status_color(entry.status))),
-                    status,
-                );
-                frame.render_widget(
-                    Paragraph::new(clip_text(
-                        entry.working_dir.as_deref().unwrap_or("Unknown"),
-                        directory.width,
-                        true,
-                    ))
-                    .style(style),
-                    directory,
-                );
-                for (label, column) in [
-                    (&entry.location.session, session),
-                    (&entry.location.tab, tab),
-                    (&entry.location.pane, pane),
-                ] {
-                    frame.render_widget(
-                        Paragraph::new(clip_text(label, column.width, false)).style(style),
-                        column,
-                    );
-                }
-                self.hits.push(HitRegion {
-                    area: row_area,
-                    entry: entry.clone(),
-                });
-            }
-        }
-
-        if footer_height == 2 {
-            let group_keys = if self.group_by == GroupBy::None {
-                ""
-            } else {
-                "Tab/Shift+Tab jump | "
-            };
-            frame.render_widget(
-                Paragraph::new(format!(
-                    "↑↓ select | g view | {group_keys}Enter/click | w details | q/Esc/Ctrl-C"
-                )),
-                Rect::new(area.x, area.bottom() - 2, area.width, 1),
-            );
-        }
-        let (status, color) = self.footer();
-        frame.render_widget(
-            Paragraph::new(status).style(Style::default().fg(color)),
-            Rect::new(area.x, area.bottom() - 1, area.width, 1),
-        );
+    fn filter_changed(&mut self) {
+        self.clear_hits();
+        self.scroll = 0;
+        self.reveal_selection = true;
     }
 
-    fn toggle_details(&mut self) {
-        self.details = !self.details;
-        self.details_scroll = 0;
-        self.details_limit = 0;
-        self.viewport = Rect::default();
-        self.hits.clear();
+    fn current_groups(&self) -> Vec<Group> {
+        groups(&self.snapshot, self.group_by, &self.query)
     }
 
-    fn scroll_details(&mut self, down: bool, amount: usize) {
-        self.details_scroll = if down {
-            self.details_scroll.saturating_add(amount)
-        } else {
-            self.details_scroll.saturating_sub(amount)
+    fn list_rows(&self) -> Vec<ListRow> {
+        let groups = self.current_groups();
+        if groups.len() < 2 {
+            return matching_indices(&self.snapshot, &self.query)
+                .into_iter()
+                .map(ListRow::Agent)
+                .collect();
         }
-        .min(self.details_limit);
-    }
-
-    fn draw_details(&mut self, frame: &mut Frame) {
-        let area = frame.area();
-        let title_height = u16::from(area.height >= 3);
-        let body = Rect::new(
-            area.x,
-            area.y + title_height,
-            area.width,
-            area.height - title_height - 1,
-        );
-        self.viewport = body;
-        let message = display_text(&self.message);
-        let mut lines = wrap_details(
-            &format!(
-                "Message: {}",
-                if message.is_empty() {
-                    "No current message."
-                } else {
-                    &message
-                }
-            ),
-            body.width,
-        );
-        lines.push(Line::raw(""));
-        lines.extend(wrap_details(
-            &format!("Warnings: {}", self.snapshot.warnings.len()),
-            body.width,
-        ));
-        if self.snapshot.warnings.is_empty() {
-            lines.extend(wrap_details("No snapshot warnings.", body.width));
-        } else {
-            for (index, warning) in self.snapshot.warnings.iter().enumerate() {
-                lines.extend(wrap_details(
-                    &format!("{}. {}", index + 1, display_text(warning)),
-                    body.width,
-                ));
+        let mut rows = Vec::new();
+        for group in groups {
+            let collapsed = self.collapsed.contains(&group.key);
+            rows.push(ListRow::Header {
+                key: group.key,
+                label: group.label,
+                first: group.entries[0],
+                count: group.entries.len(),
+                collapsed,
+            });
+            if !collapsed {
+                rows.extend(group.entries.into_iter().map(ListRow::Agent));
             }
         }
-        if let Some(index) = self.selected_index() {
-            let entry = &self.snapshot.entries[index];
-            lines.push(Line::raw(""));
-            for (label, value) in [
-                ("Agent", entry.name.as_str()),
-                (
-                    "Working directory",
-                    entry.working_dir.as_deref().unwrap_or("Unknown"),
-                ),
-                ("Session", entry.location.session.as_ref()),
-                ("Tab", entry.location.tab.as_ref()),
-                ("Pane", entry.location.pane.as_ref()),
-                ("Session ID", entry.target.session.as_str()),
-                ("Tab ID", entry.target.window.as_str()),
-                ("Pane ID", entry.target.block.as_str()),
-            ] {
-                lines.extend(wrap_details(
-                    &format!("{label}: {}", display_text(value)),
-                    body.width,
-                ));
-            }
-        }
-        let count = lines.len();
-        let height = usize::from(body.height);
-        self.details_limit = count.saturating_sub(height);
-        self.details_scroll = self.details_scroll.min(self.details_limit);
-        if title_height > 0 {
-            let first = if height == 0 {
-                0
-            } else {
-                self.details_scroll + 1
-            };
-            let last = (self.details_scroll + height).min(count);
-            frame.render_widget(
-                Paragraph::new(format!("brachio | Details | lines {first}-{last}/{count}"))
-                    .style(Style::default().add_modifier(Modifier::BOLD)),
-                Rect::new(area.x, area.y, area.width, 1),
-            );
-        }
-        frame.render_widget(
-            Paragraph::new(
-                lines
-                    .into_iter()
-                    .skip(self.details_scroll)
-                    .take(height)
-                    .collect::<Vec<_>>(),
-            ),
-            body,
-        );
-        frame.render_widget(
-            Paragraph::new("↑/↓/Wheel scroll | Esc/w back | q/Ctrl-C quit"),
-            Rect::new(area.x, area.bottom() - 1, area.width, 1),
-        );
+        rows
     }
 
     fn selected_index(&self) -> Option<usize> {
@@ -533,32 +375,49 @@ impl App {
             .position(|entry| &entry.id == selected)
     }
 
-    fn is_group_start(&self, index: usize) -> bool {
-        index == 0
-            || self.group_by.compare(
-                &self.snapshot.entries[index - 1],
-                &self.snapshot.entries[index],
-            ) != Ordering::Equal
-    }
-
-    /// None is a blank row between groups, never a selectable or clickable agent.
-    fn list_rows(&self) -> Vec<Option<usize>> {
-        let mut rows = Vec::new();
-        for index in 0..self.snapshot.entries.len() {
-            if index > 0 && self.is_group_start(index) {
-                rows.push(None);
-            }
-            rows.push(Some(index));
-        }
-        rows
-    }
-
     fn selected_row(&self) -> Option<usize> {
         let index = self.selected_index()?;
-        let separators = (1..=index)
-            .filter(|&index| self.is_group_start(index))
-            .count();
-        Some(index + separators)
+        let key = self.group_by.key(&self.snapshot.entries[index]);
+        let matches = matching_indices(&self.snapshot, &self.query);
+        if !matches.contains(&index) {
+            return None;
+        }
+        self.list_rows().iter().position(|row| match row {
+            ListRow::Agent(other) => *other == index,
+            ListRow::Header {
+                key: group,
+                collapsed: true,
+                ..
+            } => Some(group) == key.as_ref(),
+            _ => false,
+        })
+    }
+
+    fn selected_group(&self) -> Option<GroupKey> {
+        self.selected_row()?;
+        let index = self.selected_index()?;
+        self.group_by.key(&self.snapshot.entries[index])
+    }
+
+    fn fold_selected(&mut self, collapse: bool) {
+        if self.current_groups().len() < 2 {
+            return;
+        }
+        if let Some(key) = self.selected_group() {
+            if collapse {
+                self.collapsed.insert(key);
+            } else {
+                self.collapsed.remove(&key);
+            }
+            self.reveal_selection = true;
+        }
+    }
+
+    fn toggle_group(&mut self, key: GroupKey) {
+        if !self.collapsed.remove(&key) {
+            self.collapsed.insert(key);
+        }
+        self.reveal_selection = true;
     }
 
     fn selection_removed(&mut self) {
@@ -569,47 +428,93 @@ impl App {
     }
 
     fn move_selection(&mut self, down: bool) {
-        let count = self.snapshot.entries.len();
-        if count == 0 {
-            self.selected = None;
-            self.scroll = 0;
+        let rows = self.list_rows();
+        let targets: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, value)| match value {
+                ListRow::Agent(index)
+                | ListRow::Header {
+                    first: index,
+                    collapsed: true,
+                    ..
+                } => Some((row, *index)),
+                _ => None,
+            })
+            .collect();
+        if targets.is_empty() {
             return;
         }
-        let next = match self.selected_index() {
-            Some(index) if down => (index + 1).min(count - 1),
+        let current = self
+            .selected_row()
+            .and_then(|row| targets.iter().position(|target| target.0 == row));
+        let next = match current {
+            Some(index) if down => (index + 1).min(targets.len() - 1),
             Some(index) => index.saturating_sub(1),
             None if down => 0,
-            None => count - 1,
+            None => targets.len() - 1,
         };
-        self.select_index(next);
+        if current == Some(next) {
+            // A bounded arrow must not replace a collapsed group's retained member.
+            self.reveal_selection = true;
+            return;
+        }
+        self.select_index(targets[next].1);
     }
 
     fn move_group(&mut self, forward: bool) {
         if self.group_by == GroupBy::None {
             return;
         }
-        let entries = &self.snapshot.entries;
-        if entries.is_empty() {
-            self.selected = None;
-            self.scroll = 0;
+        let groups = self.current_groups();
+        if groups.is_empty() {
             return;
         }
-        let starts: Vec<_> = (0..entries.len())
-            .filter(|&index| self.is_group_start(index))
-            .collect();
-        let next = match self.selected_index() {
-            Some(index) => {
-                let group = starts.partition_point(|&start| start <= index) - 1;
-                if forward {
-                    (group + 1) % starts.len()
-                } else {
-                    (group + starts.len() - 1) % starts.len()
-                }
-            }
+        let current = self
+            .selected_group()
+            .and_then(|key| groups.iter().position(|group| group.key == key));
+        let next = match current {
+            Some(index) if forward => (index + 1) % groups.len(),
+            Some(index) => (index + groups.len() - 1) % groups.len(),
             None if forward => 0,
-            None => starts.len() - 1,
+            None => groups.len() - 1,
         };
-        self.select_index(starts[next]);
+        self.select_index(groups[next].entries[0]);
+    }
+
+    fn move_attention(&mut self, forward: bool) {
+        let indices: Vec<_> = matching_indices(&self.snapshot, &self.query)
+            .into_iter()
+            .filter(|&index| {
+                matches!(
+                    self.snapshot.entries[index].status,
+                    Status::Blocked | Status::Error
+                )
+            })
+            .collect();
+        if indices.is_empty() {
+            self.message = "No matching Blocked or Error agents.".into();
+            return;
+        }
+        let current = self.selected_index();
+        let index = if forward {
+            indices
+                .iter()
+                .copied()
+                .find(|index| current.is_none_or(|current| *index > current))
+                .unwrap_or(indices[0])
+        } else {
+            indices
+                .iter()
+                .copied()
+                .rev()
+                .find(|index| current.is_none_or(|current| *index < current))
+                .unwrap_or(*indices.last().unwrap())
+        };
+        if let Some(key) = self.group_by.key(&self.snapshot.entries[index]) {
+            self.collapsed.remove(&key);
+        }
+        self.select_index(index);
     }
 
     fn select_index(&mut self, index: usize) {
@@ -620,6 +525,22 @@ impl App {
     }
 
     fn navigate_selected(&mut self) -> Option<Action> {
+        if let Some(row) = self.selected_row() {
+            if let ListRow::Header {
+                key,
+                collapsed: true,
+                ..
+            } = &self.list_rows()[row]
+            {
+                self.collapsed.remove(key);
+                self.clear_hits();
+                self.reveal_selection = true;
+                return None;
+            }
+        } else if self.selected_index().is_some() {
+            self.message = "Selected agent is hidden by the filter. Clear the filter or select a visible agent.".into();
+            return None;
+        }
         if !self.connected {
             self.message = "Rex is disconnected; navigation is disabled.".into();
             return None;
@@ -642,1676 +563,461 @@ impl App {
         Some(Action::Navigate(Box::new(entry)))
     }
 
-    fn footer(&self) -> (String, Color) {
+    pub fn draw(&mut self, frame: &mut Frame) {
+        self.clear_hits();
+        self.viewport = Rect::default();
+        let area = frame.area();
+        if area.width == 0 || area.height == 0 {
+            self.details_limit = 0;
+            return;
+        }
+        self.group_by.sort(&mut self.snapshot);
+        if self.selected.is_some() && self.selected_index().is_none() {
+            self.selection_removed();
+        }
+        if self.details {
+            self.draw_details(frame);
+            return;
+        }
+        if self.help {
+            self.draw_help(frame);
+            return;
+        }
+        let title_height = u16::from(area.height >= 4);
+        let header_height = if area.height >= 6 {
+            2
+        } else {
+            u16::from(area.height >= 5)
+        };
+        let footer_height = area.height.min(2);
+        let body = Rect::new(
+            area.x,
+            area.y + title_height + header_height,
+            area.width,
+            area.height - title_height - header_height - footer_height,
+        );
+        self.viewport = body;
+        let height = usize::from(body.height);
+        let rows = self.list_rows();
+        let headers = self.current_groups().len() >= 2;
+        let mut hidden = [false; 6];
+        if headers {
+            match self.group_by {
+                GroupBy::None => {}
+                GroupBy::Status => hidden[0] = true,
+                GroupBy::Agent => hidden[1] = true,
+                GroupBy::Cwd => hidden[2] = true,
+                GroupBy::Session => hidden[3] = true,
+            }
+        }
+        let selected_row = self.selected_row();
+        self.scroll = self.scroll.min(rows.len().saturating_sub(height));
+        if height > 0 && self.reveal_selection {
+            if let Some(index) = selected_row {
+                if index < self.scroll {
+                    self.scroll = index;
+                } else if index >= self.scroll + height {
+                    self.scroll = index + 1 - height;
+                }
+            }
+            self.reveal_selection = false;
+        }
+        let matching = matching_indices(&self.snapshot, &self.query);
+        let home = std::env::var("HOME").ok();
+        let measured = measure_columns(
+            matching.iter().map(|&index| &self.snapshot.entries[index]),
+            home.as_deref(),
+        );
+        let layout = columns(Rect::new(area.x, body.y, area.width, 1), measured, hidden);
+        if title_height > 0 {
+            let count = matching.len();
+            let total = self.snapshot.entries.len();
+            let count = if self.query.is_empty() {
+                count.to_string()
+            } else {
+                format!("{count}/{total}")
+            };
+            let grouping = if self.group_by == GroupBy::None {
+                String::new()
+            } else {
+                format!("Group: {} | ", self.group_by.label())
+            };
+            frame.render_widget(
+                Paragraph::new(clip_text(
+                    &format!("brachio | {grouping}{count} agents"),
+                    area.width,
+                    false,
+                ))
+                .style(Style::default().add_modifier(Modifier::BOLD)),
+                Rect::new(area.x, area.y, area.width, 1),
+            );
+        }
+        if header_height > 0 {
+            let header = Rect::new(area.x, area.y + title_height, area.width, 1);
+            for (label, mut column) in COLUMN_LABELS
+                .into_iter()
+                .zip(layout.areas.into_iter().skip(1))
+            {
+                column.y = header.y;
+                frame.render_widget(
+                    Paragraph::new(clip_text(label, column.width, false))
+                        .style(Style::default().add_modifier(Modifier::BOLD)),
+                    column,
+                );
+            }
+            if header_height == 2 {
+                frame.render_widget(
+                    Paragraph::new("─".repeat(usize::from(area.width)))
+                        .style(Style::default().fg(Color::DarkGray)),
+                    Rect::new(area.x, header.y + 1, area.width, 1),
+                );
+            }
+        }
+        if rows.is_empty() {
+            let text = if self.snapshot.entries.is_empty() {
+                "No agents with reported status."
+            } else {
+                "No agents match the filter. Esc clears it."
+            };
+            frame.render_widget(Paragraph::new(text), body);
+        }
+        for (offset, row) in rows.iter().skip(self.scroll).take(height).enumerate() {
+            let row_area = Rect::new(body.x, body.y + offset as u16, body.width, 1);
+            match row {
+                ListRow::Header {
+                    key,
+                    label,
+                    count,
+                    collapsed,
+                    ..
+                } => {
+                    let selected = *collapsed && selected_row == Some(self.scroll + offset);
+                    let style = if selected {
+                        Style::default().bg(Color::DarkGray).fg(Color::White)
+                    } else {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    };
+                    let label = if self.group_by == GroupBy::Cwd {
+                        home_path(label, home.as_deref())
+                    } else {
+                        label.clone()
+                    };
+                    let marker = if *collapsed { "▸" } else { "▾" };
+                    let suffix = format!(" ({count})");
+                    let text = if row_area.width < suffix.len() as u16 + 2 {
+                        count.to_string()
+                    } else {
+                        let label = clip_text(
+                            &label,
+                            row_area.width - suffix.len() as u16 - 2,
+                            self.group_by == GroupBy::Cwd,
+                        );
+                        format!("{marker} {label}{suffix}")
+                    };
+                    frame.render_widget(
+                        Paragraph::new(clip_text(&text, row_area.width, false)).style(style),
+                        row_area,
+                    );
+                    self.group_hits.push(GroupHit {
+                        area: row_area,
+                        key: key.clone(),
+                    });
+                }
+                ListRow::Agent(index) => {
+                    let entry = &self.snapshot.entries[*index];
+                    let selected = self.selected.as_ref() == Some(&entry.id);
+                    let style = if selected {
+                        Style::default().bg(Color::DarkGray).fg(Color::White)
+                    } else {
+                        Style::default()
+                    };
+                    frame.render_widget(Block::default().style(style), row_area);
+                    let [marker, status, agent, cwd, session, tab, pane] =
+                        layout.areas.map(|mut column| {
+                            column.y = row_area.y;
+                            column
+                        });
+                    frame.render_widget(
+                        Paragraph::new(if selected { ">" } else { " " }).style(style),
+                        marker,
+                    );
+                    frame.render_widget(
+                        Paragraph::new(clip_text(
+                            status_text(entry.status, layout.compact_status),
+                            status.width,
+                            false,
+                        ))
+                        .style(style.fg(status_color(entry.status))),
+                        status,
+                    );
+                    frame.render_widget(
+                        Paragraph::new(clip_text(&entry.name, agent.width, false)).style(style),
+                        agent,
+                    );
+                    let path = home_path(
+                        entry.working_dir.as_deref().unwrap_or("Unknown"),
+                        home.as_deref(),
+                    );
+                    frame.render_widget(
+                        Paragraph::new(clip_text(&path, cwd.width, true)).style(style),
+                        cwd,
+                    );
+                    for (label, column) in [
+                        (entry.location.session.as_ref(), session),
+                        (entry.location.tab.as_ref(), tab),
+                        (entry.location.pane.as_ref(), pane),
+                    ] {
+                        frame.render_widget(
+                            Paragraph::new(clip_text(label, column.width, false)).style(style),
+                            column,
+                        );
+                    }
+                    self.hits.push(HitRegion {
+                        area: row_area,
+                        entry: entry.clone(),
+                    });
+                }
+            }
+        }
+        if footer_height == 2 {
+            let text = if self.filter_edit.is_some() {
+                clip_text(&format!("/ {}▏", self.query), area.width, true)
+            } else {
+                shortcuts(area.width, headers)
+            };
+            frame.render_widget(
+                Paragraph::new(text),
+                Rect::new(area.x, area.bottom() - 2, area.width, 1),
+            );
+        }
+        let (text, color) = self.footer(area.width);
+        frame.render_widget(
+            Paragraph::new(text).style(Style::default().fg(color)),
+            Rect::new(area.x, area.bottom() - 1, area.width, 1),
+        );
+    }
+
+    fn footer(&self, width: u16) -> (String, Color) {
+        let matching = matching_indices(&self.snapshot, &self.query);
+        if self.filter_edit.is_some() {
+            let count = format!("{}/{} agents", matching.len(), self.snapshot.entries.len());
+            return (
+                compact_line(&["Enter Apply", "Esc Cancel", &count], width),
+                Color::Cyan,
+            );
+        }
         let (state, mut color) = if !self.connected {
-            ("STALE: disconnected; navigation disabled", Color::Red)
+            ("Disconnected; navigation disabled", Color::Red)
         } else if self.navigating {
-            ("Navigating; please wait", Color::Yellow)
+            ("Navigating", Color::Yellow)
         } else {
             ("Connected", Color::Green)
         };
-        let mut text = format!(
-            "{state} | Warnings: {} (w details)",
-            self.snapshot.warnings.len()
-        );
-        let message = plain(&self.message);
-        if !message.is_empty() {
-            text.push_str(" | ");
-            text.push_str(&message);
-            if self.connected && !self.navigating {
+        let count = if self.query.is_empty() {
+            format!("{} agents", matching.len())
+        } else {
+            format!("{}/{} agents", matching.len(), self.snapshot.entries.len())
+        };
+        let warnings = format!("{} warnings (w)", self.snapshot.warnings.len());
+        let attention_count = matching
+            .iter()
+            .filter(|&&index| {
+                matches!(
+                    self.snapshot.entries[index].status,
+                    Status::Blocked | Status::Error
+                )
+            })
+            .count();
+        let working_count = matching
+            .iter()
+            .filter(|&&index| self.snapshot.entries[index].status == Status::Working)
+            .count();
+        let attention = format!("{attention_count} attention");
+        let working = format!("{working_count} working");
+        let mut parts = vec![state];
+        if !self.snapshot.warnings.is_empty() {
+            parts.push(&warnings);
+            if self.connected {
                 color = Color::Yellow;
             }
         }
-        if !self.snapshot.warnings.is_empty() && self.connected {
-            color = Color::Yellow;
+        if !self.message.is_empty() && !self.navigating {
+            parts.push("Notice (w)");
+            if self.connected {
+                color = Color::Yellow;
+            }
         }
-        (text, color)
+        parts.push(&count);
+        if attention_count > 0 {
+            parts.push(&attention);
+        }
+        if working_count > 0 {
+            parts.push(&working);
+        }
+        (compact_line(&parts, width), color)
     }
-}
 
-fn wrap_details(value: &str, width: u16) -> Vec<Line<'static>> {
-    let text = Span::raw(value);
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    let mut used = 0;
-    for grapheme in text.styled_graphemes(Style::default()) {
-        let size = Span::raw(grapheme.symbol).width();
-        if used + size > usize::from(width) && !line.is_empty() {
-            lines.push(Line::raw(std::mem::take(&mut line)));
-            used = 0;
-        }
-        line.push_str(grapheme.symbol);
-        used += size;
+    fn toggle_details(&mut self) {
+        self.details = !self.details;
+        self.help = false;
+        self.reset_overlay();
     }
-    lines.push(Line::raw(line));
-    lines
+    fn close_overlay(&mut self) {
+        self.details = false;
+        self.help = false;
+        self.reset_overlay();
+    }
+    fn reset_overlay(&mut self) {
+        self.details_scroll = 0;
+        self.details_limit = 0;
+        self.viewport = Rect::default();
+        self.clear_hits();
+    }
+    fn scroll_details(&mut self, down: bool, amount: usize) {
+        self.details_scroll = if down {
+            self.details_scroll.saturating_add(amount)
+        } else {
+            self.details_scroll.saturating_sub(amount)
+        }
+        .min(self.details_limit);
+    }
+
+    fn draw_details(&mut self, frame: &mut Frame) {
+        let mut values = vec![
+            format!(
+                "Message: {}",
+                if self.message.is_empty() {
+                    "No current message."
+                } else {
+                    &self.message
+                }
+            ),
+            format!(
+                "Client ID: {}",
+                self.client.as_deref().unwrap_or("Not pinned")
+            ),
+            format!("Last navigation: {}", self.diagnostic),
+            "Session focus is shared with other connected clients.".into(),
+            format!("Grouping: {}", self.group_by.label()),
+            format!("Filter: {}", self.query),
+            format!("Warnings: {}", self.snapshot.warnings.len()),
+        ];
+        if self.snapshot.warnings.is_empty() {
+            values.push("No snapshot warnings.".into());
+        }
+        for (index, warning) in self.snapshot.warnings.iter().enumerate() {
+            values.push(format!("{}. {}", index + 1, warning));
+        }
+        if let Some(index) = self.selected_index() {
+            let entry = &self.snapshot.entries[index];
+            values.push(String::new());
+            for (label, value) in [
+                ("Agent", entry.name.as_str()),
+                ("Status", entry.status.label()),
+                (
+                    "Status source",
+                    if entry.records == 0 {
+                        "Foreground identity only; no status report"
+                    } else {
+                        "Reported by Rex program_status"
+                    },
+                ),
+                (
+                    "Working directory",
+                    entry.working_dir.as_deref().unwrap_or("Unknown"),
+                ),
+                ("Session", entry.location.session.as_ref()),
+                ("Tab", entry.location.tab.as_ref()),
+                ("Pane", entry.location.pane.as_ref()),
+                ("Session ID", entry.target.session.as_str()),
+                ("Tab ID", entry.target.window.as_str()),
+                ("Pane ID", entry.target.block.as_str()),
+            ] {
+                values.push(format!("{label}: {value}"));
+            }
+        }
+        self.draw_overlay(frame, "Details", values);
+    }
+
+    fn draw_help(&mut self, frame: &mut Frame) {
+        let values = [
+            "↑ / ↓ or k / j: Select previous / next visible agent. Collapsed headers are selectable.",
+            "Enter: Navigate to the selected visible agent. On a collapsed header, expand only.",
+            "g / G (Shift+g): Cycle None, Agent, Status, CWD, Session forward / backward.",
+            "Tab / Shift+Tab: Next / previous group, with wraparound. No effect in None.",
+            "← / →: Collapse / expand the selected group. Headers appear only for two or more groups.",
+            "Mouse: Click a group header to toggle it; click an agent to select and navigate. Wheel scrolls.",
+            "/: Edit a case-insensitive filter. All space-separated terms must match.",
+            "Filter fields: agent:codex cwd:project session:work status:blocked. Unqualified terms also match Tab and Pane.",
+            "Filter editing: Type or paste text, Backspace deletes, Enter applies without navigation, Esc restores the previous filter.",
+            "Esc on the list: Clear an active filter, otherwise quit. q quits the list.",
+            "a / A: Next / previous matching Blocked or Error agent; expand its group.",
+            "w: Full selected-agent values, status source, exact IDs, client diagnostics, messages, and warnings.",
+            "?: Keyboard help. q / Esc closes details or help. Ctrl-C always quits.",
+            "Details / help: ↑ / ↓, PageUp / PageDown, or wheel scrolls.",
+            "Statuses: ! Blocked, × Error, ✓ Done, ? Unknown, ● Working, ○ Idle.",
+            "States come from Rex reports. Foreground identity without reports is Unknown, not Working or Idle.",
+            "Blocked is not proof that input is needed. Done is a reported state, not whole-session completion.",
+        ].into_iter().map(String::from).collect();
+        self.draw_overlay(frame, "Help", values);
+    }
+
+    fn draw_overlay(&mut self, frame: &mut Frame, title: &str, values: Vec<String>) {
+        let area = frame.area();
+        let title_height = u16::from(area.height >= 3);
+        let body = Rect::new(
+            area.x,
+            area.y + title_height,
+            area.width,
+            area.height - title_height - 1,
+        );
+        self.viewport = body;
+        let lines: Vec<Line<'static>> = values
+            .iter()
+            .flat_map(|value| wrap_details(&display_text(value), body.width))
+            .collect();
+        let count = lines.len();
+        let height = usize::from(body.height);
+        self.details_limit = count.saturating_sub(height);
+        self.details_scroll = self.details_scroll.min(self.details_limit);
+        if title_height > 0 {
+            frame.render_widget(
+                Paragraph::new(clip_text(
+                    &format!(
+                        "brachio | {title} | lines {}/{count}",
+                        self.details_scroll + 1
+                    ),
+                    area.width,
+                    false,
+                ))
+                .style(Style::default().add_modifier(Modifier::BOLD)),
+                Rect::new(area.x, area.y, area.width, 1),
+            );
+        }
+        frame.render_widget(
+            Paragraph::new(
+                lines
+                    .into_iter()
+                    .skip(self.details_scroll)
+                    .take(height)
+                    .collect::<Vec<_>>(),
+            ),
+            body,
+        );
+        frame.render_widget(
+            Paragraph::new(clip_text(
+                "↑↓/Wheel Scroll · Esc/q Back · Ctrl-C Quit",
+                area.width,
+                false,
+            )),
+            Rect::new(area.x, area.bottom() - 1, area.width, 1),
+        );
+    }
 }
 
 fn contains(area: Rect, x: u16, y: u16) -> bool {
     x >= area.x && x < area.right() && y >= area.y && y < area.bottom()
 }
 
-fn columns(area: Rect) -> [Rect; 7] {
-    let marker_width = area.width.min(2);
-    let status_width = area.width.saturating_sub(marker_width).min(8);
-    let remaining = area.width - marker_width - status_width;
-    let name_width = (remaining / 5).min(18);
-    let directory_width = (remaining / 3).min(40);
-    let locations = remaining - name_width - directory_width;
-    let session_width = locations / 3;
-    let tab_width = (locations - session_width) / 2;
-    let pane_width = locations - session_width - tab_width;
-    let name_x = area.x + marker_width;
-    let status_x = name_x + name_width;
-    let directory_x = status_x + status_width;
-    let session_x = directory_x + directory_width;
-    let tab_x = session_x + session_width;
-    let pane_x = tab_x + tab_width;
-    [
-        Rect::new(area.x, area.y, marker_width, area.height),
-        Rect::new(name_x, area.y, name_width.saturating_sub(1), area.height),
-        Rect::new(status_x, area.y, status_width, area.height),
-        Rect::new(
-            directory_x,
-            area.y,
-            directory_width.saturating_sub(1),
-            area.height,
-        ),
-        Rect::new(
-            session_x,
-            area.y,
-            session_width.saturating_sub(1),
-            area.height,
-        ),
-        Rect::new(tab_x, area.y, tab_width.saturating_sub(1), area.height),
-        Rect::new(pane_x, area.y, pane_width, area.height),
-    ]
-}
-
-fn clip_text(value: &str, width: u16, keep_end: bool) -> String {
-    let text = display_text(value);
-    if width == 0 {
-        return String::new();
-    }
-    if Line::raw(text.as_str()).width() <= usize::from(width) {
-        return text;
-    }
-    let span = Span::raw(text.as_str());
-    let graphemes: Vec<_> = span
-        .styled_graphemes(Style::default())
-        .map(|g| g.symbol)
-        .collect();
-    let mut parts = Vec::new();
-    let mut used = 0;
-    for index in 0..graphemes.len() {
-        let index = if keep_end {
-            graphemes.len() - 1 - index
-        } else {
-            index
-        };
-        let grapheme = graphemes[index];
-        let size = Span::raw(grapheme).width();
-        if used + size > usize::from(width - 1) {
-            break;
-        }
-        parts.push(grapheme);
-        used += size;
-    }
-    if keep_end {
-        format!("…{}", parts.into_iter().rev().collect::<String>())
-    } else {
-        format!("{}…", parts.concat())
-    }
-}
-
-fn status_color(status: Status) -> Color {
-    match status {
-        Status::Blocked | Status::Error => Color::Red,
-        Status::Done => Color::Green,
-        Status::Unknown => Color::Magenta,
-        Status::Working => Color::Cyan,
-        Status::Idle => Color::Gray,
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::{Location, Target};
-    use crossterm::event::{KeyEvent, MouseEvent};
-    use ratatui::{Terminal, backend::TestBackend};
-
-    fn entry(index: usize, status: Status) -> Entry {
-        Entry {
-            id: EntryId {
-                session: format!("session-{index}"),
-                block: format!("pane-{index}"),
-                agent: "pi".into(),
-            },
-            target: Target {
-                session: format!("session-{index}"),
-                window: format!("tab-{index}"),
-                block: format!("pane-{index}"),
-            },
-            name: format!("agent-{index:02}"),
-            status,
-            location: Location {
-                session: format!("session-{index:02}").into(),
-                tab: format!("tab-{index:02}").into(),
-                pane: format!("pane-{index:02}").into(),
-            },
-            working_dir: None,
-            records: 1,
-        }
-    }
-
-    fn app(entries: Vec<Entry>) -> App {
-        let mut app = App {
-            connected: true,
-            group_by: GroupBy::Status,
-            ..App::default()
-        };
-        app.replace_snapshot(Snapshot {
-            entries,
-            warnings: Vec::new(),
-        });
-        app
-    }
-
-    fn many(count: usize) -> App {
-        app((0..count).map(|i| entry(i, Status::Working)).collect())
-    }
-
-    fn key(code: KeyCode) -> Event {
-        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
-    }
-
-    fn mouse(kind: MouseEventKind, x: u16, y: u16) -> Event {
-        Event::Mouse(MouseEvent {
-            kind,
-            column: x,
-            row: y,
-            modifiers: KeyModifiers::NONE,
-        })
-    }
-
-    fn click(x: u16, y: u16) -> Event {
-        mouse(MouseEventKind::Down(MouseButton::Left), x, y)
-    }
-
-    fn terminal(width: u16, height: u16) -> Terminal<TestBackend> {
-        Terminal::new(TestBackend::new(width, height)).unwrap()
-    }
-
-    fn render(app: &mut App, terminal: &mut Terminal<TestBackend>) -> Vec<String> {
-        terminal.draw(|frame| app.draw(frame)).unwrap();
-        let buffer = terminal.backend().buffer();
-        buffer
-            .content
-            .chunks(usize::from(buffer.area.width).max(1))
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
-            .collect()
-    }
-
-    fn navigation(action: Option<Action>) -> Entry {
-        match action {
-            Some(Action::Navigate(entry)) => *entry,
-            other => panic!("expected navigation, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn default_and_empty_view_have_status_help_and_no_hit_targets() {
-        let mut app = App::default();
-        let rows = render(&mut app, &mut terminal(100, 10));
-        assert!(rows[0].starts_with("brachio | 0 agents"));
-        assert!(!rows[0].contains("Group by"));
-        assert!(rows[0].contains("0 agents"));
-        for label in ["Working directory", "Session", "Tab", "Pane"] {
-            assert!(rows[1].contains(label));
-        }
-        assert!(rows[3].contains("No agents"));
-        assert!(rows[8].contains("Enter/click"));
-        assert!(rows[8].contains("g view"));
-        assert!(rows[9].contains("STALE: disconnected"));
-        assert!(app.hits.is_empty());
-        assert!(app.handle_event(click(3, 3)).is_none());
-        app.connected = true;
-        assert!(app.handle_event(key(KeyCode::Enter)).is_none());
-        assert!(app.message.contains("No agent selected"));
-        assert!(app.handle_event(key(KeyCode::Down)).is_none());
-        assert!(app.handle_event(key(KeyCode::Up)).is_none());
-        assert!(app.selected.is_none());
-    }
-
-    fn grouping_entries() -> Vec<Entry> {
-        [
-            ("pi", Status::Idle, Some("/work/b"), "Beta", "beta"),
-            ("claude-code", Status::Working, None, "Alpha", "alpha-1"),
-            ("codex", Status::Error, Some("/work/a"), "Alpha", "alpha-1"),
-            ("pi", Status::Blocked, Some("/work/b"), "Alpha", "alpha-2"),
-            ("claude-code", Status::Done, Some("/work/a"), "Beta", "beta"),
-            ("codex", Status::Unknown, None, "Alpha", "alpha-2"),
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(index, (agent, status, cwd, session_name, session_id))| {
-            let mut entry = entry(index, status);
-            entry.id.agent = agent.into();
-            entry.id.session = session_id.into();
-            entry.target.session = session_id.into();
-            entry.location.session = session_name.into();
-            entry.working_dir = cwd.map(String::from);
-            entry
-        })
-        .collect()
-    }
-
-    fn grouped_app(entries: Vec<Entry>, group_by: GroupBy) -> App {
-        let mut app = App {
-            connected: true,
-            group_by,
-            ..App::default()
-        };
-        app.replace_snapshot(Snapshot {
-            entries,
-            warnings: Vec::new(),
-        });
-        app
-    }
-
-    #[test]
-    fn default_view_preserves_the_original_flat_list_and_navigation() {
-        let mut expected = Snapshot {
-            entries: grouping_entries(),
-            warnings: Vec::new(),
-        };
-        expected.sort();
-        let mut app = App {
-            connected: true,
-            ..App::default()
-        };
-        app.replace_snapshot(expected.clone());
-        assert_eq!(app.group_by, GroupBy::None);
-        assert_eq!(app.snapshot.entries, expected.entries);
-        let mut terminal = terminal(100, 12);
-        app.handle_event(key(KeyCode::Down));
-        let rows = render(&mut app, &mut terminal);
-        assert!(rows[0].starts_with("brachio | 6 agents | 1-6"));
-        assert!(!rows.iter().any(|row| row.contains("Group by")));
-        assert!(rows[10].contains("g view"));
-        assert!(!rows[10].contains("Tab/Shift+Tab"));
-        assert_eq!(app.hits.len(), 6);
-        assert_eq!(app.list_rows(), (0..6).map(Some).collect::<Vec<_>>());
-        let selected = app.selected.clone();
-        for code in [KeyCode::Tab, KeyCode::BackTab] {
-            assert!(app.handle_event(key(code)).is_none());
-            assert_eq!(app.selected, selected);
-            assert_eq!(app.hits.len(), 6);
-        }
-        let target = expected.entries[1].clone();
-        assert_eq!(navigation(app.handle_event(key(KeyCode::Enter))), target);
-        app.navigating = false;
-        render(&mut app, &mut terminal);
-        assert_eq!(navigation(app.handle_event(click(0, 4))), target);
-    }
-
-    #[test]
-    fn separators_only_appear_between_groups_and_are_not_click_targets() {
-        for (mode, separators) in [
-            (GroupBy::None, vec![]),
-            (GroupBy::Agent, vec![2, 5]),
-            (GroupBy::Status, vec![1, 3, 5, 7, 9]),
-            (GroupBy::Cwd, vec![2, 5]),
-            (GroupBy::Session, vec![2, 5]),
-        ] {
-            let mut app = grouped_app(grouping_entries(), mode);
-            let layout = app.list_rows();
-            let actual: Vec<_> = layout
-                .iter()
-                .enumerate()
-                .filter_map(|(row, index)| index.is_none().then_some(row))
-                .collect();
-            assert_eq!(actual, separators, "{mode:?}");
-            assert_eq!(layout.first(), Some(&Some(0)));
-            assert_eq!(layout.last(), Some(&Some(5)));
-            let mut terminal = terminal(80, 16);
-            let rows = render(&mut app, &mut terminal);
-            assert_eq!(app.hits.len(), 6);
-            assert_eq!(rows[2], "─".repeat(80));
-            assert_eq!(rows.iter().filter(|row| row.contains('─')).count(), 1);
-            assert!(app.hits.iter().all(|hit| hit.area.y > 2));
-            assert!(rows[14].contains("g view"));
-            assert!(rows[14].contains("q/Esc/Ctrl-C"));
-            let selected = app.selected.clone();
-            for row in separators {
-                let y = 3 + row as u16;
-                assert_eq!(rows[usize::from(y)], " ".repeat(80));
-                assert!(!app.hits.iter().any(|hit| hit.area.y == y));
-                assert!(app.handle_event(click(0, y)).is_none());
-                assert_eq!(app.selected, selected);
-                assert!(!app.navigating);
-                render(&mut app, &mut terminal);
-            }
-            assert_eq!(
-                navigation(app.handle_event(key(KeyCode::Enter))).id,
-                selected.unwrap()
-            );
-        }
-        assert!(
-            grouped_app(Vec::new(), GroupBy::Status)
-                .list_rows()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn scrolling_counts_separator_rows_but_title_ranges_count_only_agents() {
-        let mut app = app(vec![
-            entry(0, Status::Blocked),
-            entry(1, Status::Blocked),
-            entry(2, Status::Working),
-            entry(3, Status::Working),
-        ]);
-        let mut terminal = terminal(100, 9);
-        render(&mut app, &mut terminal);
-        let selected = app.selected.clone();
-        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 3));
-        let rows = render(&mut app, &mut terminal);
-        assert_eq!(app.scroll, 1);
-        assert!(rows[0].contains("4 agents | 2-4"));
-        assert!(rows[4].chars().all(|ch| ch == ' '));
-        assert_eq!(app.selected, selected);
-        assert!(app.handle_event(click(0, 4)).is_none());
-        render(&mut app, &mut terminal);
-        assert_eq!(
-            navigation(app.handle_event(click(0, 6))),
-            entry(3, Status::Working)
-        );
-        app.navigating = false;
-        app.handle_event(key(KeyCode::Up));
-        render(&mut app, &mut terminal);
-        assert_eq!(app.selected, Some(entry(2, Status::Working).id));
-        app.handle_event(key(KeyCode::Up));
-        render(&mut app, &mut terminal);
-        assert_eq!(app.selected, Some(entry(1, Status::Blocked).id));
-        assert_eq!(app.selected_row(), Some(1));
-    }
-
-    #[test]
-    fn refresh_reveals_selection_when_a_new_separator_changes_only_its_screen_row() {
-        let mut app = many(2);
-        let mut terminal = terminal(100, 5);
-        app.handle_event(key(KeyCode::Down));
-        render(&mut app, &mut terminal);
-        assert_eq!(app.scroll, 1);
-        let selected = app.selected.clone();
-        let mut snapshot = app.snapshot.clone();
-        snapshot.entries[0].status = Status::Blocked;
-        app.replace_snapshot(snapshot);
-        render(&mut app, &mut terminal);
-        assert_eq!(app.selected_index(), Some(1));
-        assert_eq!(app.selected_row(), Some(2));
-        assert_eq!(app.scroll, 2);
-        assert_eq!(app.selected, selected);
-        assert_eq!(app.hits.len(), 1);
-        assert_eq!(Some(&app.hits[0].entry.id), selected.as_ref());
-    }
-
-    #[test]
-    fn separator_only_view_has_no_agent_range_or_mouse_target() {
-        let mut app = app(vec![entry(0, Status::Blocked), entry(1, Status::Working)]);
-        let mut terminal = terminal(100, 5);
-        render(&mut app, &mut terminal);
-        app.scroll = 1;
-        app.reveal_selection = false;
-        let rows = render(&mut app, &mut terminal);
-        assert!(rows[0].contains("2 agents | 0-0"));
-        assert_eq!(rows[2], " ".repeat(100));
-        assert!(app.hits.is_empty());
-        assert!(app.handle_event(click(0, 2)).is_none());
-        app.handle_event(key(KeyCode::Down));
-        render(&mut app, &mut terminal);
-        assert_eq!(app.selected_index(), Some(1));
-        assert_eq!(app.hits.len(), 1);
-        assert_eq!(app.hits[0].entry, entry(1, Status::Working));
-    }
-
-    #[test]
-    fn every_grouping_mode_has_deterministic_groups_and_status_priority_within_groups() {
-        let entries = grouping_entries();
-        for (mode, order) in [
-            (GroupBy::None, [3, 2, 4, 5, 1, 0]),
-            (GroupBy::Agent, [4, 1, 2, 5, 3, 0]),
-            (GroupBy::Status, [3, 2, 4, 5, 1, 0]),
-            (GroupBy::Cwd, [2, 4, 3, 0, 5, 1]),
-            (GroupBy::Session, [2, 1, 3, 5, 4, 0]),
-        ] {
-            let expected: Vec<_> = order.map(|index| entries[index].clone()).into();
-            for input in [entries.clone(), entries.iter().cloned().rev().collect()] {
-                let mut app = grouped_app(input, mode);
-                assert_eq!(app.snapshot.entries, expected, "{mode:?}");
-                let rows = render(&mut app, &mut terminal(120, 16));
-                assert_eq!(rows[0].contains("Group by:"), mode != GroupBy::None);
-                if mode != GroupBy::None {
-                    assert!(rows[0].contains(&format!("Group by: {}", mode.label())));
-                }
-                assert!(!rows[0].contains("(g)"));
-                assert_eq!(app.snapshot.entries, expected, "draw changed {mode:?}");
-                assert_eq!(app.hits.len(), expected.len());
-                for (hit, entry) in app.hits.iter().zip(&expected) {
-                    assert_eq!(&hit.entry, entry);
-                    assert!(rows[usize::from(hit.area.y)].contains(&entry.name));
-                }
-                let narrow = render(&mut app, &mut terminal(35, 12));
-                assert_eq!(narrow[0].contains("Group by:"), mode != GroupBy::None);
-                if mode != GroupBy::None {
-                    assert!(narrow[0].contains(&format!("Group by: {}", mode.label())));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn mode_key_cycles_all_modes_without_changing_the_selected_identity() {
-        let mut app = grouped_app(grouping_entries(), GroupBy::default());
-        let selected = app.selected.clone();
-        for mode in [
-            GroupBy::Agent,
-            GroupBy::Status,
-            GroupBy::Cwd,
-            GroupBy::Session,
-            GroupBy::None,
-        ] {
-            assert!(app.handle_event(key(KeyCode::Char('g'))).is_none());
-            assert_eq!(app.group_by, mode);
-            assert_eq!(app.selected, selected);
-            let rows = render(&mut app, &mut terminal(100, 8));
-            assert_eq!(rows[0].contains("Group by:"), mode != GroupBy::None);
-            if mode != GroupBy::None {
-                assert!(rows[0].contains(&format!("Group by: {}", mode.label())));
-            }
-            assert!(!rows[0].contains("(g)"));
-            assert!(rows[6].contains("g view"));
-            assert!(
-                app.hits
-                    .iter()
-                    .any(|hit| Some(&hit.entry.id) == selected.as_ref())
-            );
-            assert!(!app.navigating);
-        }
-    }
-
-    #[test]
-    fn tab_and_backtab_jump_to_group_starts_and_wrap_in_every_mode() {
-        let entries = grouping_entries();
-        for (mode, starts) in [
-            (GroupBy::Agent, vec![4, 2, 3]),
-            (GroupBy::Status, vec![3, 2, 4, 5, 1, 0]),
-            (GroupBy::Cwd, vec![2, 3, 5]),
-            (GroupBy::Session, vec![2, 3, 4]),
-        ] {
-            let mut app = grouped_app(entries.clone(), mode);
-            app.selected = None;
-            for &index in starts.iter().chain(starts.iter().take(1)) {
-                assert!(app.handle_event(key(KeyCode::Tab)).is_none());
-                assert_eq!(app.selected, Some(entries[index].id.clone()), "{mode:?}");
-                assert!(!app.navigating);
-            }
-            for &index in starts.iter().rev().chain(starts.iter().rev().take(1)) {
-                let event = Event::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-                assert!(app.handle_event(event).is_none());
-                assert_eq!(app.selected, Some(entries[index].id.clone()), "{mode:?}");
-                assert!(!app.navigating);
-            }
-            app.selected = None;
-            app.handle_event(key(KeyCode::BackTab));
-            assert_eq!(
-                app.selected,
-                Some(entries[*starts.last().unwrap()].id.clone())
-            );
-        }
-    }
-
-    #[test]
-    fn group_jumps_skip_the_current_group_even_when_selection_is_inside_it() {
-        for mode in [GroupBy::Agent, GroupBy::Cwd, GroupBy::Session] {
-            let mut app = grouped_app(grouping_entries(), mode);
-            app.select_index(1);
-            let next = app.snapshot.entries[2].id.clone();
-            app.handle_event(key(KeyCode::Tab));
-            assert_eq!(app.selected, Some(next));
-            app.select_index(3);
-            let previous = app.snapshot.entries[0].id.clone();
-            app.handle_event(key(KeyCode::BackTab));
-            assert_eq!(app.selected, Some(previous));
-        }
-    }
-
-    #[test]
-    fn empty_lists_and_single_groups_handle_group_keys_without_navigation() {
-        let mut empty = app(Vec::new());
-        for _ in 0..4 {
-            for code in [KeyCode::Char('g'), KeyCode::Tab, KeyCode::BackTab] {
-                assert!(empty.handle_event(key(code)).is_none());
-                assert!(empty.selected.is_none());
-                assert!(!empty.navigating);
-            }
-        }
-        for mode in [
-            GroupBy::Agent,
-            GroupBy::Status,
-            GroupBy::Cwd,
-            GroupBy::Session,
-        ] {
-            let mut entries = vec![entry(0, Status::Working), entry(1, Status::Working)];
-            entries[1].id.session = entries[0].id.session.clone();
-            entries[1].target.session = entries[0].target.session.clone();
-            entries[1].location.session = entries[0].location.session.clone();
-            let mut app = grouped_app(entries, mode);
-            assert!(app.list_rows().iter().all(Option::is_some));
-            for code in [KeyCode::Tab, KeyCode::BackTab] {
-                app.select_index(1);
-                assert!(app.handle_event(key(code)).is_none());
-                assert_eq!(app.selected_index(), Some(0));
-                assert!(!app.navigating);
-            }
-        }
-    }
-
-    #[test]
-    fn grouping_uses_canonical_agents_and_full_directories_not_display_values() {
-        let mut a = entry(0, Status::Working);
-        let mut b = entry(1, Status::Working);
-        a.name = "same display name".into();
-        b.name = a.name.clone();
-        a.id.agent = "pi".into();
-        b.id.agent = "codex".into();
-        assert_ne!(GroupBy::Agent.compare(&a, &b), Ordering::Equal);
-        a.id.agent = b.id.agent.clone();
-        b.name = "different display name".into();
-        assert_eq!(GroupBy::Agent.compare(&a, &b), Ordering::Equal);
-        a.working_dir = Some("/first/long-prefix/project".into());
-        b.working_dir = Some("/second/long-prefix/project".into());
-        assert_eq!(
-            clip_text(a.working_dir.as_deref().unwrap(), 10, true),
-            clip_text(b.working_dir.as_deref().unwrap(), 10, true)
-        );
-        assert_ne!(GroupBy::Cwd.compare(&a, &b), Ordering::Equal);
-    }
-
-    #[test]
-    fn refresh_keeps_the_active_grouping_and_the_updated_exact_selection() {
-        for mode in [
-            GroupBy::Agent,
-            GroupBy::Status,
-            GroupBy::Cwd,
-            GroupBy::Session,
-        ] {
-            let mut app = grouped_app(grouping_entries(), mode);
-            app.select_index(1);
-            let mut updated = app.snapshot.entries[1].clone();
-            updated.status = Status::Blocked;
-            updated.working_dir = Some("/work/new".into());
-            updated.location.session = "Renamed session".into();
-            updated.location.tab = "Moved tab".into();
-            updated.target.window = "new-window".into();
-            let mut snapshot = app.snapshot.clone();
-            for entry in &mut snapshot.entries {
-                if entry.id == updated.id {
-                    *entry = updated.clone();
-                } else if entry.id.session == updated.id.session {
-                    entry.location.session = updated.location.session.clone();
-                }
-            }
-            snapshot.entries.reverse();
-            app.replace_snapshot(snapshot);
-            let before_draw = app.snapshot.entries.clone();
-            render(&mut app, &mut terminal(100, 8));
-            assert_eq!(app.group_by, mode);
-            assert_eq!(app.snapshot.entries, before_draw);
-            assert!(
-                app.snapshot
-                    .entries
-                    .windows(2)
-                    .all(|pair| { mode.compare(&pair[0], &pair[1]) != Ordering::Greater })
-            );
-            assert_eq!(app.selected, Some(updated.id.clone()));
-            assert_eq!(navigation(app.handle_event(key(KeyCode::Enter))), updated);
-        }
-    }
-
-    #[test]
-    fn mode_changes_do_not_restore_a_removed_selection_but_group_jumps_can_select() {
-        for code in [KeyCode::Tab, KeyCode::BackTab] {
-            let mut app = app(grouping_entries());
-            let selected = app.selected.clone().unwrap();
-            let mut snapshot = app.snapshot.clone();
-            snapshot.entries.retain(|entry| entry.id != selected);
-            app.replace_snapshot(snapshot);
-            let message = app.message.clone();
-            for _ in 0..5 {
-                app.handle_event(key(KeyCode::Char('g')));
-                render(&mut app, &mut terminal(100, 8));
-                assert!(app.selected.is_none());
-                assert!(app.selection_missing);
-                assert_eq!(app.message, message);
-            }
-            assert!(app.handle_event(key(KeyCode::Enter)).is_none());
-            assert!(app.handle_event(key(code)).is_none());
-            let expected = if code == KeyCode::Tab {
-                0
-            } else {
-                app.snapshot.entries.len() - 1
-            };
-            assert_eq!(app.selected_index(), Some(expected));
-            assert!(!app.selection_missing);
-            assert!(!app.navigating);
-        }
-    }
-
-    #[test]
-    fn grouping_keys_invalidate_old_clicks_and_keep_keyboard_and_mouse_targets_equal() {
-        for code in [KeyCode::Char('g'), KeyCode::Tab, KeyCode::BackTab] {
-            let mut app = app(grouping_entries());
-            let mut terminal = terminal(100, 8);
-            render(&mut app, &mut terminal);
-            assert!(app.handle_event(key(code)).is_none());
-            let expected = app.snapshot.entries[app.selected_index().unwrap()].clone();
-            assert!(app.hits.is_empty());
-            assert!(app.handle_event(click(0, 3)).is_none());
-            render(&mut app, &mut terminal);
-            let area = app
-                .hits
-                .iter()
-                .find(|hit| hit.entry.id == expected.id)
-                .unwrap()
-                .area;
-            assert_eq!(
-                navigation(app.handle_event(click(area.x, area.y))),
-                expected
-            );
-            app.navigating = false;
-            assert_eq!(navigation(app.handle_event(key(KeyCode::Enter))), expected);
-        }
-    }
-
-    #[test]
-    fn grouping_keys_ignore_releases_and_do_not_change_details() {
-        let mut app = app(grouping_entries());
-        let selected = app.selected.clone();
-        let mut terminal = terminal(100, 8);
-        render(&mut app, &mut terminal);
-        let hits = app.hits.len();
-        for code in [KeyCode::Char('g'), KeyCode::Tab, KeyCode::BackTab] {
-            let event = Event::Key(KeyEvent::new_with_kind(
-                code,
-                KeyModifiers::NONE,
-                KeyEventKind::Release,
-            ));
-            assert!(app.handle_event(event).is_none());
-            assert_eq!(app.hits.len(), hits);
-            assert_eq!(app.group_by, GroupBy::Status);
-            assert_eq!(app.selected, selected);
-        }
-        app.handle_event(key(KeyCode::Char('w')));
-        render(&mut app, &mut terminal);
-        app.handle_event(key(KeyCode::Down));
-        let scroll = app.details_scroll;
-        let message = app.message.clone();
-        for code in [KeyCode::Char('g'), KeyCode::Tab, KeyCode::BackTab] {
-            assert!(app.handle_event(key(code)).is_none());
-            assert!(app.details);
-            assert_eq!(app.group_by, GroupBy::Status);
-            assert_eq!(app.selected, selected);
-            assert_eq!(app.details_scroll, scroll);
-            assert_eq!(app.message, message);
-            assert!(!app.navigating);
-        }
-    }
-
-    #[test]
-    fn group_jumps_reveal_the_selected_group_after_manual_scroll_and_resize() {
-        let entries = (0..20)
-            .map(|index| {
-                let mut entry = entry(index, Status::Working);
-                entry.working_dir = Some(format!("/work/group-{:02}", index / 5));
-                entry
-            })
-            .collect();
-        let mut app = grouped_app(entries, GroupBy::Cwd);
-        let mut terminal = terminal(80, 8);
-        render(&mut app, &mut terminal);
-        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 3));
-        render(&mut app, &mut terminal);
-        assert_eq!(app.scroll, 3);
-        for index in [5, 10, 15, 0] {
-            assert!(app.handle_event(key(KeyCode::Tab)).is_none());
-            render(&mut app, &mut terminal);
-            assert_eq!(app.selected_index(), Some(index));
-            assert!(
-                app.hits
-                    .iter()
-                    .any(|hit| Some(&hit.entry.id) == app.selected.as_ref())
-            );
-        }
-        app.handle_event(Event::Resize(40, 5));
-        terminal.backend_mut().resize(40, 5);
-        terminal.resize(Rect::new(0, 0, 40, 5)).unwrap();
-        app.handle_event(key(KeyCode::BackTab));
-        render(&mut app, &mut terminal);
-        assert_eq!(app.selected_index(), Some(15));
-        assert_eq!(app.hits.len(), 1);
-        assert_eq!(app.hits[0].entry.id, app.selected.clone().unwrap());
-        assert!(!app.navigating);
-    }
-
-    #[test]
-    fn rows_are_grouped_by_model_priority_with_name_status_and_location() {
-        let statuses = [
-            Status::Idle,
-            Status::Working,
-            Status::Unknown,
-            Status::Done,
-            Status::Error,
-            Status::Blocked,
-        ];
-        let mut app = app(statuses
-            .into_iter()
-            .enumerate()
-            .map(|(i, status)| entry(i, status))
-            .collect());
-        let rows = render(&mut app, &mut terminal(100, 16));
-        for (i, entry) in app.snapshot.entries.iter().enumerate() {
-            let row = &rows[usize::from(app.hits[i].area.y)];
-            assert!(row.contains(&entry.name));
-            assert!(row.contains(entry.status.label()));
-            for label in [
-                &entry.location.session,
-                &entry.location.tab,
-                &entry.location.pane,
-            ] {
-                assert!(row.contains(label.as_ref()));
-            }
-        }
-        assert_eq!(app.snapshot.entries[0].status, Status::Blocked);
-        assert_eq!(app.snapshot.entries[5].status, Status::Idle);
-        assert_eq!(app.selected, Some(app.snapshot.entries[0].id.clone()));
-    }
-
-    #[test]
-    fn equal_statuses_use_the_same_location_and_identity_order_as_the_model() {
-        let mut a = entry(1, Status::Working);
-        let mut b = entry(2, Status::Working);
-        a.location = Location {
-            session: "same".into(),
-            tab: "same".into(),
-            pane: "same".into(),
-        };
-        b.location = a.location.clone();
-        let mut expected = Snapshot {
-            entries: vec![b, entry(3, Status::Blocked), a],
-            warnings: Vec::new(),
-        };
-        expected.sort();
-        let app = app(expected.entries.iter().cloned().rev().collect());
-        assert_eq!(app.snapshot.entries, expected.entries);
-    }
-
-    #[test]
-    fn long_unicode_names_are_clipped_without_covering_status_or_location() {
-        let mut agent = entry(0, Status::Blocked);
-        agent.name = format!("\x1b\n\u{202e}{}", "界e\u{301}🦕".repeat(100));
-        let mut app = app(vec![agent]);
-        app.message = "failure\x1b\n\u{202e}: denied".into();
-        app.snapshot.warnings.push("warn\r\u{2066}ing".into());
-        let mut terminal = terminal(100, 8);
-        let rows = render(&mut app, &mut terminal);
-        assert!(rows[3].contains("Blocked"));
-        for label in ["session-00", "tab-00", "pane-00"] {
-            assert!(rows[3].contains(label));
-        }
-        assert!(!rows[4].contains('界'));
-        assert!(rows[7].contains("failure: denied"));
-        assert!(rows[7].contains("Warnings: 1 (w details)"));
-        for cell in &terminal.backend().buffer().content {
-            assert_eq!(plain(cell.symbol()), cell.symbol());
-        }
-    }
-
-    #[test]
-    fn narrow_location_columns_keep_names_instead_of_opaque_id_suffixes() {
-        let mut agent = entry(0, Status::Working);
-        agent.location = Location {
-            session: "brachio/worktree".into(),
-            tab: "Review changes".into(),
-            pane: "2: codex".into(),
-        };
-        agent.working_dir = Some("/Users/test/projects/brachio".into());
-        agent.target = Target {
-            session: "session:00000000-0000-0000-0000-000000000001".into(),
-            window: "window:00000000-0000-0000-0000-000000000002".into(),
-            block: "block:00000000-0000-0000-0000-000000000003".into(),
-        };
-        let mut app = app(vec![agent]);
-        let rows = render(&mut app, &mut terminal(80, 8));
-        assert!(rows[3].contains("brachio/w…"));
-        assert!(rows[3].contains("Review ch…"));
-        assert!(rows[3].contains("2: codex"));
-        assert!(rows[3].contains("projects/brachio"));
-        assert!(!rows[3].contains("0000000"));
-        let rows = render(&mut app, &mut terminal(50, 8));
-        assert!(rows[3].contains("brac…"));
-        assert!(rows[3].contains("Revi…"));
-        assert!(!rows[3].contains("00000"));
-    }
-
-    #[test]
-    fn directory_clipping_preserves_the_project_tail_and_graphemes() {
-        let clipped = clip_text("/home/person/界e\u{301}/brachio", 13, true);
-        assert!(clipped.starts_with('…'));
-        assert!(clipped.ends_with("/brachio"));
-        assert!(Line::raw(clipped.as_str()).width() <= 13);
-        assert!(!clipped.starts_with("…\u{301}"));
-        assert_eq!(
-            clip_text("/work/\x1b\n\u{202e}repo", 80, true),
-            "/work/repo"
-        );
-        assert_eq!(clip_text("/work/repo", 1, true), "…");
-        assert_eq!(clip_text("/work/repo", 0, true), "");
-        let mut app = many(1);
-        let rows = render(&mut app, &mut terminal(80, 8));
-        assert!(rows[1].contains("Working directory"));
-        assert!(rows[3].contains("Unknown"));
-    }
-
-    #[test]
-    fn details_include_complete_selected_location_directory_and_exact_ids() {
-        let mut selected = entry(0, Status::Working);
-        selected.location = Location {
-            session: "team/project".into(),
-            tab: "Review / tests".into(),
-            pane: "2: coding agent".into(),
-        };
-        selected.working_dir = Some(format!("/work/{}/brachio", "long-directory/".repeat(30)));
-        let expected = selected.clone();
-        let mut app = app(vec![selected]);
-        app.handle_event(key(KeyCode::Char('w')));
-        let mut terminal = terminal(80, 8);
-        let rows = render(&mut app, &mut terminal);
-        let mut text: String = rows[1..7].iter().map(|row| row.trim_end()).collect();
-        for _ in 0..app.details_limit {
-            app.handle_event(key(KeyCode::Down));
-            let rows = render(&mut app, &mut terminal);
-            text.push_str(rows[6].trim_end());
-        }
-        for value in [
-            expected.location.session.as_ref(),
-            expected.location.tab.as_ref(),
-            expected.location.pane.as_ref(),
-            expected.working_dir.as_deref().unwrap(),
-            expected.target.session.as_str(),
-            expected.target.window.as_str(),
-            expected.target.block.as_str(),
-        ] {
-            assert!(text.contains(value), "missing {value:?}");
-        }
-        assert!(text.contains("Working directory:"));
-        assert!(text.contains("Session ID:"));
-        assert!(text.contains("Tab ID:"));
-        assert!(text.contains("Pane ID:"));
-        app.handle_event(key(KeyCode::Esc));
-        assert_eq!(navigation(app.handle_event(key(KeyCode::Enter))), expected);
-    }
-
-    #[test]
-    fn all_tiny_dimensions_render_without_overflow_or_hidden_hit_regions() {
-        for width in [0, 1, 2, 8, 17, 80] {
-            for height in [0, 1, 2, 3, 4, 5, 24] {
-                for mode in [
-                    GroupBy::None,
-                    GroupBy::Agent,
-                    GroupBy::Status,
-                    GroupBy::Cwd,
-                    GroupBy::Session,
-                ] {
-                    let mut app = grouped_app(grouping_entries(), mode);
-                    let mut terminal = terminal(width, height);
-                    render(&mut app, &mut terminal);
-                    app.handle_event(key(KeyCode::Tab));
-                    render(&mut app, &mut terminal);
-                    for hit in &app.hits {
-                        assert!(hit.area.width > 0);
-                        assert_eq!(hit.area.height, 1);
-                        assert!(hit.area.right() <= width);
-                        assert!(hit.area.bottom() <= height.saturating_sub(2));
-                    }
-                    if width == 0 || height <= 2 {
-                        assert!(app.hits.is_empty());
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn arrow_selection_is_bounded_and_enter_returns_the_full_entry() {
-        let mut app = many(3);
-        app.handle_event(key(KeyCode::Up));
-        assert_eq!(app.selected, Some(entry(0, Status::Working).id));
-        for _ in 0..10 {
-            app.handle_event(key(KeyCode::Down));
-        }
-        assert_eq!(app.selected, Some(entry(2, Status::Working).id));
-        let target = navigation(app.handle_event(key(KeyCode::Enter)));
-        assert_eq!(target, entry(2, Status::Working));
-        assert!(app.navigating);
-    }
-
-    #[test]
-    fn arrows_scroll_to_keep_the_selected_entry_visible() {
-        let mut app = many(20);
-        let mut terminal = terminal(80, 8);
-        render(&mut app, &mut terminal);
-        for _ in 0..12 {
-            app.handle_event(key(KeyCode::Down));
-        }
-        let rows = render(&mut app, &mut terminal);
-        assert_eq!(app.scroll, 10);
-        assert_eq!(app.hits.len(), 3);
-        assert_eq!(app.hits[2].entry, entry(12, Status::Working));
-        assert!(rows[5].starts_with('>'));
-        app.handle_event(key(KeyCode::Up));
-        render(&mut app, &mut terminal);
-        assert_eq!(app.scroll, 10);
-        for _ in 0..10 {
-            app.handle_event(key(KeyCode::Up));
-        }
-        render(&mut app, &mut terminal);
-        assert_eq!(app.scroll, 1);
-    }
-
-    #[test]
-    fn selection_follows_identity_through_status_name_and_location_changes() {
-        let mut app = many(2);
-        app.handle_event(key(KeyCode::Down));
-        let mut selected = entry(1, Status::Blocked);
-        selected.name = "renamed".into();
-        selected.location = Location {
-            session: "new session".into(),
-            tab: "new tab".into(),
-            pane: "pane-1".into(),
-        };
-        selected.working_dir = Some("/work/new-directory".into());
-        selected.target.window = "new-tab-1".into();
-        selected.records = 4;
-        app.replace_snapshot(Snapshot {
-            entries: vec![entry(0, Status::Done), selected.clone()],
-            warnings: Vec::new(),
-        });
-        assert_eq!(app.selected, Some(selected.id.clone()));
-        assert_eq!(app.selected_index(), Some(0));
-        assert_eq!(navigation(app.handle_event(key(KeyCode::Enter))), selected);
-    }
-
-    #[test]
-    fn removed_selection_stays_empty_across_draws_and_future_snapshots() {
-        let mut app = many(2);
-        app.handle_event(key(KeyCode::Down));
-        app.replace_snapshot(Snapshot {
-            entries: vec![entry(0, Status::Working)],
-            warnings: Vec::new(),
-        });
-        assert!(app.selected.is_none());
-        assert!(app.message.contains("no longer available"));
-        let mut terminal = terminal(100, 8);
-        let rows = render(&mut app, &mut terminal);
-        assert!(!rows[3].starts_with('>'));
-        app.replace_snapshot(Snapshot {
-            entries: vec![entry(0, Status::Working), entry(2, Status::Blocked)],
-            warnings: Vec::new(),
-        });
-        render(&mut app, &mut terminal);
-        assert!(app.selected.is_none());
-        assert!(app.handle_event(key(KeyCode::Enter)).is_none());
-        assert!(!app.navigating);
-        app.handle_event(key(KeyCode::Down));
-        assert_eq!(
-            navigation(app.handle_event(key(KeyCode::Enter))),
-            entry(2, Status::Blocked)
-        );
-    }
-
-    #[test]
-    fn a_same_name_replacement_does_not_inherit_the_removed_selection() {
-        let old = entry(0, Status::Working);
-        let mut replacement = entry(1, Status::Working);
-        replacement.name = old.name.clone();
-        replacement.location = old.location.clone();
-        let mut app = app(vec![old]);
-        app.replace_snapshot(Snapshot {
-            entries: vec![replacement.clone()],
-            warnings: Vec::new(),
-        });
-        render(&mut app, &mut terminal(80, 8));
-        assert!(app.selected.is_none());
-        assert!(app.handle_event(key(KeyCode::Enter)).is_none());
-        app.handle_event(key(KeyCode::Down));
-        assert_eq!(
-            navigation(app.handle_event(key(KeyCode::Enter))),
-            replacement
-        );
-    }
-
-    #[test]
-    fn an_initial_empty_snapshot_does_not_select_a_later_unseen_entry() {
-        let mut app = app(Vec::new());
-        app.replace_snapshot(Snapshot {
-            entries: vec![entry(0, Status::Working)],
-            warnings: Vec::new(),
-        });
-        assert!(app.selected.is_none());
-        app.handle_event(key(KeyCode::Up));
-        assert_eq!(app.selected, Some(entry(0, Status::Working).id));
-    }
-
-    #[test]
-    fn removing_all_entries_then_repopulating_needs_a_deliberate_selection() {
-        let mut app = many(1);
-        app.replace_snapshot(Snapshot::default());
-        assert!(app.selected.is_none());
-        app.replace_snapshot(Snapshot {
-            entries: vec![entry(1, Status::Working)],
-            warnings: Vec::new(),
-        });
-        let mut terminal = terminal(80, 8);
-        render(&mut app, &mut terminal);
-        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 3));
-        assert!(app.selected.is_none());
-        render(&mut app, &mut terminal);
-        assert_eq!(
-            navigation(app.handle_event(click(0, 3))),
-            entry(1, Status::Working)
-        );
-    }
-
-    #[test]
-    fn enter_and_click_navigate_the_same_exact_entry_not_a_name_match() {
-        let mut entries = vec![entry(0, Status::Working), entry(1, Status::Working)];
-        entries[0].name = "pi".into();
-        entries[1].name = "pi".into();
-        let mut keyboard = app(entries.clone());
-        keyboard.handle_event(key(KeyCode::Down));
-        let expected = navigation(keyboard.handle_event(key(KeyCode::Enter)));
-        let mut pointer = app(entries);
-        render(&mut pointer, &mut terminal(80, 8));
-        let actual = navigation(pointer.handle_event(click(79, 4)));
-        assert_eq!(actual, expected);
-        assert_eq!(pointer.selected, Some(actual.id));
-    }
-
-    #[test]
-    fn click_requires_a_draw_and_only_drawn_entry_rows_are_targets() {
-        let mut app = many(1);
-        assert!(app.handle_event(click(0, 3)).is_none());
-        let mut terminal = terminal(80, 8);
-        for (x, y) in [
-            (0, 0),
-            (0, 1),
-            (0, 2),
-            (0, 4),
-            (0, 6),
-            (0, 7),
-            (80, 3),
-            (0, 8),
-        ] {
-            render(&mut app, &mut terminal);
-            assert!(app.handle_event(click(x, y)).is_none());
-            assert!(!app.navigating);
-        }
-        render(&mut app, &mut terminal);
-        assert!(
-            app.handle_event(mouse(MouseEventKind::Down(MouseButton::Right), 0, 3))
-                .is_none()
-        );
-        render(&mut app, &mut terminal);
-        assert_eq!(
-            navigation(app.handle_event(click(0, 3))),
-            entry(0, Status::Working)
-        );
-    }
-
-    #[test]
-    fn snapshot_replacement_invalidates_even_an_unchanged_hit_map() {
-        let mut app = many(2);
-        let mut terminal = terminal(80, 8);
-        render(&mut app, &mut terminal);
-        app.replace_snapshot(app.snapshot.clone());
-        assert!(app.handle_event(click(0, 3)).is_none());
-        render(&mut app, &mut terminal);
-        app.replace_snapshot(Snapshot {
-            entries: vec![entry(1, Status::Blocked), entry(0, Status::Working)],
-            warnings: Vec::new(),
-        });
-        assert!(app.handle_event(click(0, 3)).is_none());
-        render(&mut app, &mut terminal);
-        assert_eq!(
-            navigation(app.handle_event(click(0, 3))),
-            entry(1, Status::Blocked)
-        );
-    }
-
-    #[test]
-    fn removed_rows_cannot_be_clicked_before_the_next_draw() {
-        let mut app = many(2);
-        let mut terminal = terminal(80, 8);
-        render(&mut app, &mut terminal);
-        app.replace_snapshot(Snapshot {
-            entries: vec![entry(1, Status::Working)],
-            warnings: Vec::new(),
-        });
-        assert!(app.handle_event(click(0, 3)).is_none());
-        assert!(app.selected.is_none());
-        assert!(app.message.contains("no longer available"));
-        render(&mut app, &mut terminal);
-        assert_eq!(
-            navigation(app.handle_event(click(0, 3))),
-            entry(1, Status::Working)
-        );
-    }
-
-    #[test]
-    fn non_mutating_events_preserve_a_following_click_in_the_same_input_batch() {
-        let mut app = many(2);
-        render(&mut app, &mut terminal(80, 8));
-        for event in [
-            mouse(MouseEventKind::Moved, 1, 4),
-            mouse(MouseEventKind::Up(MouseButton::Left), 1, 4),
-            mouse(MouseEventKind::Drag(MouseButton::Left), 1, 4),
-            Event::Key(KeyEvent::new_with_kind(
-                KeyCode::Down,
-                KeyModifiers::NONE,
-                KeyEventKind::Release,
-            )),
-            Event::FocusGained,
-            Event::Paste("ignored".into()),
-        ] {
-            assert!(app.handle_event(event).is_none());
-            assert_eq!(app.hits.len(), 2);
-        }
-        assert_eq!(
-            navigation(app.handle_event(click(1, 4))),
-            entry(1, Status::Working)
-        );
-    }
-
-    #[test]
-    fn keyboard_input_invalidates_click_regions_until_the_next_draw() {
-        let mut app = many(2);
-        let mut terminal = terminal(80, 8);
-        render(&mut app, &mut terminal);
-        app.handle_event(key(KeyCode::Down));
-        assert!(app.handle_event(click(0, 3)).is_none());
-        assert_eq!(app.selected, Some(entry(1, Status::Working).id));
-        render(&mut app, &mut terminal);
-        assert_eq!(
-            navigation(app.handle_event(click(0, 3))),
-            entry(0, Status::Working)
-        );
-    }
-
-    #[test]
-    fn wheel_scrolls_the_view_and_click_uses_the_drawn_offset() {
-        let mut app = many(15);
-        let mut terminal = terminal(80, 8);
-        render(&mut app, &mut terminal);
-        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 3));
-        assert_eq!(app.scroll, 3);
-        assert_eq!(app.selected, Some(entry(0, Status::Working).id));
-        assert!(app.handle_event(click(0, 3)).is_none());
-        render(&mut app, &mut terminal);
-        assert_eq!(app.hits[0].entry, entry(3, Status::Working));
-        assert_eq!(
-            navigation(app.handle_event(click(0, 3))),
-            entry(3, Status::Working)
-        );
-    }
-
-    #[test]
-    fn wheel_is_bounded_and_does_not_scroll_from_a_footer() {
-        let mut app = many(15);
-        let mut terminal = terminal(80, 8);
-        render(&mut app, &mut terminal);
-        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 7));
-        assert_eq!(app.scroll, 0);
-        for _ in 0..20 {
-            app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 3));
-        }
-        assert_eq!(app.scroll, 12);
-        render(&mut app, &mut terminal);
-        assert_eq!(app.hits.last().unwrap().entry, entry(14, Status::Working));
-        for _ in 0..20 {
-            app.handle_event(mouse(MouseEventKind::ScrollUp, 0, 3));
-        }
-        assert_eq!(app.scroll, 0);
-    }
-
-    #[test]
-    fn unchanged_refresh_preserves_manual_scroll_and_missing_selection_notice() {
-        let mut app = many(15);
-        let mut terminal = terminal(80, 8);
-        render(&mut app, &mut terminal);
-        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 3));
-        render(&mut app, &mut terminal);
-        let scroll = app.scroll;
-        app.replace_snapshot(app.snapshot.clone());
-        render(&mut app, &mut terminal);
-        assert_eq!(app.scroll, scroll);
-        let mut snapshot = app.snapshot.clone();
-        snapshot.entries.remove(0);
-        app.replace_snapshot(snapshot.clone());
-        app.message = "Previous app selection accepted".into();
-        app.replace_snapshot(snapshot);
-        assert!(app.message.contains("no longer available"));
-        assert!(app.selected.is_none());
-    }
-
-    #[test]
-    fn wheel_does_not_change_the_target_of_enter() {
-        let mut app = many(15);
-        render(&mut app, &mut terminal(80, 8));
-        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 3));
-        assert_eq!(
-            navigation(app.handle_event(key(KeyCode::Enter))),
-            entry(0, Status::Working)
-        );
-    }
-
-    #[test]
-    fn resize_invalidates_coordinates_and_reveals_the_same_selection() {
-        let mut app = many(20);
-        let mut terminal = terminal(100, 12);
-        for _ in 0..12 {
-            app.handle_event(key(KeyCode::Down));
-        }
-        render(&mut app, &mut terminal);
-        app.handle_event(Event::Resize(30, 5));
-        assert!(app.handle_event(click(0, 3)).is_none());
-        terminal.backend_mut().resize(30, 5);
-        terminal.resize(Rect::new(0, 0, 30, 5)).unwrap();
-        render(&mut app, &mut terminal);
-        assert_eq!(app.hits.len(), 1);
-        assert_eq!(app.hits[0].entry, entry(12, Status::Working));
-        assert_eq!(
-            navigation(app.handle_event(click(29, 2))),
-            entry(12, Status::Working)
-        );
-    }
-
-    #[test]
-    fn disconnected_and_in_progress_navigation_are_rejected_for_keys_and_mouse() {
-        let mut app = many(2);
-        app.connected = false;
-        assert!(app.handle_event(key(KeyCode::Enter)).is_none());
-        assert!(!app.navigating);
-        assert!(app.message.contains("disconnected"));
-        let mut terminal = terminal(100, 8);
-        render(&mut app, &mut terminal);
-        assert!(app.handle_event(click(0, 4)).is_none());
-        assert!(!app.navigating);
-        app.connected = true;
-        let target = navigation(app.handle_event(key(KeyCode::Enter)));
-        assert_eq!(target, entry(1, Status::Working));
-        assert!(app.navigating);
-        assert!(app.handle_event(key(KeyCode::Enter)).is_none());
-        assert!(app.message.contains("already in progress"));
-        let rows = render(&mut app, &mut terminal);
-        assert!(rows[7].contains("Navigating; please wait"));
-        assert!(app.handle_event(click(0, 3)).is_none());
-        app.navigating = false;
-        assert_eq!(
-            navigation(app.handle_event(key(KeyCode::Enter))),
-            entry(0, Status::Working)
-        );
-    }
-
-    #[test]
-    fn errors_and_partial_snapshot_warnings_remain_visible() {
-        let mut app = many(1);
-        app.message = "Navigation failed: Remote Control denied".into();
-        app.snapshot.warnings = vec!["Pane status unavailable".into(), "Other warning".into()];
-        let mut terminal = terminal(160, 8);
-        let rows = render(&mut app, &mut terminal);
-        assert!(rows[7].contains("Navigation failed: Remote Control denied"));
-        assert!(rows[7].contains("Warnings: 2 (w details)"));
-        app.connected = false;
-        let rows = render(&mut app, &mut terminal);
-        assert!(rows[7].contains("STALE: disconnected"));
-        assert!(rows[7].contains("Navigation failed"));
-        assert!(rows[3].contains("agent-00"));
-    }
-
-    #[test]
-    fn warning_access_precedes_long_client_notices_and_errors_at_eighty_columns() {
-        let mut app = many(1);
-        let message = "Target app client:00000000-0000-0000-0000-000000000001; session focus is shared with other clients";
-        app.message = message.into();
-        app.snapshot.warnings = vec!["First warning".into(), "Second warning".into()];
-        let mut terminal = terminal(80, 8);
-        let rows = render(&mut app, &mut terminal);
-        assert!(rows[6].contains("w details"));
-        assert!(rows[6].contains("q/Esc/Ctrl-C"));
-        assert!(rows[7].contains("Warnings: 2 (w details)"));
-        assert!(rows[7].contains("Target app client:"));
-        assert!(rows[7].find("Warnings:").unwrap() < rows[7].find("Target app").unwrap());
-        assert_eq!(app.message, message);
-
-        app.message = "Navigation failed: Remote Control denied".into();
-        let rows = render(&mut app, &mut terminal);
-        assert!(rows[7].contains("Warnings: 2 (w details)"));
-        assert!(rows[7].contains("Navigation failed: Remote Control denied"));
-        app.connected = false;
-        let rows = render(&mut app, &mut terminal);
-        assert!(rows[7].contains("STALE: disconnected"));
-        assert!(rows[7].contains("Warnings: 2 (w details)"));
-        assert!(rows[7].contains("Navigation"));
-    }
-
-    #[test]
-    fn details_scroll_exposes_the_full_sanitized_message_and_every_warning() {
-        let mut app = many(2);
-        app.message = format!(
-            "Navigation failed: {} \x1b\n\u{202e}MESSAGE-END",
-            "界e\u{301}🦕".repeat(100)
-        );
-        app.snapshot.warnings = (0..8)
-            .map(|index| {
-                format!(
-                    "WARNING-{index}: {} \r\u{2066}WARNING-END-{index}",
-                    "pane status unavailable; ".repeat(20)
-                )
-            })
-            .collect();
-        let message = app.message.clone();
-        let warnings = app.snapshot.warnings.clone();
-        let selected = app.selected.clone();
-        let mut terminal = terminal(80, 8);
-        assert!(app.handle_event(key(KeyCode::Char('w'))).is_none());
-        let rows = render(&mut app, &mut terminal);
-        assert!(rows[0].contains("Details | lines"));
-        assert!(rows[1].contains("Message: Navigation failed:"));
-        assert!(rows[7].contains("Esc/w back | q/Ctrl-C quit"));
-        let mut text: String = rows[1..7].iter().map(|row| row.trim_end()).collect();
-        assert!(!text.contains("WARNING-END-7"));
-        app.handle_event(key(KeyCode::Up));
-        assert_eq!(app.details_scroll, 0);
-        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 7));
-        assert_eq!(app.details_scroll, 0);
-        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 1));
-        assert_eq!(app.details_scroll, 3);
-        app.handle_event(mouse(MouseEventKind::ScrollUp, 0, 1));
-        assert_eq!(app.details_scroll, 0);
-
-        let limit = app.details_limit;
-        for _ in 0..limit {
-            app.handle_event(key(KeyCode::Down));
-            let rows = render(&mut app, &mut terminal);
-            text.push_str(rows[6].trim_end());
-            for cell in &terminal.backend().buffer().content {
-                assert_eq!(plain(cell.symbol()), cell.symbol());
-            }
-        }
-        assert!(text.contains("MESSAGE-END"));
-        assert!(text.contains("Warnings: 8"));
-        for index in 0..8 {
-            assert!(text.contains(&format!("WARNING-{index}:")));
-            assert!(text.contains(&format!("WARNING-END-{index}")));
-        }
-        app.handle_event(key(KeyCode::Down));
-        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 1));
-        assert_eq!(app.details_scroll, limit);
-        assert_eq!(app.message, message);
-        assert_eq!(app.snapshot.warnings, warnings);
-        assert_eq!(app.selected, selected);
-        assert!(!app.navigating);
-    }
-
-    #[test]
-    fn details_never_navigates_on_enter_or_click_and_toggles_invalidate_hits() {
-        let mut app = many(3);
-        app.handle_event(key(KeyCode::Down));
-        app.message = "Navigation failed: denied".into();
-        let selected = app.selected.clone();
-        let mut terminal = terminal(80, 8);
-        render(&mut app, &mut terminal);
-        assert_eq!(app.hits.len(), 3);
-        app.handle_event(key(KeyCode::Char('w')));
-        assert!(app.hits.is_empty());
-        assert!(app.handle_event(click(0, 2)).is_none());
-        render(&mut app, &mut terminal);
-        assert!(app.hits.is_empty());
-        for event in [
-            key(KeyCode::Enter),
-            Event::Key(KeyEvent::new_with_kind(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-                KeyEventKind::Repeat,
-            )),
-            click(0, 2),
-            click(79, 3),
-            click(0, 7),
-            mouse(MouseEventKind::Down(MouseButton::Right), 0, 2),
-        ] {
-            assert!(app.handle_event(event).is_none());
-            assert_eq!(app.selected, selected);
-            assert!(!app.navigating);
-            assert!(app.hits.is_empty());
-            assert_eq!(app.message, "Navigation failed: denied");
-        }
-        app.handle_event(key(KeyCode::Char('w')));
-        assert!(!app.details);
-        assert!(app.handle_event(click(0, 2)).is_none());
-        render(&mut app, &mut terminal);
-        assert_eq!(
-            navigation(app.handle_event(key(KeyCode::Enter))),
-            entry(1, Status::Working)
-        );
-    }
-
-    #[test]
-    fn closing_details_preserves_the_stable_target_and_manual_list_scroll() {
-        let mut app = many(20);
-        for _ in 0..5 {
-            app.handle_event(key(KeyCode::Down));
-        }
-        let mut terminal = terminal(80, 8);
-        render(&mut app, &mut terminal);
-        for _ in 0..2 {
-            app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 3));
-        }
-        render(&mut app, &mut terminal);
-        let scroll = app.scroll;
-        let selected = app.selected.clone();
-        assert!(
-            !app.hits
-                .iter()
-                .any(|hit| Some(&hit.entry.id) == selected.as_ref())
-        );
-        app.message = "Full message. ".repeat(80);
-        app.handle_event(key(KeyCode::Char('w')));
-        render(&mut app, &mut terminal);
-        app.handle_event(key(KeyCode::Down));
-        app.replace_snapshot(app.snapshot.clone());
-        render(&mut app, &mut terminal);
-        assert!(app.details_scroll > 0);
-        assert!(app.handle_event(key(KeyCode::Esc)).is_none());
-        assert!(!app.details);
-        assert!(app.handle_event(click(0, 3)).is_none());
-        render(&mut app, &mut terminal);
-        assert_eq!(app.scroll, scroll);
-        assert_eq!(app.selected, selected);
-        assert_eq!(
-            navigation(app.handle_event(key(KeyCode::Enter))),
-            entry(5, Status::Working)
-        );
-    }
-
-    #[test]
-    fn selection_removed_during_details_still_requires_deliberate_reselection() {
-        let mut app = many(2);
-        app.handle_event(key(KeyCode::Down));
-        app.handle_event(key(KeyCode::Char('w')));
-        app.replace_snapshot(Snapshot {
-            entries: vec![entry(0, Status::Working)],
-            warnings: Vec::new(),
-        });
-        let mut terminal = terminal(80, 8);
-        let rows = render(&mut app, &mut terminal);
-        assert!(rows[1].contains("Selected agent is no longer available"));
-        app.handle_event(key(KeyCode::Char('w')));
-        render(&mut app, &mut terminal);
-        assert!(app.handle_event(key(KeyCode::Enter)).is_none());
-        assert!(app.selected.is_none());
-        assert!(!app.navigating);
-        app.handle_event(key(KeyCode::Down));
-        assert_eq!(
-            navigation(app.handle_event(key(KeyCode::Enter))),
-            entry(0, Status::Working)
-        );
-    }
-
-    #[test]
-    fn details_resize_and_empty_reports_clamp_scroll_without_creating_targets() {
-        let mut app = many(1);
-        app.snapshot.warnings = vec!["Long warning. ".repeat(80)];
-        let selected = app.selected.clone();
-        let mut terminal = terminal(80, 8);
-        render(&mut app, &mut terminal);
-        app.handle_event(key(KeyCode::Char('w')));
-        render(&mut app, &mut terminal);
-        for _ in 0..100 {
-            app.handle_event(key(KeyCode::Down));
-        }
-        assert!(app.details_scroll > 0);
-        app.handle_event(Event::Resize(30, 5));
-        assert!(app.hits.is_empty());
-        assert_eq!(app.viewport, Rect::default());
-        assert!(app.handle_event(click(0, 2)).is_none());
-        terminal.backend_mut().resize(30, 5);
-        terminal.resize(Rect::new(0, 0, 30, 5)).unwrap();
-        let rows = render(&mut app, &mut terminal);
-        assert!(rows[0].contains("Details"));
-        assert_eq!(app.viewport, Rect::new(0, 1, 30, 3));
-        assert!(app.details_scroll <= app.details_limit);
-
-        app.message.clear();
-        app.replace_snapshot(Snapshot {
-            entries: app.snapshot.entries.clone(),
-            warnings: Vec::new(),
-        });
-        app.handle_event(Event::Resize(80, 8));
-        terminal.backend_mut().resize(80, 8);
-        terminal.resize(Rect::new(0, 0, 80, 8)).unwrap();
-        render(&mut app, &mut terminal);
-        assert!(app.details_scroll <= app.details_limit);
-        // Selected location metadata remains available even with no warnings.
-        for _ in 0..app.details_limit {
-            app.handle_event(key(KeyCode::Up));
-        }
-        let rows = render(&mut app, &mut terminal);
-        assert!(rows[1].contains("Message: No current message."));
-        assert!(rows[3].contains("Warnings: 0"));
-        assert!(rows[4].contains("No snapshot warnings."));
-        assert_eq!(app.details_scroll, 0);
-        assert!(app.details_limit > 0);
-        assert_eq!(app.selected, selected);
-        assert!(app.hits.is_empty());
-        assert!(!app.navigating);
-    }
-
-    #[test]
-    fn tiny_details_views_have_no_overflow_or_agent_hit_regions() {
-        for width in [0, 1, 2, 8, 17, 80] {
-            for height in [0, 1, 2, 3, 4, 5, 24] {
-                let mut app = many(3);
-                app.snapshot.warnings = vec!["界e\u{301}🦕".repeat(100)];
-                app.handle_event(key(KeyCode::Char('w')));
-                render(&mut app, &mut terminal(width, height));
-                assert!(app.details);
-                assert!(app.hits.is_empty());
-                assert!(app.handle_event(click(0, 0)).is_none());
-                assert!(app.handle_event(key(KeyCode::Enter)).is_none());
-                assert!(!app.navigating);
-            }
-        }
-    }
-
-    #[test]
-    fn details_return_and_quit_keys_ignore_key_releases() {
-        let mut app = many(1);
-        let mut terminal = terminal(80, 8);
-        render(&mut app, &mut terminal);
-        let release = Event::Key(KeyEvent::new_with_kind(
-            KeyCode::Char('w'),
-            KeyModifiers::NONE,
-            KeyEventKind::Release,
-        ));
-        assert!(app.handle_event(release.clone()).is_none());
-        assert!(!app.details);
-        assert_eq!(app.hits.len(), 1);
-        app.handle_event(key(KeyCode::Char('w')));
-        assert!(app.handle_event(release).is_none());
-        assert!(app.details);
-        assert!(app.handle_event(key(KeyCode::Esc)).is_none());
-        assert!(!app.details);
-        app.handle_event(key(KeyCode::Char('w')));
-        app.connected = false;
-        app.navigating = true;
-        for event in [
-            key(KeyCode::Char('q')),
-            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            Event::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL)),
-        ] {
-            assert!(matches!(app.handle_event(event), Some(Action::Quit)));
-        }
-    }
-
-    #[test]
-    fn direct_public_snapshot_mutation_cannot_retarget_an_old_click() {
-        let mut app = many(2);
-        render(&mut app, &mut terminal(80, 8));
-        app.snapshot.entries[0].target.window = "different-tab".into();
-        assert!(app.handle_event(click(0, 3)).is_none());
-        assert!(app.message.contains("list changed"));
-        assert!(!app.navigating);
-        app.snapshot.entries.remove(0);
-        assert!(app.handle_event(key(KeyCode::Enter)).is_none());
-        assert!(app.selected.is_none());
-        assert!(app.message.contains("no longer available"));
-    }
-
-    #[test]
-    fn quit_keys_work_while_offline_or_navigating_and_releases_are_ignored() {
-        let mut app = App {
-            navigating: true,
-            ..App::default()
-        };
-        for event in [
-            key(KeyCode::Char('q')),
-            key(KeyCode::Esc),
-            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            Event::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL)),
-        ] {
-            assert!(matches!(app.handle_event(event), Some(Action::Quit)));
-        }
-        assert!(app.handle_event(key(KeyCode::Char('c'))).is_none());
-        assert!(
-            app.handle_event(Event::Key(KeyEvent::new_with_kind(
-                KeyCode::Char('q'),
-                KeyModifiers::NONE,
-                KeyEventKind::Release,
-            )))
-            .is_none()
-        );
-    }
-}
+mod tests;

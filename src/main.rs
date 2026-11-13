@@ -4,7 +4,10 @@ use brachio::rex::{Rex, find_executable};
 use brachio::tui::{Action, App};
 use brachio::worker::{Update, Worker};
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -25,7 +28,13 @@ impl TerminalGuard {
         enable_raw_mode()?;
         TERMINAL_ACTIVE.store(true, Ordering::Relaxed);
         let guard = Self;
-        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste,
+            Hide
+        )?;
         Ok(guard)
     }
 }
@@ -47,6 +56,7 @@ fn restore_terminal() {
 
 fn cleanup_terminal() {
     // Attempt every operation, even if one output operation fails.
+    let _ = execute!(io::stdout(), DisableBracketedPaste);
     let _ = execute!(io::stdout(), DisableMouseCapture);
     let _ = execute!(io::stdout(), LeaveAlternateScreen);
     let _ = execute!(io::stdout(), Show);
@@ -67,7 +77,7 @@ fn run() -> Result<(), String> {
         match arg.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "brachio — Rex coding agent status\n\nUsage: brachio [--client client:<uuid>]\n\nSelects the only connected app by default; refuses ambiguous clients.\nKeys: Up/Down select, g cycles grouping (None/Agent/Status/CWD/Session; default None),\nTab/Shift+Tab select next/previous group when grouped, Enter or left click navigate,\nw details, q/Esc/Ctrl-C quit.\nNavigation requires Rex app Remote Control. It can change shared session focus.\nRex CLI: PATH first, then the app-managed installation on macOS."
+                    "brachio — Rex coding agent status\n\nUsage: brachio [--client client:<uuid>]\n\nSelects the only connected app by default; refuses ambiguous clients.\nKeys: Up/Down or j/k select, g/G cycle grouping (None/Agent/Status/CWD/Session; default None),\nTab/Shift+Tab select groups, Left/Right collapse/expand, / filter, ? help,\na/A select Blocked/Error agents, Enter or left click navigate, w details.\nq/Esc close the current view; Ctrl-C quits. Enter on a collapsed group expands it.\nNavigation requires Rex app Remote Control. It can change shared session focus.\nRex CLI: PATH first, then the app-managed installation on macOS."
                 );
                 return Ok(());
             }
@@ -172,18 +182,20 @@ fn run() -> Result<(), String> {
                     app.navigating = false;
                     notice = match result {
                         Ok(()) => {
-                            "Rex accepted app selection; native display is not verified by Brachio"
-                                .into()
+                            app.diagnostic = "Rex accepted app selection; native display is not verified by Brachio".into();
+                            String::new()
                         }
-                        Err(error) => error,
+                        Err(error) => {
+                            app.diagnostic = error.clone();
+                            error
+                        }
                     };
                     app.message = notice.clone();
                 }
                 Update::Client(result) => match result {
                     Ok(id) => {
                         client_error = None;
-                        notice =
-                            format!("Target app {id}; session focus is shared with other clients");
+                        app.client = Some(id);
                         app.message = notice.clone();
                     }
                     Err(error) => {
@@ -387,6 +399,7 @@ mod tests {
                 }
             }
             let quit = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+            assert!(route_input(&mut app, quit.clone(), true).is_none());
             assert!(matches!(
                 route_input(&mut app, quit, true),
                 Some(Action::Quit)

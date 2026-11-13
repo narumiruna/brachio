@@ -4,6 +4,8 @@ A standalone TUI for coding agent status in Rex. Select an agent with the keyboa
 
 Brachio does not send prompts, keys, or commands to agents. It is not a native sidebar and does not stay visible across tabs.
 
+![Brachio TUI](https://sharex.narumi.dev/2026/11/14/tui.jpg)
+
 ## Requirements and installation
 
 - macOS or Linux with an interactive terminal and mouse reporting.
@@ -62,22 +64,34 @@ Brachio uses the CLI's normal server connection. Check `rex whoami --json` befor
 
 | Input | Operation |
 | --- | --- |
-| Up / Down | Select an agent |
-| g | Cycle views: None → Agent → Status → CWD → Session; None is the default |
-| Tab / Shift+Tab | Select the first agent in the next / previous group; wrap at either end |
-| Enter | Navigate to the selected agent |
-| Left click | Select and navigate to that row |
+| Up / Down or k / j | Select the previous / next visible agent; collapsed headers are selectable |
+| g / G | Cycle grouping forward / backward: None → Agent → Status → CWD → Session |
+| Tab / Shift+Tab | Select the first matching agent in the next / previous group; wrap at either end |
+| Left / Right | Collapse / expand the selected group |
+| Enter | Navigate to the selected visible agent; on a collapsed group, expand only |
+| Left click | Select and navigate to an agent row; a group-header click only toggles its fold |
 | Mouse wheel | Scroll without changing the selected agent |
-| w | Open details with messages, warnings, and full values for the selected agent |
-| Up / Down or wheel in details | Scroll details; w / Escape returns to agents |
-| q / Escape / Ctrl-C | Exit |
-| Terminal resize | Recalculate the visible rows |
+| / | Edit the filter incrementally |
+| a / A | Select the next / previous matching Blocked or Error agent; wrap and expand its group |
+| w | Open Details with diagnostics, messages, warnings, status source, and full selected-agent values |
+| ? | Open keyboard help |
+| Up / Down, PageUp / PageDown, or wheel in overlays | Scroll Details or Help |
+| q / Escape in overlays | Close Details or Help first; w also closes Details and ? closes Help |
+| q / Escape on the list | q exits; Escape clears a query first, otherwise exits |
+| Ctrl-C | Quit from any view, including filter editing |
+| Terminal resize | Recalculate the layout and visible rows |
 
-Each row has separate **Working directory**, **Session**, **Tab**, and **Pane** columns. Locations use readable names, not ID suffixes. Unnamed sessions/tabs/panes use their display positions; generated tab names become `Tab N`. Long names end with `…`; long directories keep the path end visible. Press `w` and scroll to see complete column values and exact navigation IDs. No elapsed task time is inferred from status timestamps.
+The list has six independent columns: **Status**, **Agent**, **Working directory** (CWD), **Session**, **Tab**, and **Pane**. Session, Tab, and Pane use readable names, never a combined Location field or ID suffixes. Unnamed locations use display positions; generated tab names become `Tab N`.
 
-The default **None** view keeps the original ungrouped list and its status, location, and exact identity order. It has no **Group by** title or blank rows between groups. Keyboard hints appear only below the list.
+Column widths use the terminal-cell width of matching agent values and headings, including agents in collapsed groups. Two spaces separate visible columns. Extra terminal width stays on the right rather than spreading columns apart. Natural widths are capped at 9, 20, 48, 24, 20, and 24 cells respectively. The selected-row highlight still spans the whole terminal width.
 
-When space permits, a solid line appears below the column headings. Grouped views show the grouping mode in the title, with one blank row between adjacent groups. The header line and blank rows cannot be selected or clicked. Equal group values appear together in the table:
+When space is limited, values shorten before lower-priority columns disappear. Pane, Tab, and Session are hidden in that order when their minimum widths no longer fit. Very small views use status symbols and shorter Agent/CWD values before hiding essential fields. Visibility follows measured content, not fixed terminal-width breakpoints. Hidden values remain available in Details.
+
+Long names end with `…`; long directories keep the path end visible. An absolute path under `HOME` is displayed with `~` at a path-component boundary. Abbreviation and clipping change display only: Details retains the original full path and exact navigation IDs.
+
+The default **None** view keeps the original ungrouped list and its status, location, and exact identity order. It has no grouping title or group headers. Keyboard hints appear only below the list. When space permits, a solid line appears below the column headings.
+
+Grouped views show the mode in the title. Foldable headers with matching-agent counts appear only when at least two nonempty groups remain after filtering. With zero or one group, there are no group headers or folds. Under actual multiple headers, Status, Agent, CWD, or Session grouping hides its matching data column without leaving an empty gap. With one group, that column returns. Tab and Pane remain independent in every mode. Equal group values appear together:
 
 - **Agent** uses canonical agent names.
 - **Status** uses this priority: **Blocked, Error, Done, Unknown, Working, Idle**.
@@ -87,7 +101,13 @@ When space permits, a solid line appears below the column headings. Grouped view
 
 Agent names, paths, and session names use case-sensitive text order. Within each group, rows keep status priority, then location and exact identity order.
 
-Press `g` to change the grouping mode without changing the selected agent. `Tab` and `Shift+Tab` skip the current group and select the first agent in the next or previous nonempty group. With no selection, they select the first or last group; with one group, they select its first agent. These keys do not navigate Rex and have no effect in details. `Tab` and `Shift+Tab` also have no effect in the ungrouped view. Grouping is not saved after exit.
+Press `g` or `G` to change the grouping mode without changing the selected agent. `Tab` and `Shift+Tab` keep their group-jump operation: they skip the current group and select the first matching agent in the next or previous nonempty group, not the next or previous agent. With no visible selection, they select the first or last group; with one group, they select its first agent. They do not navigate Rex, expand folds, or act in None, Details, Help, or filter editing. Grouping, folds, and filters are not saved after exit.
+
+Left / Right folds the selected group only when multiple group headers exist. A header click toggles that group without changing the selected agent or navigating. Collapsing the selected agent's group retains its exact ID; Enter expands the group without navigation. Press Enter again to navigate to that agent.
+
+Press `/` to edit a case-insensitive substring filter. Every whitespace-separated term must match (AND). Use `agent:`, `cwd:`, `session:`, or `status:` to restrict a term to that field. Unqualified terms also search tab and pane names; unknown prefixes are literal text. For example, `agent:pi cwd:project status:blocked` requires all three matches. Filtering updates while you type or paste. Enter applies the query without navigation; Escape cancels editing and restores the previous query. Outside editing, Escape clears a query before it can exit. Filtering retains the selected ID, but a hidden selection cannot navigate. Use arrows, a group jump, an attention jump, or a click to select a matching target.
+
+The bounded footer shows connection state, compact agent counts, and nonzero attention (Blocked/Error) and working counts when space permits. It omits zero-warning text, UUIDs, and full diagnostics. A warning count or `Notice (w)` points to Details; `?` shows all controls even when footer hints do not fit.
 
 Selection uses the session ID, block ID, and canonical agent name, not a row number. If the selected entry disappears, navigation stops until you deliberately select another row with arrows, a group jump, or a click. Snapshot changes invalidate old mouse hit regions. Queued input is read before list redraws; mouse-down events that arrive during a redraw are discarded with a retry message rather than mapped to a replacement row. Terminal events do not carry a display-generation token, so this is not a guarantee about delayed physical input.
 
@@ -101,7 +121,8 @@ Recognized status `app` / `effective_app` values are `pi`, `claude-code` (alias 
 - Claude Code and Codex mappings have fixture coverage only. Their actual status reporting depends on the agent and Rex integration; it is not native end-to-end support evidence.
 - An exact recognized foreground script basename, `argv0`, or executable name can identify an agent with **Unknown** status. An interpreter such as `node` or `python` alone cannot.
 - Other applications and agents without an explicit recognized identity are omitted. An empty list is not proof that no agents are running.
-- Missing or future states are **Unknown**, never assumed Working or Idle. A failed status query is shown as a warning.
+- The status model is unchanged: **Blocked, Error, Done, Unknown, Working, Idle**. Missing or future states are **Unknown**, never assumed Working or Idle. Unknown has a neutral gray display. No **Waiting** state or need for input is inferred from Blocked. A failed status query is shown as a warning.
+- **Done** is a reported state, not proof of whole-session completion. Status timestamps do not establish elapsed task time.
 - Records inherit `app` from their nearest reported ancestor if Rex does not supply `effective_app`. Duplicate parent IDs are ambiguous and do not establish inheritance. Replies over the protocol limit of 256 records are rejected.
 - All records for the same recognized app in one pane become one row. The most urgent reported status wins; record order does not change the result.
   - Separate instances of the same app in one pane are intentionally not distinguished.
@@ -114,7 +135,7 @@ Recognized status `app` / `effective_app` values are `pi`, `claude-code` (alias 
 
 A background worker obtains the initial snapshot. The CLI event stream invalidates snapshots; event bursts are coalesced. Full reconciliation also runs two seconds after each completed refresh, so missed or unknown events cannot permanently leave old state. Commands run outside the input/render loop. One dedicated navigation thread performs focus and app selection; read-only snapshot and event workers cannot change focus. A slow full-session scan does not delay navigation to a healthy target pane.
 
-A failed server snapshot retains the old list as **STALE** and disables navigation. Per-session or per-pane failures produce a partial list and warnings. Event-stream loss is shown as a warning while periodic snapshots continue; the listener reconnects. A silent recovered listener remains marked uncertain until it delivers an event.
+A failed server snapshot retains the old list as stale, shows a disconnected status, and disables navigation. Per-session or per-pane failures produce a partial list and warnings. Event-stream loss is shown as a warning while periodic snapshots continue; the listener reconnects. A silent recovered listener remains marked uncertain until it delivers an event.
 
 Navigation rechecks the pinned client, action schema, pane location, and agent identity. It then issues exact-ID `focus`, verifies the resulting server focus, and sends `session.select` with both session and window IDs to that client. It does not retry a failed mutation or select a nearby pane.
 
@@ -160,7 +181,9 @@ flowchart LR
 - `src/rex.rs`: verified CLI schemas, snapshots, and navigation.
 - `src/process.rs`: bounded subprocess I/O and owned-process cleanup.
 - `src/worker.rs`: reconciliation, event reconnect, and navigation scheduling.
-- `src/tui.rs`: rendering, selection, scrolling, and input.
+- `src/tui.rs`: view state, rendering, selection, scrolling, and input.
+- `src/tui/list.rs`: grouping and filtering.
+- `src/tui/presentation.rs`: responsive columns, status display, clipping, and footer text.
 - `src/main.rs`: CLI, terminal guard, signal handling, and application loop.
 
 ## Recovery and release limits
