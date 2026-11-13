@@ -25,6 +25,8 @@ const MOUSE_ENABLE: &[u8] = b"\x1b[?1000h";
 const MOUSE_DISABLE: &[u8] = b"\x1b[?1000l";
 const SGR_MOUSE_ENABLE: &[u8] = b"\x1b[?1006h";
 const SGR_MOUSE_DISABLE: &[u8] = b"\x1b[?1006l";
+const PASTE_ENABLE: &[u8] = b"\x1b[?2004h";
+const PASTE_DISABLE: &[u8] = b"\x1b[?2004l";
 const CURSOR_HIDE: &[u8] = b"\x1b[?25l";
 const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
 
@@ -264,6 +266,7 @@ fn assert_termios_restored(before: &libc::termios, after: &libc::termios) {
 #[derive(Clone, Copy, Debug)]
 enum Termination {
     Byte(u8),
+    FilterPaste,
     Signal(libc::c_int),
     FloodSignal(libc::c_int),
 }
@@ -325,9 +328,15 @@ fn assert_terminal_cleanup_with_mock(termination: Termination, mock: MockRex) {
         }
         let state = pty.termios().expect("read terminal startup state");
         if state.c_lflag & (libc::ICANON | libc::ECHO) == 0
-            && [ALT_ENTER, MOUSE_ENABLE, SGR_MOUSE_ENABLE, CURSOR_HIDE]
-                .iter()
-                .all(|sequence| contains(&output, sequence))
+            && [
+                ALT_ENTER,
+                MOUSE_ENABLE,
+                SGR_MOUSE_ENABLE,
+                PASTE_ENABLE,
+                CURSOR_HIDE,
+            ]
+            .iter()
+            .all(|sequence| contains(&output, sequence))
             && mock.was_called()
         {
             break;
@@ -348,6 +357,33 @@ fn assert_terminal_cleanup_with_mock(termination: Termination, mock: MockRex) {
     let mut flood = None;
     match termination {
         Termination::Byte(byte) => pty.master.write_all(&[byte]).expect("send quit byte"),
+        Termination::FilterPaste => {
+            pty.master
+                .write_all(b"/\x1b[200~needle\nq\ng?\x1b[201~")
+                .expect("paste multiline filter");
+            let deadline = Instant::now() + DEADLINE;
+            loop {
+                read_available(&mut pty.master, &mut output).expect("read pasted query");
+                assert!(
+                    child.try_wait().expect("poll paste input").is_none(),
+                    "pasted q became a quit command"
+                );
+                // Ratatui can reuse unchanged screen cells within the query.
+                // Its unique command-like suffix and edit-mode hint must still be drawn.
+                if contains(&output, b"qg?") && contains(&output, b"Enter Apply") {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "pasted query was not kept as filter text: {:?}",
+                    String::from_utf8_lossy(&output)
+                );
+                thread::sleep(POLL_INTERVAL);
+            }
+            pty.master
+                .write_all(b"\rq")
+                .expect("apply filter then quit");
+        }
         Termination::Signal(signal) | Termination::FloodSignal(signal) => {
             if matches!(termination, Termination::FloodSignal(_)) {
                 flood = Some(InputFlood::start(pty.master.try_clone().unwrap()));
@@ -391,7 +427,13 @@ fn assert_terminal_cleanup_with_mock(termination: Termination, mock: MockRex) {
         &initial,
         &pty.termios().expect("read terminal state after exit"),
     );
-    for sequence in [SGR_MOUSE_DISABLE, MOUSE_DISABLE, ALT_LEAVE, CURSOR_SHOW] {
+    for sequence in [
+        PASTE_DISABLE,
+        SGR_MOUSE_DISABLE,
+        MOUSE_DISABLE,
+        ALT_LEAVE,
+        CURSOR_SHOW,
+    ] {
         assert!(
             contains(&output[cleanup_start..], sequence),
             "missing cleanup sequence {:?} after {termination:?}; output: {:?}",
@@ -450,8 +492,19 @@ fn help_without_a_terminal() {
     assert!(output.status.success());
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(help.contains("Usage: brachio"));
-    assert!(help.contains("g cycles grouping (None/Agent/Status/CWD/Session; default None)"));
-    assert!(help.contains("Tab/Shift+Tab select next/previous group when grouped"));
+    for controls in [
+        "Up/Down or j/k select",
+        "g/G cycle grouping (None/Agent/Status/CWD/Session; default None)",
+        "Tab/Shift+Tab select groups",
+        "Left/Right collapse/expand",
+        "/ filter, ? help",
+        "a/A select Blocked/Error agents",
+        "Enter or left click navigate, w details",
+        "q/Esc close the current view; Ctrl-C quits",
+        "Enter on a collapsed group expands it",
+    ] {
+        assert!(help.contains(controls), "missing CLI help: {controls}");
+    }
     assert!(output.stderr.is_empty());
 }
 
@@ -518,6 +571,11 @@ fn managed_rex_outside_path_starts_and_restores_terminal() {
     let mock = MockRex::managed_installation();
     assert!(!mock.bin.join("rex").exists());
     assert_terminal_cleanup_with_mock(Termination::Byte(b'q'), mock);
+}
+
+#[test]
+fn bracketed_multiline_filter_paste_is_text_and_restores_terminal() {
+    assert_terminal_cleanup(Termination::FilterPaste);
 }
 
 #[test]
