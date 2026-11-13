@@ -153,4 +153,4 @@ Brachio retries transient connection and initial app-discovery failures. Exit an
 
 Native app switching and physical mouse delivery require the manual checks in the handoff document before claiming end-to-end platform support. Windows is not supported. The CI workflow checks Linux and macOS PTY/process behavior; native Rex UI behavior is not established by those tests.
 
-The [publishing guide](docs/publishing.md) describes registry setup, tag-triggered publication to crates.io and PyPI, verification, and recovery. A maintainer must confirm both registry names and authorize each release. Publication is not a transaction across the two registries.
+The [publishing guide](docs/publishing.md) describes changenote setup, change notes, version preparation, registry setup, tag-triggered publication to crates.io and PyPI, verification, and recovery. Add or update a `.changenote/` note for changes that need a release, then run `changenote status`. A maintainer must confirm both registry names and authorize each release action. Publication is not a transaction across the two registries.

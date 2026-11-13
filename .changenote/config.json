@@ -1,0 +1,19 @@
+{
+  "$schema": "https://raw.githubusercontent.com/narumiruna/changenote/f4423760122463bf03a8d161c6f0bc4173afb6e0/schema.json",
+  "base_branch": "origin/main",
+  "changed_file_patterns": [
+    "src/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "pyproject.toml",
+    "uv.lock",
+    ".github/workflows/publish.yml"
+  ],
+  "packages": {
+    "brachio": {
+      "path": ".",
+      "version_file": "Cargo.toml",
+      "tag_prefix": "v"
+    }
+  }
+}
