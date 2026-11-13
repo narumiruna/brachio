@@ -1,12 +1,14 @@
 name: Release
 
 on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   push:
     branches: [main]
   workflow_dispatch:
     inputs:
       operation:
-        description: Manage the release PR or retry GitHub publication
+        description: Manage the release PR or retry publication
         type: choice
         default: manage-pr
         options: [manage-pr, retry-publication]
@@ -15,13 +17,43 @@ permissions:
   contents: read
 
 concurrency:
-  group: changenote-release-main
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  release:
-    if: github.ref == 'refs/heads/main'
+  notes:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          python-version: "3.12"
+          enable-cache: false
+      - name: Show pending releases
+        run: uvx changenote==0.9.2 status --include-note-paths
+      - name: Check PR notes
+        shell: bash
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
+          SKIP_RELEASE: ${{ contains(github.event.pull_request.labels.*.name, 'skip-changenote') }}
+        run: |
+          : "${BASE_BRANCH:?PR base branch is required}"
+          args=(check "--since=refs/remotes/origin/$BASE_BRANCH" --coverage=package)
+          if [[ "$SKIP_RELEASE" == "true" ]]; then
+            args+=(--skip-release --reason "Maintainer approved a note exemption; see the PR description.")
+          fi
+          uvx changenote==0.9.2 "${args[@]}"
+
+  release:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      release-commit: ${{ steps.release.outputs.release-commit }}
+      version: ${{ steps.release.outputs.release-commit != '' && fromJSON(steps.release.outputs.releases)[0].version || '' }}
     steps:
       - name: Check release token
         shell: bash
@@ -38,7 +70,126 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: narumiruna/changenote/release@f4423760122463bf03a8d161c6f0bc4173afb6e0
+        id: release
         with:
           github-token: ${{ secrets.PAT_TOKEN }}
           base-branch: main
           operation: ${{ inputs.operation || 'auto' }}
+
+  validate:
+    needs: release
+    if: needs.release.outputs.release-commit != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.release.outputs.release-commit }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          python-version: "3.12"
+          enable-cache: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt, clippy
+      - run: uv lock --check
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+      - run: cargo build --locked --release
+      - run: cargo publish --locked --dry-run
+
+  wheels:
+    needs: [release, validate]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.release.outputs.release-commit }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          python-version: "3.12"
+          enable-cache: false
+      - name: Build platform wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          maturin-version: v1.15.0
+          target: ${{ matrix.target }}
+          manylinux: 2_28
+          args: --release --locked --out dist --compatibility pypi
+      - name: Check installed wheel
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          actual=$(uvx --isolated --no-index --find-links dist brachio --version)
+          test "$actual" = "brachio $EXPECTED_VERSION"
+          uvx --isolated --no-index --find-links dist brachio --help
+      - name: Build source distribution
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          maturin-version: v1.15.0
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: python-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  crates-io:
+    needs: [release, validate, wheels]
+    runs-on: ubuntu-latest
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/brachio
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.release.outputs.release-commit }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked
+
+  pypi:
+    needs: [validate, wheels]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/brachio/
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: python-*
+          merge-multiple: true
+          path: dist
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          enable-cache: false
+      - name: Publish to PyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        run: uv publish --trusted-publishing never --check-url https://pypi.org/simple/ dist/*
