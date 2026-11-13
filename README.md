@@ -8,7 +8,7 @@ Brachio does not send prompts, keys, or commands to agents. It is not a native s
 
 - macOS or Linux with an interactive terminal and mouse reporting.
 - For installation, use Cargo or [uv](https://docs.astral.sh/uv/). A PyPI wheel does not require Rust. Source builds require Rust stable and Cargo.
-- The official Rex CLI on `PATH`, connected to the intended server.
+- The official Rex CLI, connected to the intended server. Brachio checks `PATH` first. On macOS, it also checks the app-managed installation described below.
 - An open Rex app. Brachio uses the `session.select` app action to show a session or tab. This action requires **Remote Control**.
   - In Rex, open **Settings → Rex Server** and enable **Remote Control**. It is off by default.
   - Enable this only if you accept remote app control. Brachio does not change it.
@@ -37,12 +37,24 @@ cargo install --path . --locked
 
 ## Start and operate
 
+You can start Brachio from Ghostty or another terminal; it does not need to run inside Rex. Keep the Rex app open.
+
+Brachio uses the first executable `rex` on `PATH`. If none is found on macOS, it checks:
+
+```text
+~/Library/Application Support/com.superlogical.rex/RexServer/Versions/Current/Rex Server.app/Contents/MacOS/rex
+```
+
+This uses Rex's current CLI without a fixed version number or changes to your shell or terminal configuration. If neither location has an executable CLI, Brachio reports an error before it changes terminal modes. On Linux, `rex` must be on `PATH`.
+
 ```sh
 brachio
 brachio --help
 rex --autostart=false client ls --json
 brachio --client 'client:<full-uuid-from-the-list>'
 ```
+
+If `rex` is not on `PATH`, use the full CLI path above for the client-list command.
 
 With one connected app, Brachio selects and retains its full client ID. Connection failures and an absent app are retried until the first pin. With multiple apps, use `--client` with a full ID; ambiguity remains refused until restart, even if an app later disconnects. Labels and suffixes are not accepted. Once pinned, a disconnected selected app prevents navigation without substitution. Restart to select a different client.
 

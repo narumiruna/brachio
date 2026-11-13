@@ -1,6 +1,6 @@
 use brachio::model::{plain, valid_id};
 use brachio::process::Runner;
-use brachio::rex::Rex;
+use brachio::rex::{Rex, find_executable};
 use brachio::tui::{Action, App};
 use brachio::worker::{Update, Worker};
 use crossterm::cursor::{Hide, Show};
@@ -67,7 +67,7 @@ fn run() -> Result<(), String> {
         match arg.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "brachio — Rex coding agent status\n\nUsage: brachio [--client client:<uuid>]\n\nSelects the only connected app by default; refuses ambiguous clients.\nKeys: Up/Down select, Enter or left click navigate, q/Esc/Ctrl-C quit.\nNavigation requires Rex app Remote Control. It can change shared session focus."
+                    "brachio — Rex coding agent status\n\nUsage: brachio [--client client:<uuid>]\n\nSelects the only connected app by default; refuses ambiguous clients.\nKeys: Up/Down select, Enter or left click navigate, q/Esc/Ctrl-C quit.\nNavigation requires Rex app Remote Control. It can change shared session focus.\nRex CLI: PATH first, then the app-managed installation on macOS."
                 );
                 return Ok(());
             }
@@ -93,6 +93,7 @@ fn run() -> Result<(), String> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("stdin and stdout must be terminals; use --help for usage".into());
     }
+    let executable = find_executable()?;
     let stop = Arc::new(AtomicBool::new(false));
     for signal in [
         signal_hook::consts::SIGINT,
@@ -101,7 +102,7 @@ fn run() -> Result<(), String> {
     ] {
         signal_hook::flag::register(signal, stop.clone()).map_err(|error| error.to_string())?;
     }
-    let runner = Runner::new("rex", stop.clone());
+    let runner = Runner::new(executable, stop.clone());
     let worker = Worker::start(Rex::new(runner), client, stop.clone())?;
     let guard = TerminalGuard::enter().map_err(|error| error.to_string())?;
     let previous_hook = std::panic::take_hook();

@@ -31,6 +31,7 @@ const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
 struct MockRex {
     root: TempDir,
     bin: PathBuf,
+    executable: PathBuf,
 }
 
 impl MockRex {
@@ -53,9 +54,25 @@ impl MockRex {
             b"#!/bin/sh\nprintf '%s\\n' '--call--' \"$@\" >> \"${0%/*}/smoke-rex.log\"\nprintf '%s\\n' 'offline smoke fixture' >&2\nexit 1\n",
         )
         .expect("write offline Rex mock");
-        fs::set_permissions(rex, fs::Permissions::from_mode(0o700))
+        fs::set_permissions(&rex, fs::Permissions::from_mode(0o700))
             .expect("make offline Rex mock executable");
-        Self { root, bin }
+        Self {
+            root,
+            bin,
+            executable: rex,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn managed_installation() -> Self {
+        let mut mock = Self::new();
+        let installed = mock.root.path().join(
+            "Library/Application Support/com.superlogical.rex/RexServer/Versions/Current/Rex Server.app/Contents/MacOS/rex",
+        );
+        fs::create_dir_all(installed.parent().unwrap()).expect("create app-managed CLI directory");
+        fs::rename(&mock.executable, &installed).expect("move CLI outside PATH");
+        mock.executable = installed;
+        mock
     }
 
     fn command(&self) -> Command {
@@ -72,7 +89,7 @@ impl MockRex {
     }
 
     fn was_called(&self) -> bool {
-        self.bin.join("smoke-rex.log").is_file()
+        self.executable.with_file_name("smoke-rex.log").is_file()
     }
 }
 
@@ -289,7 +306,10 @@ impl Drop for InputFlood {
 }
 
 fn assert_terminal_cleanup(termination: Termination) {
-    let mock = MockRex::new();
+    assert_terminal_cleanup_with_mock(termination, MockRex::new());
+}
+
+fn assert_terminal_cleanup_with_mock(termination: Termination, mock: MockRex) {
     let mut pty = Pty::new().expect("open owned PTY");
     let initial = pty.termios().expect("read initial terminal state");
     let mut child = pty.spawn(mock.command()).expect("spawn brachio on PTY");
@@ -462,6 +482,39 @@ fn invalid_client_is_rejected_before_terminal_setup() {
                 .contains("--client requires a full client:<uuid> ID")
         );
     }
+}
+
+#[test]
+fn missing_rex_is_rejected_before_terminal_setup() {
+    let mock = MockRex::new();
+    fs::remove_file(&mock.executable).expect("remove Rex from isolated PATH");
+    let mut pty = Pty::new().expect("open owned PTY");
+    let initial = pty.termios().unwrap();
+    let mut child = pty.spawn(mock.command()).expect("spawn brachio on PTY");
+    let mut output = Vec::new();
+    let deadline = Instant::now() + DEADLINE;
+    let status = loop {
+        read_available(&mut pty.master, &mut output).expect("read missing CLI error");
+        if let Some(status) = child.try_wait().expect("poll brachio exit") {
+            drain(&mut pty.master, &mut output);
+            break status;
+        }
+        assert!(Instant::now() < deadline, "missing CLI check timed out");
+        thread::sleep(POLL_INTERVAL);
+    };
+    assert_eq!(status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output).contains("Rex CLI not found"));
+    assert!(!output.contains(&0x1b), "terminal setup before CLI check");
+    assert!(!mock.was_called());
+    assert_termios_restored(&initial, &pty.termios().unwrap());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn managed_rex_outside_path_starts_and_restores_terminal() {
+    let mock = MockRex::managed_installation();
+    assert!(!mock.bin.join("rex").exists());
+    assert_terminal_cleanup_with_mock(Termination::Byte(b'q'), mock);
 }
 
 #[test]
