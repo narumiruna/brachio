@@ -95,13 +95,13 @@ The server describes session focus as shared session state. A client action can 
 
 - Model tests: multiple apps, related records, parent inheritance, missing/future states, clear, unsupported apps, safe text, and exact resource IDs. Location labels stay separate from IDs; directory changes cannot change agent identity or navigation targets.
 - Mock CLI tests: multiple sessions/tabs/panes, detached and nonterminal blocks, empty status, retained completed reports, malformed JSON, unsupported status, ambiguous locations, pinned app choice, transient startup discovery recovery, refusal to replace a pin, precise ordered arguments, stale/moved panes, focus failure, permission refusal, event refresh, reconnect, navigation during a slow scan, and worker shutdown.
-- TUI tests: empty and long lists, status groups, readable location columns, working-directory path clipping, Unicode clipping, tiny viewports, scroll, resize, stable selection, removed targets, stale click maps, keyboard/mouse target equivalence, disabled navigation, and complete scrollable message/warning/selected-agent details. Input tests confirm that clicks before or after a details redraw do not replace error messages.
+- TUI tests: empty and long lists, Agent/Status/CWD/Session grouping, mode changes, next/previous group selection and wraparound, canonical agent and full-path group keys, unknown CWD grouping, same-name session separation, readable location columns, working-directory path clipping, Unicode clipping, tiny viewports, scroll, resize, stable selection, removed targets, stale click maps, keyboard/mouse target equivalence, disabled navigation, and complete scrollable message/warning/selected-agent details. Input tests confirm that clicks before or after a details redraw do not replace error messages.
 - Subprocess tests: timeout, cancellation, argument boundaries, invalid encoding, output limits, stderr failures, stream framing, EOF, and owned descendant cleanup.
 - PTY smoke tests: actual binary startup and keyboard/signal exits with terminal-mode and escape cleanup, including SIGTERM during sustained input. Nonterminal and argument errors exit without starting the TUI.
 
 ### Local results
 
-All four standard checks passed on macOS with the measured Rust toolchain. The suite has 102 tests: 71 library tests, two redraw/input routing tests, 19 mock Rex integration tests, and 10 PTY/CLI smoke tests. Three additional complete test runs passed before the location/working-directory update. Release binary help/version checks also passed without terminal setup or Rex navigation.
+All four standard checks passed on macOS with the measured Rust toolchain. The suite has 121 tests: 88 library tests, two redraw/input routing tests, 19 mock Rex integration tests, and 12 PTY/CLI smoke tests. Three additional complete test runs passed before the location/working-directory update. Release binary help/version checks also passed without terminal setup or Rex navigation.
 
 Repeated verification exposed and corrected a Darwin process-exit transition where group signaling can report EPERM before waitid exposes exit. The runner retains child identity during a bounded retry; a 100-short-stream regression checks this path. Process and mock CLI fixtures use serialized execution to avoid cold-executable launch saturation. Worker concurrency remains active within each fixture, including the slow-scan navigation test. Process fixtures also use startup-specific test deadlines; production request deadlines remain unchanged.
 
@@ -126,6 +126,11 @@ Prerequisite: a prepared Rex app with multiple sessions, tabs, panes, recognized
 1. Start Brachio in a pane or tab. Confirm the expected agents, statuses, and locations.
 2. Use Enter and left click on the same entry. Confirm that the intended app shows exactly its session, tab, and pane.
 3. Return to the TUI and repeat after status changes, scrolling, and terminal resize.
+   - Use multiple agent types, statuses, directories, and sessions.
+   - Press `g` to cycle Agent, Status, CWD, and Session grouping. Confirm that the selected agent stays the same.
+   - Press `Tab` / `Shift+Tab` to select the first agent of the next / previous nonempty group. Check wraparound and confirm that the selected row stays visible.
+   - Confirm that these keys do not switch Rex panes. Confirm that Enter still navigates to the exact selected agent.
+   - Check these keys on the physical terminal. Confirm that they have no effect in details.
 4. Close the selected pane. Confirm that the entry disappears and Enter cannot silently select another row.
 5. Disconnect/reconnect Rex. Confirm stale indication, navigation blocking, and eventual resynchronization.
 6. Test with Remote Control disabled and with multiple app clients. Confirm refusal or explicit client selection, without fallback.
@@ -134,7 +139,7 @@ Prerequisite: a prepared Rex app with multiple sessions, tabs, panes, recognized
 
 Expected result: only the requested navigation occurs; no prompt, key, agent command, pane closure, or permission change is sent.
 
-Unverified: physical mouse delivery, visible app switching, return-to-TUI behavior, native resize, and shared-client UI effects. **Do not claim native end-to-end platform acceptance before these checks pass.**
+Unverified: physical group-key and mouse delivery, visible app switching, return-to-TUI behavior, native resize, and shared-client UI effects. **Do not claim native end-to-end platform acceptance before these checks pass.**
 
 ### Package maintainer: release
 

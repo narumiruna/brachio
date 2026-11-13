@@ -448,7 +448,10 @@ fn run_cli(args: &[&str]) -> Output {
 fn help_without_a_terminal() {
     let output = run_cli(&["--help"]);
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("Usage: brachio"));
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("Usage: brachio"));
+    assert!(help.contains("g cycles grouping (Agent/Status/CWD/Session; default Status)"));
+    assert!(help.contains("Tab/Shift+Tab select next/previous group"));
     assert!(output.stderr.is_empty());
 }
 

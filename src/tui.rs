@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::{
     Frame,
@@ -20,6 +22,55 @@ struct HitRegion {
     entry: Entry,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum GroupBy {
+    Agent,
+    #[default]
+    Status,
+    Cwd,
+    Session,
+}
+
+impl GroupBy {
+    fn next(self) -> Self {
+        match self {
+            Self::Agent => Self::Status,
+            Self::Status => Self::Cwd,
+            Self::Cwd => Self::Session,
+            Self::Session => Self::Agent,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Agent => "Agent",
+            Self::Status => "Status",
+            Self::Cwd => "CWD",
+            Self::Session => "Session",
+        }
+    }
+
+    fn compare(self, a: &Entry, b: &Entry) -> Ordering {
+        match self {
+            Self::Agent => a.id.agent.cmp(&b.id.agent),
+            Self::Status => a.status.cmp(&b.status),
+            Self::Cwd => (a.working_dir.is_none(), &a.working_dir)
+                .cmp(&(b.working_dir.is_none(), &b.working_dir)),
+            Self::Session => {
+                (&a.location.session, &a.id.session).cmp(&(&b.location.session, &b.id.session))
+            }
+        }
+    }
+
+    fn sort(self, snapshot: &mut Snapshot) {
+        snapshot.sort();
+        if self != Self::Status {
+            // Stable sorting keeps status priority, location, and identity order within each group.
+            snapshot.entries.sort_by(|a, b| self.compare(a, b));
+        }
+    }
+}
+
 /// View and input state only. The caller supplies snapshots and runs navigation.
 #[derive(Default)]
 pub struct App {
@@ -27,6 +78,7 @@ pub struct App {
     pub message: String,
     pub connected: bool,
     pub navigating: bool,
+    group_by: GroupBy,
     selected: Option<EntryId>,
     selection_missing: bool,
     received_snapshot: bool,
@@ -42,7 +94,7 @@ pub struct App {
 impl App {
     /// Use this method for updates so that clicks cannot use an old list layout.
     pub fn replace_snapshot(&mut self, mut snapshot: Snapshot) {
-        snapshot.sort();
+        self.group_by.sort(&mut snapshot);
         self.hits.clear();
         let old_index = self.selected_index();
         self.snapshot = snapshot;
@@ -79,7 +131,15 @@ impl App {
         let invalidates = match &event {
             Event::Key(key) => {
                 key.kind != KeyEventKind::Release
-                    && matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Enter)
+                    && matches!(
+                        key.code,
+                        KeyCode::Up
+                            | KeyCode::Down
+                            | KeyCode::Enter
+                            | KeyCode::Char('g')
+                            | KeyCode::Tab
+                            | KeyCode::BackTab
+                    )
             }
             Event::Mouse(mouse) => matches!(
                 mouse.kind,
@@ -106,6 +166,16 @@ impl App {
                 KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
                 KeyCode::Char('w') => {
                     self.toggle_details();
+                    None
+                }
+                KeyCode::Char('g') if !self.details => {
+                    self.group_by = self.group_by.next();
+                    self.group_by.sort(&mut self.snapshot);
+                    self.reveal_selection = true;
+                    None
+                }
+                KeyCode::Tab | KeyCode::BackTab if !self.details => {
+                    self.move_group(key.code == KeyCode::Tab);
                     None
                 }
                 KeyCode::Up | KeyCode::Down if self.details => {
@@ -184,7 +254,7 @@ impl App {
             self.details_limit = 0;
             return;
         }
-        self.snapshot.sort();
+        self.group_by.sort(&mut self.snapshot);
         if self.selected.is_some() && self.selected_index().is_none() {
             self.selection_removed();
         }
@@ -224,8 +294,11 @@ impl App {
             let first = if count == 0 { 0 } else { self.scroll + 1 };
             let last = (self.scroll + height).min(count);
             frame.render_widget(
-                Paragraph::new(format!("brachio | {count} agents | {first}-{last}"))
-                    .style(Style::default().add_modifier(Modifier::BOLD)),
+                Paragraph::new(format!(
+                    "brachio | Group by: {} (g) | {count} agents | {first}-{last}",
+                    self.group_by.label()
+                ))
+                .style(Style::default().add_modifier(Modifier::BOLD)),
                 Rect::new(area.x, area.y, area.width, 1),
             );
         }
@@ -308,7 +381,7 @@ impl App {
         if footer_height == 2 {
             frame.render_widget(
                 Paragraph::new(
-                    "↑/↓ select | Enter/click navigate | Wheel scroll | w details | q/Esc/Ctrl-C quit",
+                    "↑↓ | Tab/Shift+Tab group | Enter/click navigate | w details | q/Esc/Ctrl-C quit",
                 ),
                 Rect::new(area.x, area.bottom() - 2, area.width, 1),
             );
@@ -457,7 +530,40 @@ impl App {
             None if down => 0,
             None => count - 1,
         };
-        self.selected = Some(self.snapshot.entries[next].id.clone());
+        self.select_index(next);
+    }
+
+    fn move_group(&mut self, forward: bool) {
+        let entries = &self.snapshot.entries;
+        if entries.is_empty() {
+            self.selected = None;
+            self.scroll = 0;
+            return;
+        }
+        let starts: Vec<_> = (0..entries.len())
+            .filter(|&index| {
+                index == 0
+                    || self.group_by.compare(&entries[index - 1], &entries[index])
+                        != Ordering::Equal
+            })
+            .collect();
+        let next = match self.selected_index() {
+            Some(index) => {
+                let group = starts.partition_point(|&start| start <= index) - 1;
+                if forward {
+                    (group + 1) % starts.len()
+                } else {
+                    (group + starts.len() - 1) % starts.len()
+                }
+            }
+            None if forward => 0,
+            None => starts.len() - 1,
+        };
+        self.select_index(starts[next]);
+    }
+
+    fn select_index(&mut self, index: usize) {
+        self.selected = Some(self.snapshot.entries[index].id.clone());
         self.selection_missing = false;
         self.reveal_selection = true;
         self.message.clear();
@@ -707,7 +813,8 @@ mod tests {
     fn default_and_empty_view_have_status_help_and_no_hit_targets() {
         let mut app = App::default();
         let rows = render(&mut app, &mut terminal(100, 10));
-        assert!(rows[0].contains("brachio | 0 agents"));
+        assert!(rows[0].starts_with("brachio | Group by: Status (g)"));
+        assert!(rows[0].contains("0 agents"));
         for label in ["Working directory", "Session", "Tab", "Pane"] {
             assert!(rows[1].contains(label));
         }
@@ -722,6 +829,354 @@ mod tests {
         assert!(app.handle_event(key(KeyCode::Down)).is_none());
         assert!(app.handle_event(key(KeyCode::Up)).is_none());
         assert!(app.selected.is_none());
+    }
+
+    fn grouping_entries() -> Vec<Entry> {
+        [
+            ("pi", Status::Idle, Some("/work/b"), "Beta", "beta"),
+            ("claude-code", Status::Working, None, "Alpha", "alpha-1"),
+            ("codex", Status::Error, Some("/work/a"), "Alpha", "alpha-1"),
+            ("pi", Status::Blocked, Some("/work/b"), "Alpha", "alpha-2"),
+            ("claude-code", Status::Done, Some("/work/a"), "Beta", "beta"),
+            ("codex", Status::Unknown, None, "Alpha", "alpha-2"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (agent, status, cwd, session_name, session_id))| {
+            let mut entry = entry(index, status);
+            entry.id.agent = agent.into();
+            entry.id.session = session_id.into();
+            entry.target.session = session_id.into();
+            entry.location.session = session_name.into();
+            entry.working_dir = cwd.map(String::from);
+            entry
+        })
+        .collect()
+    }
+
+    fn grouped_app(entries: Vec<Entry>, group_by: GroupBy) -> App {
+        let mut app = App {
+            connected: true,
+            group_by,
+            ..App::default()
+        };
+        app.replace_snapshot(Snapshot {
+            entries,
+            warnings: Vec::new(),
+        });
+        app
+    }
+
+    #[test]
+    fn every_grouping_mode_has_deterministic_groups_and_status_priority_within_groups() {
+        let entries = grouping_entries();
+        for (mode, order) in [
+            (GroupBy::Agent, [4, 1, 2, 5, 3, 0]),
+            (GroupBy::Status, [3, 2, 4, 5, 1, 0]),
+            (GroupBy::Cwd, [2, 4, 3, 0, 5, 1]),
+            (GroupBy::Session, [2, 1, 3, 5, 4, 0]),
+        ] {
+            let expected: Vec<_> = order.map(|index| entries[index].clone()).into();
+            for input in [entries.clone(), entries.iter().cloned().rev().collect()] {
+                let mut app = grouped_app(input, mode);
+                assert_eq!(app.snapshot.entries, expected, "{mode:?}");
+                let rows = render(&mut app, &mut terminal(120, 12));
+                assert!(rows[0].contains(&format!("Group by: {} (g)", mode.label())));
+                assert_eq!(app.snapshot.entries, expected, "draw changed {mode:?}");
+                for (row, entry) in expected.iter().enumerate() {
+                    assert!(rows[row + 2].contains(&entry.name));
+                }
+                let narrow = render(&mut app, &mut terminal(35, 12));
+                assert!(narrow[0].contains(&format!("Group by: {} (g)", mode.label())));
+            }
+        }
+    }
+
+    #[test]
+    fn mode_key_cycles_all_four_modes_without_changing_the_selected_identity() {
+        let mut app = app(grouping_entries());
+        let selected = app.selected.clone();
+        for mode in [
+            GroupBy::Cwd,
+            GroupBy::Session,
+            GroupBy::Agent,
+            GroupBy::Status,
+        ] {
+            assert!(app.handle_event(key(KeyCode::Char('g'))).is_none());
+            assert_eq!(app.group_by, mode);
+            assert_eq!(app.selected, selected);
+            let rows = render(&mut app, &mut terminal(100, 8));
+            assert!(rows[0].contains(&format!("Group by: {} (g)", mode.label())));
+            assert!(
+                app.hits
+                    .iter()
+                    .any(|hit| Some(&hit.entry.id) == selected.as_ref())
+            );
+            assert!(!app.navigating);
+        }
+    }
+
+    #[test]
+    fn tab_and_backtab_jump_to_group_starts_and_wrap_in_every_mode() {
+        let entries = grouping_entries();
+        for (mode, starts) in [
+            (GroupBy::Agent, vec![4, 2, 3]),
+            (GroupBy::Status, vec![3, 2, 4, 5, 1, 0]),
+            (GroupBy::Cwd, vec![2, 3, 5]),
+            (GroupBy::Session, vec![2, 3, 4]),
+        ] {
+            let mut app = grouped_app(entries.clone(), mode);
+            app.selected = None;
+            for &index in starts.iter().chain(starts.iter().take(1)) {
+                assert!(app.handle_event(key(KeyCode::Tab)).is_none());
+                assert_eq!(app.selected, Some(entries[index].id.clone()), "{mode:?}");
+                assert!(!app.navigating);
+            }
+            for &index in starts.iter().rev().chain(starts.iter().rev().take(1)) {
+                let event = Event::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+                assert!(app.handle_event(event).is_none());
+                assert_eq!(app.selected, Some(entries[index].id.clone()), "{mode:?}");
+                assert!(!app.navigating);
+            }
+            app.selected = None;
+            app.handle_event(key(KeyCode::BackTab));
+            assert_eq!(
+                app.selected,
+                Some(entries[*starts.last().unwrap()].id.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn group_jumps_skip_the_current_group_even_when_selection_is_inside_it() {
+        for mode in [GroupBy::Agent, GroupBy::Cwd, GroupBy::Session] {
+            let mut app = grouped_app(grouping_entries(), mode);
+            app.select_index(1);
+            let next = app.snapshot.entries[2].id.clone();
+            app.handle_event(key(KeyCode::Tab));
+            assert_eq!(app.selected, Some(next));
+            app.select_index(3);
+            let previous = app.snapshot.entries[0].id.clone();
+            app.handle_event(key(KeyCode::BackTab));
+            assert_eq!(app.selected, Some(previous));
+        }
+    }
+
+    #[test]
+    fn empty_lists_and_single_groups_handle_group_keys_without_navigation() {
+        let mut empty = app(Vec::new());
+        for _ in 0..4 {
+            for code in [KeyCode::Char('g'), KeyCode::Tab, KeyCode::BackTab] {
+                assert!(empty.handle_event(key(code)).is_none());
+                assert!(empty.selected.is_none());
+                assert!(!empty.navigating);
+            }
+        }
+        for mode in [
+            GroupBy::Agent,
+            GroupBy::Status,
+            GroupBy::Cwd,
+            GroupBy::Session,
+        ] {
+            let mut entries = vec![entry(0, Status::Working), entry(1, Status::Working)];
+            entries[1].id.session = entries[0].id.session.clone();
+            entries[1].target.session = entries[0].target.session.clone();
+            entries[1].location.session = entries[0].location.session.clone();
+            let mut app = grouped_app(entries, mode);
+            for code in [KeyCode::Tab, KeyCode::BackTab] {
+                app.select_index(1);
+                assert!(app.handle_event(key(code)).is_none());
+                assert_eq!(app.selected_index(), Some(0));
+                assert!(!app.navigating);
+            }
+        }
+    }
+
+    #[test]
+    fn grouping_uses_canonical_agents_and_full_directories_not_display_values() {
+        let mut a = entry(0, Status::Working);
+        let mut b = entry(1, Status::Working);
+        a.name = "same display name".into();
+        b.name = a.name.clone();
+        a.id.agent = "pi".into();
+        b.id.agent = "codex".into();
+        assert_ne!(GroupBy::Agent.compare(&a, &b), Ordering::Equal);
+        a.id.agent = b.id.agent.clone();
+        b.name = "different display name".into();
+        assert_eq!(GroupBy::Agent.compare(&a, &b), Ordering::Equal);
+        a.working_dir = Some("/first/long-prefix/project".into());
+        b.working_dir = Some("/second/long-prefix/project".into());
+        assert_eq!(
+            clip_text(a.working_dir.as_deref().unwrap(), 10, true),
+            clip_text(b.working_dir.as_deref().unwrap(), 10, true)
+        );
+        assert_ne!(GroupBy::Cwd.compare(&a, &b), Ordering::Equal);
+    }
+
+    #[test]
+    fn refresh_keeps_the_active_grouping_and_the_updated_exact_selection() {
+        for mode in [
+            GroupBy::Agent,
+            GroupBy::Status,
+            GroupBy::Cwd,
+            GroupBy::Session,
+        ] {
+            let mut app = grouped_app(grouping_entries(), mode);
+            app.select_index(1);
+            let mut updated = app.snapshot.entries[1].clone();
+            updated.status = Status::Blocked;
+            updated.working_dir = Some("/work/new".into());
+            updated.location.session = "Renamed session".into();
+            updated.location.tab = "Moved tab".into();
+            updated.target.window = "new-window".into();
+            let mut snapshot = app.snapshot.clone();
+            for entry in &mut snapshot.entries {
+                if entry.id == updated.id {
+                    *entry = updated.clone();
+                } else if entry.id.session == updated.id.session {
+                    entry.location.session = updated.location.session.clone();
+                }
+            }
+            snapshot.entries.reverse();
+            app.replace_snapshot(snapshot);
+            let before_draw = app.snapshot.entries.clone();
+            render(&mut app, &mut terminal(100, 8));
+            assert_eq!(app.group_by, mode);
+            assert_eq!(app.snapshot.entries, before_draw);
+            assert!(
+                app.snapshot
+                    .entries
+                    .windows(2)
+                    .all(|pair| { mode.compare(&pair[0], &pair[1]) != Ordering::Greater })
+            );
+            assert_eq!(app.selected, Some(updated.id.clone()));
+            assert_eq!(navigation(app.handle_event(key(KeyCode::Enter))), updated);
+        }
+    }
+
+    #[test]
+    fn mode_changes_do_not_restore_a_removed_selection_but_group_jumps_can_select() {
+        for code in [KeyCode::Tab, KeyCode::BackTab] {
+            let mut app = app(grouping_entries());
+            let selected = app.selected.clone().unwrap();
+            let mut snapshot = app.snapshot.clone();
+            snapshot.entries.retain(|entry| entry.id != selected);
+            app.replace_snapshot(snapshot);
+            let message = app.message.clone();
+            for _ in 0..4 {
+                app.handle_event(key(KeyCode::Char('g')));
+                render(&mut app, &mut terminal(100, 8));
+                assert!(app.selected.is_none());
+                assert!(app.selection_missing);
+                assert_eq!(app.message, message);
+            }
+            assert!(app.handle_event(key(KeyCode::Enter)).is_none());
+            assert!(app.handle_event(key(code)).is_none());
+            let expected = if code == KeyCode::Tab {
+                0
+            } else {
+                app.snapshot.entries.len() - 1
+            };
+            assert_eq!(app.selected_index(), Some(expected));
+            assert!(!app.selection_missing);
+            assert!(!app.navigating);
+        }
+    }
+
+    #[test]
+    fn grouping_keys_invalidate_old_clicks_and_keep_keyboard_and_mouse_targets_equal() {
+        for code in [KeyCode::Char('g'), KeyCode::Tab, KeyCode::BackTab] {
+            let mut app = app(grouping_entries());
+            let mut terminal = terminal(100, 8);
+            render(&mut app, &mut terminal);
+            assert!(app.handle_event(key(code)).is_none());
+            let expected = app.snapshot.entries[app.selected_index().unwrap()].clone();
+            assert!(app.hits.is_empty());
+            assert!(app.handle_event(click(0, 2)).is_none());
+            render(&mut app, &mut terminal);
+            let area = app
+                .hits
+                .iter()
+                .find(|hit| hit.entry.id == expected.id)
+                .unwrap()
+                .area;
+            assert_eq!(
+                navigation(app.handle_event(click(area.x, area.y))),
+                expected
+            );
+            app.navigating = false;
+            assert_eq!(navigation(app.handle_event(key(KeyCode::Enter))), expected);
+        }
+    }
+
+    #[test]
+    fn grouping_keys_ignore_releases_and_do_not_change_details() {
+        let mut app = app(grouping_entries());
+        let selected = app.selected.clone();
+        let mut terminal = terminal(100, 8);
+        render(&mut app, &mut terminal);
+        let hits = app.hits.len();
+        for code in [KeyCode::Char('g'), KeyCode::Tab, KeyCode::BackTab] {
+            let event = Event::Key(KeyEvent::new_with_kind(
+                code,
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ));
+            assert!(app.handle_event(event).is_none());
+            assert_eq!(app.hits.len(), hits);
+            assert_eq!(app.group_by, GroupBy::Status);
+            assert_eq!(app.selected, selected);
+        }
+        app.handle_event(key(KeyCode::Char('w')));
+        render(&mut app, &mut terminal);
+        app.handle_event(key(KeyCode::Down));
+        let scroll = app.details_scroll;
+        let message = app.message.clone();
+        for code in [KeyCode::Char('g'), KeyCode::Tab, KeyCode::BackTab] {
+            assert!(app.handle_event(key(code)).is_none());
+            assert!(app.details);
+            assert_eq!(app.group_by, GroupBy::Status);
+            assert_eq!(app.selected, selected);
+            assert_eq!(app.details_scroll, scroll);
+            assert_eq!(app.message, message);
+            assert!(!app.navigating);
+        }
+    }
+
+    #[test]
+    fn group_jumps_reveal_the_selected_group_after_manual_scroll_and_resize() {
+        let entries = (0..20)
+            .map(|index| {
+                let mut entry = entry(index, Status::Working);
+                entry.working_dir = Some(format!("/work/group-{:02}", index / 5));
+                entry
+            })
+            .collect();
+        let mut app = grouped_app(entries, GroupBy::Cwd);
+        let mut terminal = terminal(80, 8);
+        render(&mut app, &mut terminal);
+        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 2));
+        render(&mut app, &mut terminal);
+        assert_eq!(app.scroll, 3);
+        for index in [5, 10, 15, 0] {
+            assert!(app.handle_event(key(KeyCode::Tab)).is_none());
+            render(&mut app, &mut terminal);
+            assert_eq!(app.selected_index(), Some(index));
+            assert!(
+                app.hits
+                    .iter()
+                    .any(|hit| Some(&hit.entry.id) == app.selected.as_ref())
+            );
+        }
+        app.handle_event(Event::Resize(40, 5));
+        terminal.backend_mut().resize(40, 5);
+        terminal.resize(Rect::new(0, 0, 40, 5)).unwrap();
+        app.handle_event(key(KeyCode::BackTab));
+        render(&mut app, &mut terminal);
+        assert_eq!(app.selected_index(), Some(15));
+        assert_eq!(app.hits.len(), 1);
+        assert_eq!(app.hits[0].entry.id, app.selected.clone().unwrap());
+        assert!(!app.navigating);
     }
 
     #[test]
@@ -885,17 +1340,26 @@ mod tests {
     fn all_tiny_dimensions_render_without_overflow_or_hidden_hit_regions() {
         for width in [0, 1, 2, 8, 17, 80] {
             for height in [0, 1, 2, 3, 4, 5, 24] {
-                let mut app = many(3);
-                let mut terminal = terminal(width, height);
-                render(&mut app, &mut terminal);
-                for hit in &app.hits {
-                    assert!(hit.area.width > 0);
-                    assert_eq!(hit.area.height, 1);
-                    assert!(hit.area.right() <= width);
-                    assert!(hit.area.bottom() <= height.saturating_sub(2));
-                }
-                if width == 0 || height <= 2 {
-                    assert!(app.hits.is_empty());
+                for mode in [
+                    GroupBy::Agent,
+                    GroupBy::Status,
+                    GroupBy::Cwd,
+                    GroupBy::Session,
+                ] {
+                    let mut app = grouped_app(grouping_entries(), mode);
+                    let mut terminal = terminal(width, height);
+                    render(&mut app, &mut terminal);
+                    app.handle_event(key(KeyCode::Tab));
+                    render(&mut app, &mut terminal);
+                    for hit in &app.hits {
+                        assert!(hit.area.width > 0);
+                        assert_eq!(hit.area.height, 1);
+                        assert!(hit.area.right() <= width);
+                        assert!(hit.area.bottom() <= height.saturating_sub(2));
+                    }
+                    if width == 0 || height <= 2 {
+                        assert!(app.hits.is_empty());
+                    }
                 }
             }
         }
