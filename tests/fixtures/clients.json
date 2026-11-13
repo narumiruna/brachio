@@ -1,0 +1,18 @@
+{
+  "clients": [
+    {
+      "client_id": "client:00000000-0000-0000-0000-000000000001",
+      "connection_state": "connected",
+      "info": {
+        "kind": "app"
+      }
+    },
+    {
+      "client_id": "client:00000000-0000-0000-0000-000000000009",
+      "connection_state": "connected",
+      "info": {
+        "kind": "cli"
+      }
+    }
+  ]
+}

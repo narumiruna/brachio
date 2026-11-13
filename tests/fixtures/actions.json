@@ -1,0 +1,17 @@
+{
+  "actions": [
+    {
+      "name": "session.select",
+      "args": {
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "window_id": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  ]
+}

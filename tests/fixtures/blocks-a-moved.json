@@ -1,0 +1,58 @@
+{
+  "blocks": [
+    {
+      "block_id": "block:00000000-0000-0000-0000-000000000001",
+      "window_id": "window:00000000-0000-0000-0000-000000000002",
+      "label": "Pane 1",
+      "creator_name": "com.superlogical.terminal",
+      "placement": "placed"
+    },
+    {
+      "block_id": "block:00000000-0000-0000-0000-000000000002",
+      "window_id": "window:00000000-0000-0000-0000-000000000001",
+      "label": "Pane 2",
+      "creator_name": "com.superlogical.terminal",
+      "placement": "placed"
+    },
+    {
+      "block_id": "block:00000000-0000-0000-0000-000000000003",
+      "window_id": "window:00000000-0000-0000-0000-000000000001",
+      "label": "Pane 3",
+      "creator_name": "com.example.editor",
+      "placement": "placed"
+    },
+    {
+      "block_id": "block:00000000-0000-0000-0000-000000000004",
+      "window_id": "window:00000000-0000-0000-0000-000000000002",
+      "label": "Pane 4",
+      "creator_name": "com.superlogical.terminal",
+      "placement": "placed"
+    },
+    {
+      "block_id": "block:00000000-0000-0000-0000-000000000005",
+      "window_id": "window:00000000-0000-0000-0000-000000000002",
+      "label": "Pane 5",
+      "creator_name": "com.superlogical.terminal",
+      "placement": "placed"
+    },
+    {
+      "block_id": "block:00000000-0000-0000-0000-000000000006",
+      "window_id": null,
+      "label": "Pane 6",
+      "creator_name": "com.superlogical.terminal",
+      "placement": "detached"
+    },
+    {
+      "block_id": "block:00000000-0000-0000-0000-000000000007",
+      "window_id": "window:00000000-0000-0000-0000-000000000002",
+      "label": "Pane 7",
+      "creator_name": "com.superlogical.terminal",
+      "placement": "future-placement"
+    },
+    {
+      "creator_name": "com.superlogical.terminal",
+      "placement": "placed",
+      "window_id": "window:00000000-0000-0000-0000-000000000001"
+    }
+  ]
+}
