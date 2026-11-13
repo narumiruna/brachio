@@ -99,11 +99,11 @@ The server describes session focus as shared session state. A client action can 
 
 ### Local results
 
-All four standard checks passed on macOS with the measured Rust toolchain. The suite has 83 tests: 60 library tests, one redraw/input routing test, 12 mock Rex integration tests, and 10 PTY/CLI smoke tests. Three additional complete test runs passed. Release binary help/version checks also passed without terminal setup or Rex navigation.
+All four standard checks passed on macOS with the measured Rust toolchain. The suite has 84 tests: 61 library tests, one redraw/input routing test, 12 mock Rex integration tests, and 10 PTY/CLI smoke tests. Three additional complete test runs passed. Release binary help/version checks also passed without terminal setup or Rex navigation.
 
 Repeated verification exposed and corrected a Darwin process-exit transition where group signaling can report EPERM before waitid exposes exit. The runner retains child identity during a bounded retry; a 100-short-stream regression checks this path. Process fixtures use serialized execution and startup-specific test deadlines to avoid cold-executable timing failures; production request deadlines remain unchanged.
 
-Source review also corrected queued-click retargeting, duplicate-parent record inheritance, input-flood shutdown, and final terminal cleanup after a worker panic. No live app switch or agent input was sent during verification. The CI workflow repeats the standard checks on Linux and macOS; native UI acceptance remains a separate handoff.
+Source review also corrected queued-click retargeting, duplicate-parent record inheritance, input-flood shutdown, and final terminal cleanup after a worker panic. Automated PR review identified non-mutating mouse events that consumed click targets; motion/release events now preserve the last drawn targets, with a same-batch regression test. No live app switch or agent input was sent during verification. The CI workflow repeats the standard checks on Linux and macOS; native UI acceptance remains a separate handoff.
 
 These tests are not evidence that a real Rex app displayed the target pane.
 

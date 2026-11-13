@@ -62,8 +62,25 @@ impl App {
                 .map(|hit| hit.entry.clone()),
             _ => None,
         };
-        // Any input consumes the hit map. A new click needs a new draw.
-        self.hits.clear();
+        // Preserve targets for motion, release, and other non-mutating input.
+        // Selection, scroll, and resize need a draw before another click.
+        let invalidates = match &event {
+            Event::Key(key) => {
+                key.kind != KeyEventKind::Release
+                    && matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Enter)
+            }
+            Event::Mouse(mouse) => matches!(
+                mouse.kind,
+                MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollUp
+            ),
+            Event::Resize(_, _) => true,
+            _ => false,
+        };
+        if invalidates {
+            self.hits.clear();
+        }
 
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
@@ -787,6 +804,31 @@ mod tests {
         render(&mut app, &mut terminal);
         assert_eq!(
             navigation(app.handle_event(click(0, 2))),
+            entry(1, Status::Working)
+        );
+    }
+
+    #[test]
+    fn non_mutating_events_preserve_a_following_click_in_the_same_input_batch() {
+        let mut app = many(2);
+        render(&mut app, &mut terminal(80, 8));
+        for event in [
+            mouse(MouseEventKind::Moved, 1, 3),
+            mouse(MouseEventKind::Up(MouseButton::Left), 1, 3),
+            mouse(MouseEventKind::Drag(MouseButton::Left), 1, 3),
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Down,
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )),
+            Event::FocusGained,
+            Event::Paste("ignored".into()),
+        ] {
+            assert!(app.handle_event(event).is_none());
+            assert_eq!(app.hits.len(), 2);
+        }
+        assert_eq!(
+            navigation(app.handle_event(click(1, 3))),
             entry(1, Status::Working)
         );
     }
