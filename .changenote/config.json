@@ -7,7 +7,7 @@
     "Cargo.lock",
     "pyproject.toml",
     "uv.lock",
-    ".github/workflows/publish.yml"
+    ".github/workflows/release.yml"
   ],
   "packages": {
     "brachio": {
