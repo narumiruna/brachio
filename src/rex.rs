@@ -6,8 +6,8 @@ use crate::process::Runner;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
-use std::os::unix::fs::PermissionsExt;
+use std::ffi::{CString, OsStr};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -36,9 +36,17 @@ fn find_executable_in(path: Option<&OsStr>, home: Option<&Path>) -> Option<PathB
         .map(|directory| directory.join("rex"))
         .chain(installed)
         .find(|path| {
-            path.metadata().is_ok_and(|metadata| {
-                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-            })
+            if !path.is_file() {
+                return false;
+            }
+            let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+                return false;
+            };
+            // SAFETY: path is a valid C string for this call. AT_EACCESS checks
+            // the effective credentials used to execute the CLI.
+            unsafe {
+                libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0
+            }
         })
 }
 
@@ -519,6 +527,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     fn write_executable(path: &Path) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -547,6 +556,42 @@ mod tests {
             find_executable_in(Some(&path), None),
             Some(directories[3].join("rex"))
         );
+    }
+
+    #[test]
+    fn executable_search_skips_files_the_owner_cannot_execute() {
+        // Root can execute a regular file with any execute bit set.
+        // SAFETY: geteuid has no pointer arguments or side effects.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let blocked_bin = home.path().join("blocked");
+        let blocked = blocked_bin.join("rex");
+        write_executable(&blocked);
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o601)).unwrap();
+        let error = std::process::Command::new(&blocked).output().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let valid_bin = home.path().join("valid");
+        let valid = valid_bin.join("rex");
+        write_executable(&valid);
+        let path = std::env::join_paths([&blocked_bin, &valid_bin]).unwrap();
+        assert_eq!(find_executable_in(Some(&path), None), Some(valid));
+        assert_eq!(
+            find_executable_in(Some(blocked_bin.as_os_str()), None),
+            None
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            let installed = home.path().join(MACOS_REX_EXECUTABLE);
+            write_executable(&installed);
+            assert_eq!(
+                find_executable_in(Some(blocked_bin.as_os_str()), Some(home.path())),
+                Some(installed)
+            );
+        }
     }
 
     #[test]
