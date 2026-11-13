@@ -95,17 +95,19 @@ The server describes session focus as shared session state. A client action can 
 
 - Model tests: multiple apps, related records, parent inheritance, missing/future states, clear, unsupported apps, safe text, and exact resource IDs. Location labels stay separate from IDs; directory changes cannot change agent identity or navigation targets.
 - Mock CLI tests: multiple sessions/tabs/panes, detached and nonterminal blocks, empty status, retained completed reports, malformed JSON, unsupported status, ambiguous locations, pinned app choice, transient startup discovery recovery, refusal to replace a pin, precise ordered arguments, stale/moved panes, focus failure, permission refusal, event refresh, reconnect, navigation during a slow scan, and worker shutdown.
-- TUI tests: empty and long lists, Agent/Status/CWD/Session grouping, mode changes, next/previous group selection and wraparound, canonical agent and full-path group keys, unknown CWD grouping, same-name session separation, readable location columns, working-directory path clipping, Unicode clipping, tiny viewports, scroll, resize, stable selection, removed targets, stale click maps, keyboard/mouse target equivalence, disabled navigation, and complete scrollable message/warning/selected-agent details. Input tests confirm that clicks before or after a details redraw do not replace error messages.
+- TUI tests: empty and long lists, the default ungrouped view, Agent/Status/CWD/Session grouping, a solid header line and non-clickable blank rows between groups, separator-aware scroll and title ranges, selection visibility after separator changes, mode changes, next/previous group selection and wraparound, canonical agent and full-path group keys, unknown CWD grouping, same-name session separation, readable location columns, working-directory path clipping, Unicode clipping, tiny viewports, scroll, resize, stable selection, removed targets, stale click maps, keyboard/mouse target equivalence, disabled navigation, and complete scrollable message/warning/selected-agent details. Input tests confirm that clicks before or after a details redraw do not replace error messages.
 - Subprocess tests: timeout, cancellation, argument boundaries, invalid encoding, output limits, stderr failures, stream framing, EOF, and owned descendant cleanup.
 - PTY smoke tests: actual binary startup and keyboard/signal exits with terminal-mode and escape cleanup, including SIGTERM during sustained input. Nonterminal and argument errors exit without starting the TUI.
 
 ### Local results
 
-All four standard checks passed on macOS with the measured Rust toolchain. The suite has 121 tests: 88 library tests, two redraw/input routing tests, 19 mock Rex integration tests, and 12 PTY/CLI smoke tests. Three additional complete test runs passed before the location/working-directory update. Release binary help/version checks also passed without terminal setup or Rex navigation.
+All four standard checks passed on macOS with the measured Rust toolchain. The suite has 126 tests: 93 library tests, two redraw/input routing tests, 19 mock Rex integration tests, and 12 PTY/CLI smoke tests. Three additional complete test runs passed before the location/working-directory update. Release binary help/version checks also passed without terminal setup or Rex navigation.
 
 Repeated verification exposed and corrected a Darwin process-exit transition where group signaling can report EPERM before waitid exposes exit. The runner retains child identity during a bounded retry; a 100-short-stream regression checks this path. Process and mock CLI fixtures use serialized execution to avoid cold-executable launch saturation. Worker concurrency remains active within each fixture, including the slow-scan navigation test. Process fixtures also use startup-specific test deadlines; production request deadlines remain unchanged.
 
 Source review also corrected queued-click retargeting, duplicate-parent record inheritance, input-flood shutdown, and final terminal cleanup after a worker panic. Automated PR review identified non-mutating mouse events that consumed click targets, hidden warning details, startup discovery that did not recover, and navigation delayed by snapshot scans. The fixes preserve motion/release hit targets, expose scrollable details, retry only transient pre-pin discovery, and separate serialized navigation from read-only refresh work. No live app switch or agent input was sent during verification. The CI workflow repeats the standard checks on Linux and macOS; native UI acceptance remains a separate handoff.
+
+During grouping verification, `process::tests::timeout_kills_and_reaps_the_group_with_inherited_pipes` once failed because a fixture PID file was absent. Its isolated retry and the complete 126-test suite passed without changes to process code.
 
 These tests are not evidence that a real Rex app displayed the target pane.
 
@@ -127,9 +129,10 @@ Prerequisite: a prepared Rex app with multiple sessions, tabs, panes, recognized
 2. Use Enter and left click on the same entry. Confirm that the intended app shows exactly its session, tab, and pane.
 3. Return to the TUI and repeat after status changes, scrolling, and terminal resize.
    - Use multiple agent types, statuses, directories, and sessions.
-   - Press `g` to cycle Agent, Status, CWD, and Session grouping. Confirm that the selected agent stays the same.
+   - Confirm that the default view is the original ungrouped list, without blank rows between groups or a Group by title. Confirm that a solid line appears below the column headings and that keyboard hints appear only below the list.
+   - Press `g` to cycle None, Agent, Status, CWD, and Session views. Confirm that the selected agent stays the same. Grouped views must have one blank row between groups, with no extra labels or lines. Return to None and confirm that group gaps disappear and Tab / Shift+Tab have no effect.
    - Press `Tab` / `Shift+Tab` to select the first agent of the next / previous nonempty group. Check wraparound and confirm that the selected row stays visible.
-   - Confirm that these keys do not switch Rex panes. Confirm that Enter still navigates to the exact selected agent.
+   - Confirm that these keys do not switch Rex panes and that clicking the header line or a blank group row does nothing. Confirm that Enter still navigates to the exact selected agent.
    - Check these keys on the physical terminal. Confirm that they have no effect in details.
 4. Close the selected pane. Confirm that the entry disappears and Enter cannot silently select another row.
 5. Disconnect/reconnect Rex. Confirm stale indication, navigation blocking, and eventual resynchronization.

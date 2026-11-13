@@ -24,8 +24,9 @@ struct HitRegion {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum GroupBy {
-    Agent,
     #[default]
+    None,
+    Agent,
     Status,
     Cwd,
     Session,
@@ -34,15 +35,17 @@ enum GroupBy {
 impl GroupBy {
     fn next(self) -> Self {
         match self {
+            Self::None => Self::Agent,
             Self::Agent => Self::Status,
             Self::Status => Self::Cwd,
             Self::Cwd => Self::Session,
-            Self::Session => Self::Agent,
+            Self::Session => Self::None,
         }
     }
 
     fn label(self) -> &'static str {
         match self {
+            Self::None => "None",
             Self::Agent => "Agent",
             Self::Status => "Status",
             Self::Cwd => "CWD",
@@ -52,6 +55,7 @@ impl GroupBy {
 
     fn compare(self, a: &Entry, b: &Entry) -> Ordering {
         match self {
+            Self::None => Ordering::Equal,
             Self::Agent => a.id.agent.cmp(&b.id.agent),
             Self::Status => a.status.cmp(&b.status),
             Self::Cwd => (a.working_dir.is_none(), &a.working_dir)
@@ -64,7 +68,7 @@ impl GroupBy {
 
     fn sort(self, snapshot: &mut Snapshot) {
         snapshot.sort();
-        if self != Self::Status {
+        if !matches!(self, Self::None | Self::Status) {
             // Stable sorting keeps status priority, location, and identity order within each group.
             snapshot.entries.sort_by(|a, b| self.compare(a, b));
         }
@@ -96,14 +100,14 @@ impl App {
     pub fn replace_snapshot(&mut self, mut snapshot: Snapshot) {
         self.group_by.sort(&mut snapshot);
         self.hits.clear();
-        let old_index = self.selected_index();
+        let old_row = self.selected_row();
         self.snapshot = snapshot;
         if self.selection_missing || (self.selected.is_some() && self.selected_index().is_none()) {
             self.selection_removed();
         } else if !self.received_snapshot {
             self.selected = self.snapshot.entries.first().map(|entry| entry.id.clone());
         }
-        self.reveal_selection |= !self.received_snapshot || old_index != self.selected_index();
+        self.reveal_selection |= !self.received_snapshot || old_row != self.selected_row();
         self.received_snapshot = true;
     }
 
@@ -131,15 +135,14 @@ impl App {
         let invalidates = match &event {
             Event::Key(key) => {
                 key.kind != KeyEventKind::Release
-                    && matches!(
-                        key.code,
-                        KeyCode::Up
-                            | KeyCode::Down
-                            | KeyCode::Enter
-                            | KeyCode::Char('g')
-                            | KeyCode::Tab
-                            | KeyCode::BackTab
-                    )
+                    && match key.code {
+                        KeyCode::Up | KeyCode::Down | KeyCode::Enter => true,
+                        KeyCode::Char('g') => !self.details,
+                        KeyCode::Tab | KeyCode::BackTab => {
+                            !self.details && self.group_by != GroupBy::None
+                        }
+                        _ => false,
+                    }
             }
             Event::Mouse(mouse) => matches!(
                 mouse.kind,
@@ -220,8 +223,7 @@ impl App {
                     if contains(self.viewport, mouse.column, mouse.row) =>
                 {
                     let limit = self
-                        .snapshot
-                        .entries
+                        .list_rows()
                         .len()
                         .saturating_sub(usize::from(self.viewport.height));
                     self.scroll = if mouse.kind == MouseEventKind::ScrollDown {
@@ -265,7 +267,11 @@ impl App {
 
         // Keep the status and help visible. Omit headings in very short views.
         let title_height = u16::from(area.height >= 4);
-        let header_height = u16::from(area.height >= 5);
+        let header_height = if area.height >= 6 {
+            2
+        } else {
+            u16::from(area.height >= 5)
+        };
         let footer_height = area.height.min(2);
         let body = Rect::new(
             area.x,
@@ -275,11 +281,10 @@ impl App {
         );
         self.viewport = body;
         let height = usize::from(body.height);
-        self.scroll = self
-            .scroll
-            .min(self.snapshot.entries.len().saturating_sub(height));
+        let rows = self.list_rows();
+        self.scroll = self.scroll.min(rows.len().saturating_sub(height));
         if height > 0 && self.reveal_selection {
-            if let Some(index) = self.selected_index() {
+            if let Some(index) = self.selected_row() {
                 if index < self.scroll {
                     self.scroll = index;
                 } else if index >= self.scroll + height {
@@ -291,12 +296,21 @@ impl App {
 
         if title_height > 0 {
             let count = self.snapshot.entries.len();
-            let first = if count == 0 { 0 } else { self.scroll + 1 };
-            let last = (self.scroll + height).min(count);
+            let mut visible = rows
+                .iter()
+                .skip(self.scroll)
+                .take(height)
+                .filter_map(|row| *row);
+            let first = visible.next().map_or(0, |index| index + 1);
+            let last = visible.next_back().map_or(first, |index| index + 1);
+            let grouping = if self.group_by == GroupBy::None {
+                String::new()
+            } else {
+                format!("Group by: {} | ", self.group_by.label())
+            };
             frame.render_widget(
                 Paragraph::new(format!(
-                    "brachio | Group by: {} (g) | {count} agents | {first}-{last}",
-                    self.group_by.label()
+                    "brachio | {grouping}{count} agents | {first}-{last}"
                 ))
                 .style(Style::default().add_modifier(Modifier::BOLD)),
                 Rect::new(area.x, area.y, area.width, 1),
@@ -316,20 +330,24 @@ impl App {
             ] {
                 frame.render_widget(Paragraph::new(label).style(style), column);
             }
+            if header_height == 2 {
+                frame.render_widget(
+                    Paragraph::new("─".repeat(usize::from(area.width)))
+                        .style(Style::default().fg(Color::DarkGray)),
+                    Rect::new(area.x, header.y + 1, area.width, 1),
+                );
+            }
         }
 
         if self.snapshot.entries.is_empty() {
             frame.render_widget(Paragraph::new("No agents with reported status."), body);
         } else {
-            for (row, entry) in self
-                .snapshot
-                .entries
-                .iter()
-                .skip(self.scroll)
-                .take(height)
-                .enumerate()
-            {
+            for (row, index) in rows.iter().skip(self.scroll).take(height).enumerate() {
                 let row_area = Rect::new(body.x, body.y + row as u16, body.width, 1);
+                let Some(index) = index else {
+                    continue;
+                };
+                let entry = &self.snapshot.entries[*index];
                 let selected = self.selected.as_ref() == Some(&entry.id);
                 let style = if selected {
                     Style::default().bg(Color::DarkGray).fg(Color::White)
@@ -379,10 +397,15 @@ impl App {
         }
 
         if footer_height == 2 {
+            let group_keys = if self.group_by == GroupBy::None {
+                ""
+            } else {
+                "Tab/Shift+Tab jump | "
+            };
             frame.render_widget(
-                Paragraph::new(
-                    "↑↓ | Tab/Shift+Tab group | Enter/click navigate | w details | q/Esc/Ctrl-C quit",
-                ),
+                Paragraph::new(format!(
+                    "↑↓ select | g view | {group_keys}Enter/click | w details | q/Esc/Ctrl-C"
+                )),
                 Rect::new(area.x, area.bottom() - 2, area.width, 1),
             );
         }
@@ -510,6 +533,34 @@ impl App {
             .position(|entry| &entry.id == selected)
     }
 
+    fn is_group_start(&self, index: usize) -> bool {
+        index == 0
+            || self.group_by.compare(
+                &self.snapshot.entries[index - 1],
+                &self.snapshot.entries[index],
+            ) != Ordering::Equal
+    }
+
+    /// None is a blank row between groups, never a selectable or clickable agent.
+    fn list_rows(&self) -> Vec<Option<usize>> {
+        let mut rows = Vec::new();
+        for index in 0..self.snapshot.entries.len() {
+            if index > 0 && self.is_group_start(index) {
+                rows.push(None);
+            }
+            rows.push(Some(index));
+        }
+        rows
+    }
+
+    fn selected_row(&self) -> Option<usize> {
+        let index = self.selected_index()?;
+        let separators = (1..=index)
+            .filter(|&index| self.is_group_start(index))
+            .count();
+        Some(index + separators)
+    }
+
     fn selection_removed(&mut self) {
         self.selected = None;
         self.selection_missing = true;
@@ -534,6 +585,9 @@ impl App {
     }
 
     fn move_group(&mut self, forward: bool) {
+        if self.group_by == GroupBy::None {
+            return;
+        }
         let entries = &self.snapshot.entries;
         if entries.is_empty() {
             self.selected = None;
@@ -541,11 +595,7 @@ impl App {
             return;
         }
         let starts: Vec<_> = (0..entries.len())
-            .filter(|&index| {
-                index == 0
-                    || self.group_by.compare(&entries[index - 1], &entries[index])
-                        != Ordering::Equal
-            })
+            .filter(|&index| self.is_group_start(index))
             .collect();
         let next = match self.selected_index() {
             Some(index) => {
@@ -758,6 +808,7 @@ mod tests {
     fn app(entries: Vec<Entry>) -> App {
         let mut app = App {
             connected: true,
+            group_by: GroupBy::Status,
             ..App::default()
         };
         app.replace_snapshot(Snapshot {
@@ -813,16 +864,18 @@ mod tests {
     fn default_and_empty_view_have_status_help_and_no_hit_targets() {
         let mut app = App::default();
         let rows = render(&mut app, &mut terminal(100, 10));
-        assert!(rows[0].starts_with("brachio | Group by: Status (g)"));
+        assert!(rows[0].starts_with("brachio | 0 agents"));
+        assert!(!rows[0].contains("Group by"));
         assert!(rows[0].contains("0 agents"));
         for label in ["Working directory", "Session", "Tab", "Pane"] {
             assert!(rows[1].contains(label));
         }
-        assert!(rows[2].contains("No agents"));
-        assert!(rows[8].contains("Enter/click navigate"));
+        assert!(rows[3].contains("No agents"));
+        assert!(rows[8].contains("Enter/click"));
+        assert!(rows[8].contains("g view"));
         assert!(rows[9].contains("STALE: disconnected"));
         assert!(app.hits.is_empty());
-        assert!(app.handle_event(click(3, 2)).is_none());
+        assert!(app.handle_event(click(3, 3)).is_none());
         app.connected = true;
         assert!(app.handle_event(key(KeyCode::Enter)).is_none());
         assert!(app.message.contains("No agent selected"));
@@ -868,9 +921,167 @@ mod tests {
     }
 
     #[test]
+    fn default_view_preserves_the_original_flat_list_and_navigation() {
+        let mut expected = Snapshot {
+            entries: grouping_entries(),
+            warnings: Vec::new(),
+        };
+        expected.sort();
+        let mut app = App {
+            connected: true,
+            ..App::default()
+        };
+        app.replace_snapshot(expected.clone());
+        assert_eq!(app.group_by, GroupBy::None);
+        assert_eq!(app.snapshot.entries, expected.entries);
+        let mut terminal = terminal(100, 12);
+        app.handle_event(key(KeyCode::Down));
+        let rows = render(&mut app, &mut terminal);
+        assert!(rows[0].starts_with("brachio | 6 agents | 1-6"));
+        assert!(!rows.iter().any(|row| row.contains("Group by")));
+        assert!(rows[10].contains("g view"));
+        assert!(!rows[10].contains("Tab/Shift+Tab"));
+        assert_eq!(app.hits.len(), 6);
+        assert_eq!(app.list_rows(), (0..6).map(Some).collect::<Vec<_>>());
+        let selected = app.selected.clone();
+        for code in [KeyCode::Tab, KeyCode::BackTab] {
+            assert!(app.handle_event(key(code)).is_none());
+            assert_eq!(app.selected, selected);
+            assert_eq!(app.hits.len(), 6);
+        }
+        let target = expected.entries[1].clone();
+        assert_eq!(navigation(app.handle_event(key(KeyCode::Enter))), target);
+        app.navigating = false;
+        render(&mut app, &mut terminal);
+        assert_eq!(navigation(app.handle_event(click(0, 4))), target);
+    }
+
+    #[test]
+    fn separators_only_appear_between_groups_and_are_not_click_targets() {
+        for (mode, separators) in [
+            (GroupBy::None, vec![]),
+            (GroupBy::Agent, vec![2, 5]),
+            (GroupBy::Status, vec![1, 3, 5, 7, 9]),
+            (GroupBy::Cwd, vec![2, 5]),
+            (GroupBy::Session, vec![2, 5]),
+        ] {
+            let mut app = grouped_app(grouping_entries(), mode);
+            let layout = app.list_rows();
+            let actual: Vec<_> = layout
+                .iter()
+                .enumerate()
+                .filter_map(|(row, index)| index.is_none().then_some(row))
+                .collect();
+            assert_eq!(actual, separators, "{mode:?}");
+            assert_eq!(layout.first(), Some(&Some(0)));
+            assert_eq!(layout.last(), Some(&Some(5)));
+            let mut terminal = terminal(80, 16);
+            let rows = render(&mut app, &mut terminal);
+            assert_eq!(app.hits.len(), 6);
+            assert_eq!(rows[2], "─".repeat(80));
+            assert_eq!(rows.iter().filter(|row| row.contains('─')).count(), 1);
+            assert!(app.hits.iter().all(|hit| hit.area.y > 2));
+            assert!(rows[14].contains("g view"));
+            assert!(rows[14].contains("q/Esc/Ctrl-C"));
+            let selected = app.selected.clone();
+            for row in separators {
+                let y = 3 + row as u16;
+                assert_eq!(rows[usize::from(y)], " ".repeat(80));
+                assert!(!app.hits.iter().any(|hit| hit.area.y == y));
+                assert!(app.handle_event(click(0, y)).is_none());
+                assert_eq!(app.selected, selected);
+                assert!(!app.navigating);
+                render(&mut app, &mut terminal);
+            }
+            assert_eq!(
+                navigation(app.handle_event(key(KeyCode::Enter))).id,
+                selected.unwrap()
+            );
+        }
+        assert!(
+            grouped_app(Vec::new(), GroupBy::Status)
+                .list_rows()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn scrolling_counts_separator_rows_but_title_ranges_count_only_agents() {
+        let mut app = app(vec![
+            entry(0, Status::Blocked),
+            entry(1, Status::Blocked),
+            entry(2, Status::Working),
+            entry(3, Status::Working),
+        ]);
+        let mut terminal = terminal(100, 9);
+        render(&mut app, &mut terminal);
+        let selected = app.selected.clone();
+        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 3));
+        let rows = render(&mut app, &mut terminal);
+        assert_eq!(app.scroll, 1);
+        assert!(rows[0].contains("4 agents | 2-4"));
+        assert!(rows[4].chars().all(|ch| ch == ' '));
+        assert_eq!(app.selected, selected);
+        assert!(app.handle_event(click(0, 4)).is_none());
+        render(&mut app, &mut terminal);
+        assert_eq!(
+            navigation(app.handle_event(click(0, 6))),
+            entry(3, Status::Working)
+        );
+        app.navigating = false;
+        app.handle_event(key(KeyCode::Up));
+        render(&mut app, &mut terminal);
+        assert_eq!(app.selected, Some(entry(2, Status::Working).id));
+        app.handle_event(key(KeyCode::Up));
+        render(&mut app, &mut terminal);
+        assert_eq!(app.selected, Some(entry(1, Status::Blocked).id));
+        assert_eq!(app.selected_row(), Some(1));
+    }
+
+    #[test]
+    fn refresh_reveals_selection_when_a_new_separator_changes_only_its_screen_row() {
+        let mut app = many(2);
+        let mut terminal = terminal(100, 5);
+        app.handle_event(key(KeyCode::Down));
+        render(&mut app, &mut terminal);
+        assert_eq!(app.scroll, 1);
+        let selected = app.selected.clone();
+        let mut snapshot = app.snapshot.clone();
+        snapshot.entries[0].status = Status::Blocked;
+        app.replace_snapshot(snapshot);
+        render(&mut app, &mut terminal);
+        assert_eq!(app.selected_index(), Some(1));
+        assert_eq!(app.selected_row(), Some(2));
+        assert_eq!(app.scroll, 2);
+        assert_eq!(app.selected, selected);
+        assert_eq!(app.hits.len(), 1);
+        assert_eq!(Some(&app.hits[0].entry.id), selected.as_ref());
+    }
+
+    #[test]
+    fn separator_only_view_has_no_agent_range_or_mouse_target() {
+        let mut app = app(vec![entry(0, Status::Blocked), entry(1, Status::Working)]);
+        let mut terminal = terminal(100, 5);
+        render(&mut app, &mut terminal);
+        app.scroll = 1;
+        app.reveal_selection = false;
+        let rows = render(&mut app, &mut terminal);
+        assert!(rows[0].contains("2 agents | 0-0"));
+        assert_eq!(rows[2], " ".repeat(100));
+        assert!(app.hits.is_empty());
+        assert!(app.handle_event(click(0, 2)).is_none());
+        app.handle_event(key(KeyCode::Down));
+        render(&mut app, &mut terminal);
+        assert_eq!(app.selected_index(), Some(1));
+        assert_eq!(app.hits.len(), 1);
+        assert_eq!(app.hits[0].entry, entry(1, Status::Working));
+    }
+
+    #[test]
     fn every_grouping_mode_has_deterministic_groups_and_status_priority_within_groups() {
         let entries = grouping_entries();
         for (mode, order) in [
+            (GroupBy::None, [3, 2, 4, 5, 1, 0]),
             (GroupBy::Agent, [4, 1, 2, 5, 3, 0]),
             (GroupBy::Status, [3, 2, 4, 5, 1, 0]),
             (GroupBy::Cwd, [2, 4, 3, 0, 5, 1]),
@@ -880,33 +1091,48 @@ mod tests {
             for input in [entries.clone(), entries.iter().cloned().rev().collect()] {
                 let mut app = grouped_app(input, mode);
                 assert_eq!(app.snapshot.entries, expected, "{mode:?}");
-                let rows = render(&mut app, &mut terminal(120, 12));
-                assert!(rows[0].contains(&format!("Group by: {} (g)", mode.label())));
+                let rows = render(&mut app, &mut terminal(120, 16));
+                assert_eq!(rows[0].contains("Group by:"), mode != GroupBy::None);
+                if mode != GroupBy::None {
+                    assert!(rows[0].contains(&format!("Group by: {}", mode.label())));
+                }
+                assert!(!rows[0].contains("(g)"));
                 assert_eq!(app.snapshot.entries, expected, "draw changed {mode:?}");
-                for (row, entry) in expected.iter().enumerate() {
-                    assert!(rows[row + 2].contains(&entry.name));
+                assert_eq!(app.hits.len(), expected.len());
+                for (hit, entry) in app.hits.iter().zip(&expected) {
+                    assert_eq!(&hit.entry, entry);
+                    assert!(rows[usize::from(hit.area.y)].contains(&entry.name));
                 }
                 let narrow = render(&mut app, &mut terminal(35, 12));
-                assert!(narrow[0].contains(&format!("Group by: {} (g)", mode.label())));
+                assert_eq!(narrow[0].contains("Group by:"), mode != GroupBy::None);
+                if mode != GroupBy::None {
+                    assert!(narrow[0].contains(&format!("Group by: {}", mode.label())));
+                }
             }
         }
     }
 
     #[test]
-    fn mode_key_cycles_all_four_modes_without_changing_the_selected_identity() {
-        let mut app = app(grouping_entries());
+    fn mode_key_cycles_all_modes_without_changing_the_selected_identity() {
+        let mut app = grouped_app(grouping_entries(), GroupBy::default());
         let selected = app.selected.clone();
         for mode in [
-            GroupBy::Cwd,
-            GroupBy::Session,
             GroupBy::Agent,
             GroupBy::Status,
+            GroupBy::Cwd,
+            GroupBy::Session,
+            GroupBy::None,
         ] {
             assert!(app.handle_event(key(KeyCode::Char('g'))).is_none());
             assert_eq!(app.group_by, mode);
             assert_eq!(app.selected, selected);
             let rows = render(&mut app, &mut terminal(100, 8));
-            assert!(rows[0].contains(&format!("Group by: {} (g)", mode.label())));
+            assert_eq!(rows[0].contains("Group by:"), mode != GroupBy::None);
+            if mode != GroupBy::None {
+                assert!(rows[0].contains(&format!("Group by: {}", mode.label())));
+            }
+            assert!(!rows[0].contains("(g)"));
+            assert!(rows[6].contains("g view"));
             assert!(
                 app.hits
                     .iter()
@@ -983,6 +1209,7 @@ mod tests {
             entries[1].target.session = entries[0].target.session.clone();
             entries[1].location.session = entries[0].location.session.clone();
             let mut app = grouped_app(entries, mode);
+            assert!(app.list_rows().iter().all(Option::is_some));
             for code in [KeyCode::Tab, KeyCode::BackTab] {
                 app.select_index(1);
                 assert!(app.handle_event(key(code)).is_none());
@@ -1063,7 +1290,7 @@ mod tests {
             snapshot.entries.retain(|entry| entry.id != selected);
             app.replace_snapshot(snapshot);
             let message = app.message.clone();
-            for _ in 0..4 {
+            for _ in 0..5 {
                 app.handle_event(key(KeyCode::Char('g')));
                 render(&mut app, &mut terminal(100, 8));
                 assert!(app.selected.is_none());
@@ -1092,7 +1319,7 @@ mod tests {
             assert!(app.handle_event(key(code)).is_none());
             let expected = app.snapshot.entries[app.selected_index().unwrap()].clone();
             assert!(app.hits.is_empty());
-            assert!(app.handle_event(click(0, 2)).is_none());
+            assert!(app.handle_event(click(0, 3)).is_none());
             render(&mut app, &mut terminal);
             let area = app
                 .hits
@@ -1155,7 +1382,7 @@ mod tests {
         let mut app = grouped_app(entries, GroupBy::Cwd);
         let mut terminal = terminal(80, 8);
         render(&mut app, &mut terminal);
-        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 2));
+        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 3));
         render(&mut app, &mut terminal);
         assert_eq!(app.scroll, 3);
         for index in [5, 10, 15, 0] {
@@ -1194,16 +1421,17 @@ mod tests {
             .enumerate()
             .map(|(i, status)| entry(i, status))
             .collect());
-        let rows = render(&mut app, &mut terminal(100, 12));
+        let rows = render(&mut app, &mut terminal(100, 16));
         for (i, entry) in app.snapshot.entries.iter().enumerate() {
-            assert!(rows[i + 2].contains(&entry.name));
-            assert!(rows[i + 2].contains(entry.status.label()));
+            let row = &rows[usize::from(app.hits[i].area.y)];
+            assert!(row.contains(&entry.name));
+            assert!(row.contains(entry.status.label()));
             for label in [
                 &entry.location.session,
                 &entry.location.tab,
                 &entry.location.pane,
             ] {
-                assert!(rows[i + 2].contains(label.as_ref()));
+                assert!(row.contains(label.as_ref()));
             }
         }
         assert_eq!(app.snapshot.entries[0].status, Status::Blocked);
@@ -1239,11 +1467,11 @@ mod tests {
         app.snapshot.warnings.push("warn\r\u{2066}ing".into());
         let mut terminal = terminal(100, 8);
         let rows = render(&mut app, &mut terminal);
-        assert!(rows[2].contains("Blocked"));
+        assert!(rows[3].contains("Blocked"));
         for label in ["session-00", "tab-00", "pane-00"] {
-            assert!(rows[2].contains(label));
+            assert!(rows[3].contains(label));
         }
-        assert!(!rows[3].contains('界'));
+        assert!(!rows[4].contains('界'));
         assert!(rows[7].contains("failure: denied"));
         assert!(rows[7].contains("Warnings: 1 (w details)"));
         for cell in &terminal.backend().buffer().content {
@@ -1267,15 +1495,15 @@ mod tests {
         };
         let mut app = app(vec![agent]);
         let rows = render(&mut app, &mut terminal(80, 8));
-        assert!(rows[2].contains("brachio/w…"));
-        assert!(rows[2].contains("Review ch…"));
-        assert!(rows[2].contains("2: codex"));
-        assert!(rows[2].contains("projects/brachio"));
-        assert!(!rows[2].contains("0000000"));
+        assert!(rows[3].contains("brachio/w…"));
+        assert!(rows[3].contains("Review ch…"));
+        assert!(rows[3].contains("2: codex"));
+        assert!(rows[3].contains("projects/brachio"));
+        assert!(!rows[3].contains("0000000"));
         let rows = render(&mut app, &mut terminal(50, 8));
-        assert!(rows[2].contains("brac…"));
-        assert!(rows[2].contains("Revi…"));
-        assert!(!rows[2].contains("00000"));
+        assert!(rows[3].contains("brac…"));
+        assert!(rows[3].contains("Revi…"));
+        assert!(!rows[3].contains("00000"));
     }
 
     #[test]
@@ -1294,7 +1522,7 @@ mod tests {
         let mut app = many(1);
         let rows = render(&mut app, &mut terminal(80, 8));
         assert!(rows[1].contains("Working directory"));
-        assert!(rows[2].contains("Unknown"));
+        assert!(rows[3].contains("Unknown"));
     }
 
     #[test]
@@ -1341,6 +1569,7 @@ mod tests {
         for width in [0, 1, 2, 8, 17, 80] {
             for height in [0, 1, 2, 3, 4, 5, 24] {
                 for mode in [
+                    GroupBy::None,
                     GroupBy::Agent,
                     GroupBy::Status,
                     GroupBy::Cwd,
@@ -1388,13 +1617,13 @@ mod tests {
             app.handle_event(key(KeyCode::Down));
         }
         let rows = render(&mut app, &mut terminal);
-        assert_eq!(app.scroll, 9);
-        assert_eq!(app.hits.len(), 4);
-        assert_eq!(app.hits[3].entry, entry(12, Status::Working));
+        assert_eq!(app.scroll, 10);
+        assert_eq!(app.hits.len(), 3);
+        assert_eq!(app.hits[2].entry, entry(12, Status::Working));
         assert!(rows[5].starts_with('>'));
         app.handle_event(key(KeyCode::Up));
         render(&mut app, &mut terminal);
-        assert_eq!(app.scroll, 9);
+        assert_eq!(app.scroll, 10);
         for _ in 0..10 {
             app.handle_event(key(KeyCode::Up));
         }
@@ -1437,7 +1666,7 @@ mod tests {
         assert!(app.message.contains("no longer available"));
         let mut terminal = terminal(100, 8);
         let rows = render(&mut app, &mut terminal);
-        assert!(!rows[2].starts_with('>'));
+        assert!(!rows[3].starts_with('>'));
         app.replace_snapshot(Snapshot {
             entries: vec![entry(0, Status::Working), entry(2, Status::Blocked)],
             warnings: Vec::new(),
@@ -1497,11 +1726,11 @@ mod tests {
         });
         let mut terminal = terminal(80, 8);
         render(&mut app, &mut terminal);
-        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 2));
+        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 3));
         assert!(app.selected.is_none());
         render(&mut app, &mut terminal);
         assert_eq!(
-            navigation(app.handle_event(click(0, 2))),
+            navigation(app.handle_event(click(0, 3))),
             entry(1, Status::Working)
         );
     }
@@ -1516,7 +1745,7 @@ mod tests {
         let expected = navigation(keyboard.handle_event(key(KeyCode::Enter)));
         let mut pointer = app(entries);
         render(&mut pointer, &mut terminal(80, 8));
-        let actual = navigation(pointer.handle_event(click(79, 3)));
+        let actual = navigation(pointer.handle_event(click(79, 4)));
         assert_eq!(actual, expected);
         assert_eq!(pointer.selected, Some(actual.id));
     }
@@ -1524,21 +1753,30 @@ mod tests {
     #[test]
     fn click_requires_a_draw_and_only_drawn_entry_rows_are_targets() {
         let mut app = many(1);
-        assert!(app.handle_event(click(0, 2)).is_none());
+        assert!(app.handle_event(click(0, 3)).is_none());
         let mut terminal = terminal(80, 8);
-        for (x, y) in [(0, 0), (0, 1), (0, 3), (0, 6), (0, 7), (80, 2), (0, 8)] {
+        for (x, y) in [
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (0, 4),
+            (0, 6),
+            (0, 7),
+            (80, 3),
+            (0, 8),
+        ] {
             render(&mut app, &mut terminal);
             assert!(app.handle_event(click(x, y)).is_none());
             assert!(!app.navigating);
         }
         render(&mut app, &mut terminal);
         assert!(
-            app.handle_event(mouse(MouseEventKind::Down(MouseButton::Right), 0, 2))
+            app.handle_event(mouse(MouseEventKind::Down(MouseButton::Right), 0, 3))
                 .is_none()
         );
         render(&mut app, &mut terminal);
         assert_eq!(
-            navigation(app.handle_event(click(0, 2))),
+            navigation(app.handle_event(click(0, 3))),
             entry(0, Status::Working)
         );
     }
@@ -1549,16 +1787,16 @@ mod tests {
         let mut terminal = terminal(80, 8);
         render(&mut app, &mut terminal);
         app.replace_snapshot(app.snapshot.clone());
-        assert!(app.handle_event(click(0, 2)).is_none());
+        assert!(app.handle_event(click(0, 3)).is_none());
         render(&mut app, &mut terminal);
         app.replace_snapshot(Snapshot {
             entries: vec![entry(1, Status::Blocked), entry(0, Status::Working)],
             warnings: Vec::new(),
         });
-        assert!(app.handle_event(click(0, 2)).is_none());
+        assert!(app.handle_event(click(0, 3)).is_none());
         render(&mut app, &mut terminal);
         assert_eq!(
-            navigation(app.handle_event(click(0, 2))),
+            navigation(app.handle_event(click(0, 3))),
             entry(1, Status::Blocked)
         );
     }
@@ -1572,12 +1810,12 @@ mod tests {
             entries: vec![entry(1, Status::Working)],
             warnings: Vec::new(),
         });
-        assert!(app.handle_event(click(0, 2)).is_none());
+        assert!(app.handle_event(click(0, 3)).is_none());
         assert!(app.selected.is_none());
         assert!(app.message.contains("no longer available"));
         render(&mut app, &mut terminal);
         assert_eq!(
-            navigation(app.handle_event(click(0, 2))),
+            navigation(app.handle_event(click(0, 3))),
             entry(1, Status::Working)
         );
     }
@@ -1587,9 +1825,9 @@ mod tests {
         let mut app = many(2);
         render(&mut app, &mut terminal(80, 8));
         for event in [
-            mouse(MouseEventKind::Moved, 1, 3),
-            mouse(MouseEventKind::Up(MouseButton::Left), 1, 3),
-            mouse(MouseEventKind::Drag(MouseButton::Left), 1, 3),
+            mouse(MouseEventKind::Moved, 1, 4),
+            mouse(MouseEventKind::Up(MouseButton::Left), 1, 4),
+            mouse(MouseEventKind::Drag(MouseButton::Left), 1, 4),
             Event::Key(KeyEvent::new_with_kind(
                 KeyCode::Down,
                 KeyModifiers::NONE,
@@ -1602,7 +1840,7 @@ mod tests {
             assert_eq!(app.hits.len(), 2);
         }
         assert_eq!(
-            navigation(app.handle_event(click(1, 3))),
+            navigation(app.handle_event(click(1, 4))),
             entry(1, Status::Working)
         );
     }
@@ -1613,11 +1851,11 @@ mod tests {
         let mut terminal = terminal(80, 8);
         render(&mut app, &mut terminal);
         app.handle_event(key(KeyCode::Down));
-        assert!(app.handle_event(click(0, 2)).is_none());
+        assert!(app.handle_event(click(0, 3)).is_none());
         assert_eq!(app.selected, Some(entry(1, Status::Working).id));
         render(&mut app, &mut terminal);
         assert_eq!(
-            navigation(app.handle_event(click(0, 2))),
+            navigation(app.handle_event(click(0, 3))),
             entry(0, Status::Working)
         );
     }
@@ -1627,14 +1865,14 @@ mod tests {
         let mut app = many(15);
         let mut terminal = terminal(80, 8);
         render(&mut app, &mut terminal);
-        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 2));
+        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 3));
         assert_eq!(app.scroll, 3);
         assert_eq!(app.selected, Some(entry(0, Status::Working).id));
-        assert!(app.handle_event(click(0, 2)).is_none());
+        assert!(app.handle_event(click(0, 3)).is_none());
         render(&mut app, &mut terminal);
         assert_eq!(app.hits[0].entry, entry(3, Status::Working));
         assert_eq!(
-            navigation(app.handle_event(click(0, 2))),
+            navigation(app.handle_event(click(0, 3))),
             entry(3, Status::Working)
         );
     }
@@ -1647,13 +1885,13 @@ mod tests {
         app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 7));
         assert_eq!(app.scroll, 0);
         for _ in 0..20 {
-            app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 2));
+            app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 3));
         }
-        assert_eq!(app.scroll, 11);
+        assert_eq!(app.scroll, 12);
         render(&mut app, &mut terminal);
         assert_eq!(app.hits.last().unwrap().entry, entry(14, Status::Working));
         for _ in 0..20 {
-            app.handle_event(mouse(MouseEventKind::ScrollUp, 0, 2));
+            app.handle_event(mouse(MouseEventKind::ScrollUp, 0, 3));
         }
         assert_eq!(app.scroll, 0);
     }
@@ -1663,7 +1901,7 @@ mod tests {
         let mut app = many(15);
         let mut terminal = terminal(80, 8);
         render(&mut app, &mut terminal);
-        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 2));
+        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 3));
         render(&mut app, &mut terminal);
         let scroll = app.scroll;
         app.replace_snapshot(app.snapshot.clone());
@@ -1682,7 +1920,7 @@ mod tests {
     fn wheel_does_not_change_the_target_of_enter() {
         let mut app = many(15);
         render(&mut app, &mut terminal(80, 8));
-        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 2));
+        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 3));
         assert_eq!(
             navigation(app.handle_event(key(KeyCode::Enter))),
             entry(0, Status::Working)
@@ -1719,7 +1957,7 @@ mod tests {
         assert!(app.message.contains("disconnected"));
         let mut terminal = terminal(100, 8);
         render(&mut app, &mut terminal);
-        assert!(app.handle_event(click(0, 3)).is_none());
+        assert!(app.handle_event(click(0, 4)).is_none());
         assert!(!app.navigating);
         app.connected = true;
         let target = navigation(app.handle_event(key(KeyCode::Enter)));
@@ -1729,7 +1967,7 @@ mod tests {
         assert!(app.message.contains("already in progress"));
         let rows = render(&mut app, &mut terminal);
         assert!(rows[7].contains("Navigating; please wait"));
-        assert!(app.handle_event(click(0, 2)).is_none());
+        assert!(app.handle_event(click(0, 3)).is_none());
         app.navigating = false;
         assert_eq!(
             navigation(app.handle_event(key(KeyCode::Enter))),
@@ -1750,7 +1988,7 @@ mod tests {
         let rows = render(&mut app, &mut terminal);
         assert!(rows[7].contains("STALE: disconnected"));
         assert!(rows[7].contains("Navigation failed"));
-        assert!(rows[2].contains("agent-00"));
+        assert!(rows[3].contains("agent-00"));
     }
 
     #[test]
@@ -1762,7 +2000,7 @@ mod tests {
         let mut terminal = terminal(80, 8);
         let rows = render(&mut app, &mut terminal);
         assert!(rows[6].contains("w details"));
-        assert!(rows[6].contains("q/Esc/Ctrl-C quit"));
+        assert!(rows[6].contains("q/Esc/Ctrl-C"));
         assert!(rows[7].contains("Warnings: 2 (w details)"));
         assert!(rows[7].contains("Target app client:"));
         assert!(rows[7].find("Warnings:").unwrap() < rows[7].find("Target app").unwrap());
@@ -1889,7 +2127,7 @@ mod tests {
         let mut terminal = terminal(80, 8);
         render(&mut app, &mut terminal);
         for _ in 0..2 {
-            app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 2));
+            app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 3));
         }
         render(&mut app, &mut terminal);
         let scroll = app.scroll;
@@ -1908,7 +2146,7 @@ mod tests {
         assert!(app.details_scroll > 0);
         assert!(app.handle_event(key(KeyCode::Esc)).is_none());
         assert!(!app.details);
-        assert!(app.handle_event(click(0, 2)).is_none());
+        assert!(app.handle_event(click(0, 3)).is_none());
         render(&mut app, &mut terminal);
         assert_eq!(app.scroll, scroll);
         assert_eq!(app.selected, selected);
@@ -2043,7 +2281,7 @@ mod tests {
         let mut app = many(2);
         render(&mut app, &mut terminal(80, 8));
         app.snapshot.entries[0].target.window = "different-tab".into();
-        assert!(app.handle_event(click(0, 2)).is_none());
+        assert!(app.handle_event(click(0, 3)).is_none());
         assert!(app.message.contains("list changed"));
         assert!(!app.navigating);
         app.snapshot.entries.remove(0);

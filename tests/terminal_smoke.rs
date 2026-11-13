@@ -450,8 +450,8 @@ fn help_without_a_terminal() {
     assert!(output.status.success());
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(help.contains("Usage: brachio"));
-    assert!(help.contains("g cycles grouping (Agent/Status/CWD/Session; default Status)"));
-    assert!(help.contains("Tab/Shift+Tab select next/previous group"));
+    assert!(help.contains("g cycles grouping (None/Agent/Status/CWD/Session; default None)"));
+    assert!(help.contains("Tab/Shift+Tab select next/previous group when grouped"));
     assert!(output.stderr.is_empty());
 }
 

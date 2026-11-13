@@ -63,7 +63,7 @@ Brachio uses the CLI's normal server connection. Check `rex whoami --json` befor
 | Input | Operation |
 | --- | --- |
 | Up / Down | Select an agent |
-| g | Cycle grouping: Agent → Status → CWD → Session; Status is the default |
+| g | Cycle views: None → Agent → Status → CWD → Session; None is the default |
 | Tab / Shift+Tab | Select the first agent in the next / previous group; wrap at either end |
 | Enter | Navigate to the selected agent |
 | Left click | Select and navigate to that row |
@@ -75,7 +75,9 @@ Brachio uses the CLI's normal server connection. Check `rex whoami --json` befor
 
 Each row has separate **Working directory**, **Session**, **Tab**, and **Pane** columns. Locations use readable names, not ID suffixes. Unnamed sessions/tabs/panes use their display positions; generated tab names become `Tab N`. Long names end with `…`; long directories keep the path end visible. Press `w` and scroll to see complete column values and exact navigation IDs. No elapsed task time is inferred from status timestamps.
 
-The title shows the current **Group by** mode. Equal group values appear together in the table:
+The default **None** view keeps the original ungrouped list and its status, location, and exact identity order. It has no **Group by** title or blank rows between groups. Keyboard hints appear only below the list.
+
+When space permits, a solid line appears below the column headings. Grouped views show the grouping mode in the title, with one blank row between adjacent groups. The header line and blank rows cannot be selected or clicked. Equal group values appear together in the table:
 
 - **Agent** uses canonical agent names.
 - **Status** uses this priority: **Blocked, Error, Done, Unknown, Working, Idle**.
@@ -85,7 +87,7 @@ The title shows the current **Group by** mode. Equal group values appear togethe
 
 Agent names, paths, and session names use case-sensitive text order. Within each group, rows keep status priority, then location and exact identity order.
 
-Press `g` to change the grouping mode without changing the selected agent. `Tab` and `Shift+Tab` skip the current group and select the first agent in the next or previous nonempty group. With no selection, they select the first or last group; with one group, they select its first agent. These keys do not navigate Rex and have no effect in details. Grouping is not saved after exit.
+Press `g` to change the grouping mode without changing the selected agent. `Tab` and `Shift+Tab` skip the current group and select the first agent in the next or previous nonempty group. With no selection, they select the first or last group; with one group, they select its first agent. These keys do not navigate Rex and have no effect in details. `Tab` and `Shift+Tab` also have no effect in the ungrouped view. Grouping is not saved after exit.
 
 Selection uses the session ID, block ID, and canonical agent name, not a row number. If the selected entry disappears, navigation stops until you deliberately select another row with arrows, a group jump, or a click. Snapshot changes invalidate old mouse hit regions. Queued input is read before list redraws; mouse-down events that arrive during a redraw are discarded with a retry message rather than mapped to a replacement row. Terminal events do not carry a display-generation token, so this is not a guarantee about delayed physical input.
 
