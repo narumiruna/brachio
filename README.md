@@ -9,8 +9,10 @@ Brachio does not send prompts, keys, or commands to agents. It is not a native s
 - macOS or Linux with an interactive terminal and mouse reporting.
 - Rust stable and Cargo. The development checks used Rust/Cargo 1.99.1.
 - The official Rex CLI on `PATH`, connected to the intended server.
-- An open Rex app. Navigation needs its **Remote Control** permission.
+- An open Rex app. Brachio uses the `session.select` app action to show a session or tab. This action requires **Remote Control**.
+  - In Rex, open **Settings → Rex Server** and enable **Remote Control**. It is off by default.
   - Enable this only if you accept remote app control. Brachio does not change it.
+  - If disabled, Rex rejects app selection with `Rex.app is not accepting actions`. Press `w` in Brachio to read the full error. After enabling the permission, press Enter on the target agent to retry.
 
 Build from source:
 
@@ -77,6 +79,8 @@ A background worker obtains the initial snapshot. The CLI event stream invalidat
 A failed server snapshot retains the old list as **STALE** and disables navigation. Per-session or per-pane failures produce a partial list and warnings. Event-stream loss is shown as a warning while periodic snapshots continue; the listener reconnects. A silent recovered listener remains marked uncertain until it delivers an event.
 
 Navigation rechecks the pinned client, action schema, pane location, and agent identity. It then issues exact-ID `focus`, verifies the resulting server focus, and sends `session.select` with both session and window IDs to that client. It does not retry a failed mutation or select a nearby pane.
+
+`rex focus` and `rex window focus` change server state without Remote Control. Their success does not confirm that the app shows the target tab.
 
 **Session focus is shared server state.** Other apps attached to that session can observe a focus change even though app selection targets only one client. If app selection is refused, server focus may already have changed; the error states this. A timed-out focus or app-selection request can still complete later. The separate Rex operations are not a transaction: concurrent layout or focus changes by another client remain a race. Brachio checks between operations but cannot lock the native app.
 
