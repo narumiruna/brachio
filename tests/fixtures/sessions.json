@@ -1,0 +1,12 @@
+{
+  "sessions": [
+    {
+      "session_id": "session:00000000-0000-0000-0000-000000000001",
+      "label": "Work"
+    },
+    {
+      "session_id": "session:00000000-0000-0000-0000-000000000002",
+      "label": "Other"
+    }
+  ]
+}

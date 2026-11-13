@@ -1,0 +1,11 @@
+{
+  "blocks": [
+    {
+      "block_id": "block:00000000-0000-0000-0000-000000000008",
+      "window_id": "window:00000000-0000-0000-0000-000000000003",
+      "label": "Pane 8",
+      "creator_name": "com.superlogical.terminal",
+      "placement": "placed"
+    }
+  ]
+}

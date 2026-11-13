@@ -1,0 +1,22 @@
+{
+  "session_id": "session:00000000-0000-0000-0000-000000000002",
+  "revision": 1,
+  "label": "Other",
+  "windows": [
+    {
+      "window_id": "window:00000000-0000-0000-0000-000000000003",
+      "label": "Review",
+      "layers": [
+        {
+          "blocks": [
+            {
+              "block_id": "block:00000000-0000-0000-0000-000000000008"
+            }
+          ]
+        }
+      ],
+      "focused_block_id": "block:00000000-0000-0000-0000-000000000008"
+    }
+  ],
+  "active_window_id": "window:00000000-0000-0000-0000-000000000003"
+}

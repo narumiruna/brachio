@@ -1,0 +1,14 @@
+{
+  "records": [
+    {
+      "app": "pi",
+      "effective_app": "pi",
+      "state": "working"
+    },
+    {
+      "id": "child",
+      "effective_app": "pi",
+      "state": "blocked"
+    }
+  ]
+}
