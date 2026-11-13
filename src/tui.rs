@@ -55,6 +55,12 @@ impl App {
         self.received_snapshot = true;
     }
 
+    pub fn discard_redraw_click(&mut self) {
+        if !self.details {
+            self.message = "List redrawn; click again to select the displayed row".into();
+        }
+    }
+
     pub fn handle_event(&mut self, event: Event) -> Option<Action> {
         // Resolve clicks from the last draw, never from a newly sorted row index.
         let clicked = match &event {
