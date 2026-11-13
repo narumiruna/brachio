@@ -4,6 +4,8 @@ A standalone TUI for coding agent status in Rex. Select an agent with the keyboa
 
 Brachio does not send prompts, keys, or commands to agents. It is not a native sidebar and does not stay visible across tabs.
 
+![Brachio TUI](https://sharex.narumi.dev/2026/11/14/tui.jpg)
+
 ## Requirements and installation
 
 - macOS or Linux with an interactive terminal and mouse reporting.
