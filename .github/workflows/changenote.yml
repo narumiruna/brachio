@@ -1,0 +1,27 @@
+name: Change notes
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Install changenote
+        run: cargo install --git https://github.com/narumiruna/changenote --rev f4423760122463bf03a8d161c6f0bc4173afb6e0 --locked
+      - name: Check PR notes
+        uses: narumiruna/changenote/check@f4423760122463bf03a8d161c6f0bc4173afb6e0
+        with:
+          since: refs/remotes/origin/${{ github.base_ref }}
+          coverage: package
+          skip-release: ${{ contains(github.event.pull_request.labels.*.name, 'skip-changenote') }}
+          reason: ${{ contains(github.event.pull_request.labels.*.name, 'skip-changenote') && 'Maintainer approved a note exemption; see the PR description.' || '' }}
