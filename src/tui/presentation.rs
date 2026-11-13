@@ -221,7 +221,7 @@ pub(super) fn status_color(status: Status) -> Color {
         Status::Done => Color::Green,
         Status::Unknown => Color::Gray,
         Status::Working => Color::Cyan,
-        Status::Idle => Color::DarkGray,
+        Status::Idle => Color::Gray,
     }
 }
 
@@ -623,7 +623,7 @@ mod tests {
             (Status::Done, "✓", "✓ Done", Color::Green),
             (Status::Unknown, "?", "? Unknown", Color::Gray),
             (Status::Working, "●", "● Working", Color::Cyan),
-            (Status::Idle, "○", "○ Idle", Color::DarkGray),
+            (Status::Idle, "○", "○ Idle", Color::Gray),
         ] {
             assert_eq!(status_text(status, true), symbol);
             assert_eq!(status_text(status, false), label);

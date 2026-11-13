@@ -2116,11 +2116,38 @@ fn filter_fields_use_case_insensitive_and_matching_and_unknown_prefixes_stay_lit
 }
 
 #[test]
+fn filter_paste_preserves_whitespace_separated_field_terms() {
+    for separator in [" ", "\n", "\r\n", "\t", "\u{85}", "\u{2028}", "\u{a0}"] {
+        let expected = entry(0, Status::Working);
+        let mut other_agent = entry(2, Status::Working);
+        other_agent.id.agent = "codex".into();
+        let mut app = app(vec![expected.clone(), entry(1, Status::Idle), other_agent]);
+        let matches = matching_indices(&app.snapshot, "agent:pi status:working");
+        assert_eq!(matches.len(), 1);
+        app.handle_event(key(KeyCode::Char('/')));
+        assert!(
+            app.handle_event(Event::Paste(format!("agent:pi{separator}status:working")))
+                .is_none()
+        );
+        assert_eq!(
+            matching_indices(&app.snapshot, &app.query),
+            matches,
+            "separator {separator:?}: {:?}",
+            app.query
+        );
+        assert!(app.filter_edit.is_some());
+        assert!(!app.navigating);
+        assert!(app.handle_event(key(KeyCode::Enter)).is_none());
+        assert_eq!(navigation(app.handle_event(key(KeyCode::Enter))), expected);
+    }
+}
+
+#[test]
 fn filter_paste_sanitizes_controls_limits_length_and_ignores_modified_or_release_keys() {
     let mut app = many(1);
     app.handle_event(key(KeyCode::Char('/')));
     app.handle_event(Event::Paste("q\x1b\n\u{202e}g\r\u{2066}界".into()));
-    assert_eq!(app.query, "qg界");
+    assert_eq!(app.query, "q g 界");
     for event in [
         Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
         Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT)),
@@ -2132,7 +2159,7 @@ fn filter_paste_sanitizes_controls_limits_length_and_ignores_modified_or_release
         )),
     ] {
         assert!(app.handle_event(event).is_none());
-        assert_eq!(app.query, "qg界");
+        assert_eq!(app.query, "q g 界");
     }
     app.handle_event(Event::Paste("界".repeat(300)));
     assert_eq!(app.query.chars().count(), 256);
@@ -2366,6 +2393,35 @@ fn grouped_columns_remove_only_repeated_fields_and_single_groups_restore_them() 
                 }
             }
         }
+    }
+}
+
+#[test]
+fn selected_idle_status_contrasts_with_full_row_highlight_at_full_and_compact_widths() {
+    for width in [100, 20] {
+        let agent = entry(0, Status::Idle);
+        let mut app = app(vec![agent.clone()]);
+        let mut terminal = terminal(width, 10);
+        render(&mut app, &mut terminal);
+        let row = agent_area(&app, &agent.id);
+        let layout = app_columns(&app, row);
+        assert_eq!(layout.compact_status, width == 20);
+        let status = layout.areas[1];
+        let label = if layout.compact_status {
+            "○"
+        } else {
+            "○ Idle"
+        };
+        let buffer = terminal.backend().buffer();
+        assert_cell_text(buffer, status, label, false);
+        for x in status.x..status.x + Line::raw(label).width() as u16 {
+            let cell = &buffer[(x, row.y)];
+            assert_ne!(cell.fg, cell.bg, "Idle status at width {width}, cell {x}");
+        }
+        for x in row.x..row.right() {
+            assert_eq!(buffer[(x, row.y)].bg, Color::DarkGray);
+        }
+        assert_eq!(app.selected, Some(agent.id));
     }
 }
 

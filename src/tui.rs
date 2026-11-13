@@ -249,8 +249,12 @@ impl App {
         if let Event::Paste(value) = &event {
             if self.filter_edit.is_some() {
                 let remaining = 256usize.saturating_sub(self.query.chars().count());
+                let value: String = value
+                    .chars()
+                    .map(|c| if c.is_whitespace() { ' ' } else { c })
+                    .collect();
                 self.query
-                    .extend(display_text(value).chars().take(remaining));
+                    .extend(display_text(&value).chars().take(remaining));
                 self.filter_changed();
             }
             return None;

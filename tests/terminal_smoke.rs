@@ -370,7 +370,7 @@ fn assert_terminal_cleanup_with_mock(termination: Termination, mock: MockRex) {
                 );
                 // Ratatui can reuse unchanged screen cells within the query.
                 // Its unique command-like suffix and edit-mode hint must still be drawn.
-                if contains(&output, b"qg?") && contains(&output, b"Enter Apply") {
+                if contains(&output, b"q g?") && contains(&output, b"Enter Apply") {
                     break;
                 }
                 assert!(
