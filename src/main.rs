@@ -67,7 +67,7 @@ fn run() -> Result<(), String> {
         match arg.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "brachio — Rex coding agent status\n\nUsage: brachio [--client client:<uuid>]\n\nSelects the only connected app by default; refuses ambiguous clients.\nKeys: Up/Down select, Enter or left click navigate, q/Esc/Ctrl-C quit.\nNavigation requires Rex app Remote Control. It can change shared session focus.\nRex CLI: PATH first, then the app-managed installation on macOS."
+                    "brachio — Rex coding agent status\n\nUsage: brachio [--client client:<uuid>]\n\nSelects the only connected app by default; refuses ambiguous clients.\nKeys: Up/Down select, g cycles grouping (None/Agent/Status/CWD/Session; default None),\nTab/Shift+Tab select next/previous group when grouped, Enter or left click navigate,\nw details, q/Esc/Ctrl-C quit.\nNavigation requires Rex app Remote Control. It can change shared session focus.\nRex CLI: PATH first, then the app-managed installation on macOS."
                 );
                 return Ok(());
             }
@@ -314,7 +314,7 @@ mod tests {
         let click = Event::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 0,
-            row: 2,
+            row: 3,
             modifiers: KeyModifiers::NONE,
         });
         // Input already pending before updates still resolves the old displayed row.
