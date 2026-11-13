@@ -5,6 +5,7 @@ edition = "2024"
 description = "A Rex coding agent status TUI"
 license = "MIT"
 repository = "https://github.com/narumiruna/brachio"
+readme = "README.md"
 publish = true
 
 [dependencies]

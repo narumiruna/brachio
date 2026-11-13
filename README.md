@@ -7,12 +7,24 @@ Brachio does not send prompts, keys, or commands to agents. It is not a native s
 ## Requirements and installation
 
 - macOS or Linux with an interactive terminal and mouse reporting.
-- Rust stable and Cargo. The development checks used Rust/Cargo 1.99.1.
+- For installation, use Cargo or [uv](https://docs.astral.sh/uv/). A PyPI wheel does not require Rust. Source builds require Rust stable and Cargo.
 - The official Rex CLI on `PATH`, connected to the intended server.
 - An open Rex app. Brachio uses the `session.select` app action to show a session or tab. This action requires **Remote Control**.
   - In Rex, open **Settings → Rex Server** and enable **Remote Control**. It is off by default.
   - Enable this only if you accept remote app control. Brachio does not change it.
   - If disabled, Rex rejects app selection with `Rex.app is not accepting actions`. Press `w` in Brachio to read the full error. After enabling the permission, press Enter on the target agent to retry.
+
+After publication, install from either registry:
+
+```sh
+cargo install brachio --locked
+# Or install the native CLI from PyPI:
+uv tool install brachio
+# Run without a persistent installation:
+uvx brachio --help
+```
+
+PyPI wheels target Linux (glibc 2.28 or newer) and macOS, on x86_64 and aarch64. Windows and musl wheels are not provided. Both distributions contain the same Rust CLI and use the version in `Cargo.toml`.
 
 Build from source:
 
@@ -22,8 +34,6 @@ cargo build --release --locked
 # Optional local installation:
 cargo install --path . --locked
 ```
-
-The package is not published. The manifest disables registry publication.
 
 ## Start and operate
 
@@ -95,7 +105,13 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 cargo build --release
+uv lock --check
+uv build
+uvx --isolated --no-index --find-links dist brachio --version
+uvx --isolated --no-index --find-links dist brachio --help
 ```
+
+`uv build` builds a source distribution, then builds the local platform wheel from it. The CLI smoke tests do not start the TUI or contact Rex.
 
 Tests use synthetic JSON, a local mock CLI, Ratatui's test backend, and owned PTYs. They do not control the real Rex app. See [Rex compatibility and handoff](docs/rex-compatibility.md) for the measured environment, repeatable read-only queries, test evidence, native UI checks, and release restrictions.
 
@@ -125,4 +141,4 @@ Brachio retries transient connection and initial app-discovery failures. Exit an
 
 Native app switching and physical mouse delivery require the manual checks in the handoff document before claiming end-to-end platform support. Windows is not supported. The CI workflow checks Linux and macOS PTY/process behavior; native Rex UI behavior is not established by those tests.
 
-No registry publication, version tag, or release workflow is part of this implementation. Before any future publication, a maintainer must recheck the crate name and similar project names and authorize release.
+The [publishing guide](docs/publishing.md) describes registry setup, tag-triggered publication to crates.io and PyPI, verification, and recovery. A maintainer must confirm both registry names and authorize each release. Publication is not a transaction across the two registries.

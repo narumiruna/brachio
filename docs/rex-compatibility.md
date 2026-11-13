@@ -138,9 +138,9 @@ Unverified: physical mouse delivery, visible app switching, return-to-TUI behavi
 
 ### Package maintainer: release
 
-Prerequisite: a separate release authorization. Recheck `brachio` on crates.io and similar project names, review native test results and compatibility claims, then decide whether to release.
+Prerequisite: a separate release authorization. Confirm ownership and availability of `brachio` on crates.io and PyPI, check similar project names, and review native test results and compatibility claims. Follow the [publishing guide](publishing.md) to configure registry credentials and validate the release tag.
 
-No package publication, registry credential request, version tag, or release dispatch is authorized by this work. The manifest's `publish = false` is intentional.
+The repository supports both registry uploads. No package publication, version tag, or release dispatch was performed during implementation. Packaging checks do not establish native Rex UI acceptance.
 
 ## References
 
