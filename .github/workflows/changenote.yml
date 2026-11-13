@@ -1,4 +1,4 @@
-name: Change notes
+name: Changenotes
 
 on:
   pull_request:
