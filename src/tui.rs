@@ -7,7 +7,7 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
-use crate::model::{Entry, EntryId, Snapshot, Status, plain};
+use crate::model::{Entry, EntryId, Snapshot, Status, display_text, plain};
 
 #[derive(Debug)]
 pub enum Action {
@@ -225,14 +225,18 @@ impl App {
         }
         if header_height > 0 {
             let header = Rect::new(area.x, area.y + title_height, area.width, 1);
-            let [_, name, status, location] = columns(header);
+            let [_, name, status, directory, session, tab, pane] = columns(header);
             let style = Style::default().add_modifier(Modifier::BOLD);
             frame.render_widget(Paragraph::new("Agent").style(style), name);
             frame.render_widget(Paragraph::new("Status").style(style), status);
-            frame.render_widget(
-                Paragraph::new("Session / Tab / Pane").style(style),
-                location,
-            );
+            for (label, column) in [
+                ("Working directory", directory),
+                ("Session", session),
+                ("Tab", tab),
+                ("Pane", pane),
+            ] {
+                frame.render_widget(Paragraph::new(label).style(style), column);
+            }
         }
 
         if self.snapshot.entries.is_empty() {
@@ -254,22 +258,40 @@ impl App {
                     Style::default()
                 };
                 frame.render_widget(Block::default().style(style), row_area);
-                let [marker, name, status, location] = columns(row_area);
+                let [marker, name, status, directory, session, tab, pane] = columns(row_area);
                 frame.render_widget(
                     Paragraph::new(if selected { ">" } else { " " }).style(style),
                     marker,
                 );
                 // Separate clipped columns keep long Unicode names off the status/location.
-                frame.render_widget(Paragraph::new(plain(&entry.name)).style(style), name);
+                frame.render_widget(
+                    Paragraph::new(clip_text(&entry.name, name.width, false)).style(style),
+                    name,
+                );
                 frame.render_widget(
                     Paragraph::new(entry.status.label())
                         .style(style.fg(status_color(entry.status))),
                     status,
                 );
                 frame.render_widget(
-                    Paragraph::new(location_text(entry, location.width)).style(style),
-                    location,
+                    Paragraph::new(clip_text(
+                        entry.working_dir.as_deref().unwrap_or("Unknown"),
+                        directory.width,
+                        true,
+                    ))
+                    .style(style),
+                    directory,
                 );
+                for (label, column) in [
+                    (&entry.location.session, session),
+                    (&entry.location.tab, tab),
+                    (&entry.location.pane, pane),
+                ] {
+                    frame.render_widget(
+                        Paragraph::new(clip_text(label, column.width, false)).style(style),
+                        column,
+                    );
+                }
                 self.hits.push(HitRegion {
                     area: row_area,
                     entry: entry.clone(),
@@ -319,7 +341,7 @@ impl App {
             area.height - title_height - 1,
         );
         self.viewport = body;
-        let message = report_text(&self.message);
+        let message = display_text(&self.message);
         let mut lines = wrap_details(
             &format!(
                 "Message: {}",
@@ -341,7 +363,29 @@ impl App {
         } else {
             for (index, warning) in self.snapshot.warnings.iter().enumerate() {
                 lines.extend(wrap_details(
-                    &format!("{}. {}", index + 1, report_text(warning)),
+                    &format!("{}. {}", index + 1, display_text(warning)),
+                    body.width,
+                ));
+            }
+        }
+        if let Some(index) = self.selected_index() {
+            let entry = &self.snapshot.entries[index];
+            lines.push(Line::raw(""));
+            for (label, value) in [
+                ("Agent", entry.name.as_str()),
+                (
+                    "Working directory",
+                    entry.working_dir.as_deref().unwrap_or("Unknown"),
+                ),
+                ("Session", entry.location.session.as_ref()),
+                ("Tab", entry.location.tab.as_ref()),
+                ("Pane", entry.location.pane.as_ref()),
+                ("Session ID", entry.target.session.as_str()),
+                ("Tab ID", entry.target.window.as_str()),
+                ("Pane ID", entry.target.block.as_str()),
+            ] {
+                lines.extend(wrap_details(
+                    &format!("{label}: {}", display_text(value)),
                     body.width,
                 ));
             }
@@ -432,7 +476,7 @@ impl App {
         };
         let entry = self.snapshot.entries[index].clone();
         self.navigating = true;
-        self.message = format!("Switching to {}.", plain(&entry.location));
+        self.message = format!("Switching to {}.", entry.location);
         Some(Action::Navigate(Box::new(entry)))
     }
 
@@ -463,21 +507,6 @@ impl App {
     }
 }
 
-// Keep the model's display filter, but not its 256-character row limit.
-fn report_text(value: &str) -> String {
-    let mut text = String::new();
-    let mut remaining = value;
-    while !remaining.is_empty() {
-        let end = remaining
-            .char_indices()
-            .nth(256)
-            .map_or(remaining.len(), |(index, _)| index);
-        text.push_str(&plain(&remaining[..end]));
-        remaining = &remaining[end..];
-    }
-    text
-}
-
 fn wrap_details(value: &str, width: u16) -> Vec<Line<'static>> {
     let text = Span::raw(value);
     let mut lines = Vec::new();
@@ -500,41 +529,77 @@ fn contains(area: Rect, x: u16, y: u16) -> bool {
     x >= area.x && x < area.right() && y >= area.y && y < area.bottom()
 }
 
-fn columns(area: Rect) -> [Rect; 4] {
+fn columns(area: Rect) -> [Rect; 7] {
     let marker_width = area.width.min(2);
     let status_width = area.width.saturating_sub(marker_width).min(8);
     let remaining = area.width - marker_width - status_width;
-    let name_width = (remaining / 3).min(24);
+    let name_width = (remaining / 5).min(18);
+    let directory_width = (remaining / 3).min(40);
+    let locations = remaining - name_width - directory_width;
+    let session_width = locations / 3;
+    let tab_width = (locations - session_width) / 2;
+    let pane_width = locations - session_width - tab_width;
     let name_x = area.x + marker_width;
     let status_x = name_x + name_width;
-    let location_x = status_x + status_width;
+    let directory_x = status_x + status_width;
+    let session_x = directory_x + directory_width;
+    let tab_x = session_x + session_width;
+    let pane_x = tab_x + tab_width;
     [
         Rect::new(area.x, area.y, marker_width, area.height),
         Rect::new(name_x, area.y, name_width.saturating_sub(1), area.height),
         Rect::new(status_x, area.y, status_width, area.height),
-        Rect::new(location_x, area.y, remaining - name_width, area.height),
+        Rect::new(
+            directory_x,
+            area.y,
+            directory_width.saturating_sub(1),
+            area.height,
+        ),
+        Rect::new(
+            session_x,
+            area.y,
+            session_width.saturating_sub(1),
+            area.height,
+        ),
+        Rect::new(tab_x, area.y, tab_width.saturating_sub(1), area.height),
+        Rect::new(pane_x, area.y, pane_width, area.height),
     ]
 }
 
-fn location_text(entry: &Entry, width: u16) -> String {
-    let location = plain(&entry.location);
-    if !location.is_empty() && Line::raw(location.as_str()).width() <= usize::from(width) {
-        return location;
+fn clip_text(value: &str, width: u16, keep_end: bool) -> String {
+    let text = display_text(value);
+    if width == 0 {
+        return String::new();
     }
-    // Long labels must not push the pane identity out of the row.
-    let suffix_width = (usize::from(width).saturating_sub(8) / 3).min(8);
-    let suffix = |id: &str| {
-        let id = plain(id);
-        id.chars()
-            .skip(id.chars().count().saturating_sub(suffix_width))
-            .collect::<String>()
-    };
-    format!(
-        "s:{} t:{} p:{}",
-        suffix(&entry.target.session),
-        suffix(&entry.target.window),
-        suffix(&entry.target.block),
-    )
+    if Line::raw(text.as_str()).width() <= usize::from(width) {
+        return text;
+    }
+    let span = Span::raw(text.as_str());
+    let graphemes: Vec<_> = span
+        .styled_graphemes(Style::default())
+        .map(|g| g.symbol)
+        .collect();
+    let mut parts = Vec::new();
+    let mut used = 0;
+    for index in 0..graphemes.len() {
+        let index = if keep_end {
+            graphemes.len() - 1 - index
+        } else {
+            index
+        };
+        let grapheme = graphemes[index];
+        let size = Span::raw(grapheme).width();
+        if used + size > usize::from(width - 1) {
+            break;
+        }
+        parts.push(grapheme);
+        used += size;
+    }
+    if keep_end {
+        format!("…{}", parts.into_iter().rev().collect::<String>())
+    } else {
+        format!("{}…", parts.concat())
+    }
 }
 
 fn status_color(status: Status) -> Color {
@@ -550,7 +615,7 @@ fn status_color(status: Status) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Target;
+    use crate::model::{Location, Target};
     use crossterm::event::{KeyEvent, MouseEvent};
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -568,7 +633,12 @@ mod tests {
             },
             name: format!("agent-{index:02}"),
             status,
-            location: format!("session-{index:02} / tab-{index:02} / pane-{index:02}"),
+            location: Location {
+                session: format!("session-{index:02}").into(),
+                tab: format!("tab-{index:02}").into(),
+                pane: format!("pane-{index:02}").into(),
+            },
+            working_dir: None,
             records: 1,
         }
     }
@@ -632,7 +702,9 @@ mod tests {
         let mut app = App::default();
         let rows = render(&mut app, &mut terminal(100, 10));
         assert!(rows[0].contains("brachio | 0 agents"));
-        assert!(rows[1].contains("Session / Tab / Pane"));
+        for label in ["Working directory", "Session", "Tab", "Pane"] {
+            assert!(rows[1].contains(label));
+        }
         assert!(rows[2].contains("No agents"));
         assert!(rows[8].contains("Enter/click navigate"));
         assert!(rows[9].contains("STALE: disconnected"));
@@ -665,7 +737,13 @@ mod tests {
         for (i, entry) in app.snapshot.entries.iter().enumerate() {
             assert!(rows[i + 2].contains(&entry.name));
             assert!(rows[i + 2].contains(entry.status.label()));
-            assert!(rows[i + 2].contains(&entry.location));
+            for label in [
+                &entry.location.session,
+                &entry.location.tab,
+                &entry.location.pane,
+            ] {
+                assert!(rows[i + 2].contains(label.as_ref()));
+            }
         }
         assert_eq!(app.snapshot.entries[0].status, Status::Blocked);
         assert_eq!(app.snapshot.entries[5].status, Status::Idle);
@@ -676,7 +754,11 @@ mod tests {
     fn equal_statuses_use_the_same_location_and_identity_order_as_the_model() {
         let mut a = entry(1, Status::Working);
         let mut b = entry(2, Status::Working);
-        a.location = "same location".into();
+        a.location = Location {
+            session: "same".into(),
+            tab: "same".into(),
+            pane: "same".into(),
+        };
         b.location = a.location.clone();
         let mut expected = Snapshot {
             entries: vec![b, entry(3, Status::Blocked), a],
@@ -697,7 +779,9 @@ mod tests {
         let mut terminal = terminal(100, 8);
         let rows = render(&mut app, &mut terminal);
         assert!(rows[2].contains("Blocked"));
-        assert!(rows[2].contains("session-00 / tab-00 / pane-00"));
+        for label in ["session-00", "tab-00", "pane-00"] {
+            assert!(rows[2].contains(label));
+        }
         assert!(!rows[3].contains('界'));
         assert!(rows[7].contains("failure: denied"));
         assert!(rows[7].contains("Warnings: 1 (w details)"));
@@ -707,14 +791,14 @@ mod tests {
     }
 
     #[test]
-    fn long_location_labels_keep_session_tab_and_pane_identities_in_the_row() {
+    fn narrow_location_columns_keep_names_instead_of_opaque_id_suffixes() {
         let mut agent = entry(0, Status::Working);
-        agent.location = format!(
-            "{} / {} / {}",
-            "session".repeat(8),
-            "tab".repeat(8),
-            "pane".repeat(8)
-        );
+        agent.location = Location {
+            session: "brachio/worktree".into(),
+            tab: "Review changes".into(),
+            pane: "2: codex".into(),
+        };
+        agent.working_dir = Some("/Users/test/projects/brachio".into());
         agent.target = Target {
             session: "session:00000000-0000-0000-0000-000000000001".into(),
             window: "window:00000000-0000-0000-0000-000000000002".into(),
@@ -722,9 +806,73 @@ mod tests {
         };
         let mut app = app(vec![agent]);
         let rows = render(&mut app, &mut terminal(80, 8));
-        assert!(rows[2].contains("s:00000001 t:00000002 p:00000003"));
+        assert!(rows[2].contains("brachio/w…"));
+        assert!(rows[2].contains("Review ch…"));
+        assert!(rows[2].contains("2: codex"));
+        assert!(rows[2].contains("projects/brachio"));
+        assert!(!rows[2].contains("0000000"));
         let rows = render(&mut app, &mut terminal(50, 8));
-        assert!(rows[2].contains("s:000001 t:000002 p:000003"));
+        assert!(rows[2].contains("brac…"));
+        assert!(rows[2].contains("Revi…"));
+        assert!(!rows[2].contains("00000"));
+    }
+
+    #[test]
+    fn directory_clipping_preserves_the_project_tail_and_graphemes() {
+        let clipped = clip_text("/home/person/界e\u{301}/brachio", 13, true);
+        assert!(clipped.starts_with('…'));
+        assert!(clipped.ends_with("/brachio"));
+        assert!(Line::raw(clipped.as_str()).width() <= 13);
+        assert!(!clipped.starts_with("…\u{301}"));
+        assert_eq!(
+            clip_text("/work/\x1b\n\u{202e}repo", 80, true),
+            "/work/repo"
+        );
+        assert_eq!(clip_text("/work/repo", 1, true), "…");
+        assert_eq!(clip_text("/work/repo", 0, true), "");
+        let mut app = many(1);
+        let rows = render(&mut app, &mut terminal(80, 8));
+        assert!(rows[1].contains("Working directory"));
+        assert!(rows[2].contains("Unknown"));
+    }
+
+    #[test]
+    fn details_include_complete_selected_location_directory_and_exact_ids() {
+        let mut selected = entry(0, Status::Working);
+        selected.location = Location {
+            session: "team/project".into(),
+            tab: "Review / tests".into(),
+            pane: "2: coding agent".into(),
+        };
+        selected.working_dir = Some(format!("/work/{}/brachio", "long-directory/".repeat(30)));
+        let expected = selected.clone();
+        let mut app = app(vec![selected]);
+        app.handle_event(key(KeyCode::Char('w')));
+        let mut terminal = terminal(80, 8);
+        let rows = render(&mut app, &mut terminal);
+        let mut text: String = rows[1..7].iter().map(|row| row.trim_end()).collect();
+        for _ in 0..app.details_limit {
+            app.handle_event(key(KeyCode::Down));
+            let rows = render(&mut app, &mut terminal);
+            text.push_str(rows[6].trim_end());
+        }
+        for value in [
+            expected.location.session.as_ref(),
+            expected.location.tab.as_ref(),
+            expected.location.pane.as_ref(),
+            expected.working_dir.as_deref().unwrap(),
+            expected.target.session.as_str(),
+            expected.target.window.as_str(),
+            expected.target.block.as_str(),
+        ] {
+            assert!(text.contains(value), "missing {value:?}");
+        }
+        assert!(text.contains("Working directory:"));
+        assert!(text.contains("Session ID:"));
+        assert!(text.contains("Tab ID:"));
+        assert!(text.contains("Pane ID:"));
+        app.handle_event(key(KeyCode::Esc));
+        assert_eq!(navigation(app.handle_event(key(KeyCode::Enter))), expected);
     }
 
     #[test]
@@ -790,7 +938,12 @@ mod tests {
         app.handle_event(key(KeyCode::Down));
         let mut selected = entry(1, Status::Blocked);
         selected.name = "renamed".into();
-        selected.location = "new session / new tab / pane-1".into();
+        selected.location = Location {
+            session: "new session".into(),
+            tab: "new tab".into(),
+            pane: "pane-1".into(),
+        };
+        selected.working_dir = Some("/work/new-directory".into());
         selected.target.window = "new-tab-1".into();
         selected.records = 4;
         app.replace_snapshot(Snapshot {
@@ -1351,12 +1504,18 @@ mod tests {
         app.handle_event(Event::Resize(80, 8));
         terminal.backend_mut().resize(80, 8);
         terminal.resize(Rect::new(0, 0, 80, 8)).unwrap();
+        render(&mut app, &mut terminal);
+        assert!(app.details_scroll <= app.details_limit);
+        // Selected location metadata remains available even with no warnings.
+        for _ in 0..app.details_limit {
+            app.handle_event(key(KeyCode::Up));
+        }
         let rows = render(&mut app, &mut terminal);
         assert!(rows[1].contains("Message: No current message."));
         assert!(rows[3].contains("Warnings: 0"));
         assert!(rows[4].contains("No snapshot warnings."));
         assert_eq!(app.details_scroll, 0);
-        assert_eq!(app.details_limit, 0);
+        assert!(app.details_limit > 0);
         assert_eq!(app.selected, selected);
         assert!(app.hits.is_empty());
         assert!(!app.navigating);

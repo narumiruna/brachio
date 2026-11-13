@@ -2,6 +2,7 @@
   "last_exit": null,
   "foreground": {
     "name": "node",
-    "argv0": "pi"
+    "argv0": "pi",
+    "cwd": "/Users/test/projects/brachio"
   }
 }

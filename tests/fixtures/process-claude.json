@@ -2,6 +2,7 @@
   "last_exit": null,
   "foreground": {
     "name": "claude",
-    "argv0": "claude"
+    "argv0": "claude",
+    "cwd": "/work/other-project"
   }
 }

@@ -1,10 +1,12 @@
 use crate::model::{
-    Entry, EntryId, Snapshot, Status, Target, agent_name, aggregate, plain, valid_id,
+    Entry, EntryId, Location, Snapshot, Status, Target, agent_name, aggregate, display_text,
+    valid_id,
 };
 use crate::process::Runner;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Rex {
@@ -85,7 +87,13 @@ struct Block {
 #[derive(Clone, Debug)]
 struct Pane {
     target: Target,
-    location: String,
+    location: Location,
+}
+
+struct Report {
+    status: Status,
+    records: usize,
+    working_dir: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -128,7 +136,12 @@ impl Rex {
             .map_err(|error| format!("Invalid Rex JSON: {error}; command: {}", args.join(" ")))
     }
 
-    fn panes(&self, session: &str, warnings: &mut Vec<String>) -> Result<Vec<Pane>, String> {
+    fn panes(
+        &self,
+        session: &str,
+        session_number: usize,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<Pane>, String> {
         let view: View = self.json(&["session", "inspect", session, "--json"])?;
         if view.session_id.as_deref() != Some(session) {
             return Err("Rex returned a different or missing session ID".into());
@@ -136,20 +149,30 @@ impl Rex {
         let blocks: Blocks = self.json(&["block", "ls", "-s", session, "--json"])?;
         let mut windows = BTreeMap::new();
         let mut ambiguous = BTreeSet::new();
-        for window in view.windows.unwrap_or_default() {
+        for (window_index, window) in view.windows.unwrap_or_default().into_iter().enumerate() {
             let Some(id) = window.window_id.filter(|id| valid_id(id, "window")) else {
                 warnings.push("Window without a full ID ignored".into());
                 continue;
             };
-            for layer in window.layers.unwrap_or_default() {
-                for block in layer.blocks.unwrap_or_default() {
-                    if let Some(block) = block.block_id.filter(|id| valid_id(id, "block"))
-                        && windows
-                            .insert(block.clone(), (id.clone(), window.label.clone()))
-                            .is_some()
-                    {
-                        ambiguous.insert(block);
-                    }
+            let default_label = format!("Window {}", &id[id.len() - 8..]);
+            let tab = if window.label == default_label {
+                format!("Tab {}", window_index + 1).into()
+            } else {
+                named(&window.label, "Tab", window_index + 1)
+            };
+            for (pane_index, block) in window
+                .layers
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|layer| layer.blocks.unwrap_or_default())
+                .enumerate()
+            {
+                if let Some(block) = block.block_id.filter(|id| valid_id(id, "block"))
+                    && windows
+                        .insert(block.clone(), (id.clone(), tab.clone(), pane_index + 1))
+                        .is_some()
+                {
+                    ambiguous.insert(block);
                 }
             }
         }
@@ -162,6 +185,7 @@ impl Rex {
             }
         }
         let mut panes = Vec::new();
+        let session_name = named(&view.label, "Session", session_number);
         for block in blocks.blocks {
             if block.creator_name != "com.superlogical.terminal" {
                 continue;
@@ -174,34 +198,29 @@ impl Rex {
             if block.placement != "placed"
                 || ambiguous.contains(&id)
                 || location.is_none()
-                || location.is_some_and(|(window, _)| block.window_id.as_ref() != Some(window))
+                || location.is_some_and(|(window, _, _)| block.window_id.as_ref() != Some(window))
             {
                 warnings.push(format!("Detached, ambiguous, or moved pane {id} ignored"));
                 continue;
             }
-            let (window, label) = location.expect("checked above");
+            let (window, tab, pane_number) = location.expect("checked above");
             panes.push(Pane {
                 target: Target {
                     session: session.into(),
                     window: window.clone(),
                     block: id.clone(),
                 },
-                location: format!(
-                    "{} / {} / {}",
-                    named(&view.label, session),
-                    named(label, window),
-                    named(&block.label, &id)
-                ),
+                location: Location {
+                    session: session_name.clone(),
+                    tab: tab.clone(),
+                    pane: named(&block.label, "Pane", *pane_number),
+                },
             });
         }
         Ok(panes)
     }
 
-    fn reports(
-        &self,
-        pane: &Pane,
-        warnings: &mut Vec<String>,
-    ) -> BTreeMap<String, (Status, usize)> {
+    fn reports(&self, pane: &Pane, warnings: &mut Vec<String>) -> BTreeMap<String, Report> {
         let target = &pane.target;
         let status: Result<Value, String> = self.json(&[
             "block",
@@ -212,13 +231,26 @@ impl Rex {
             &target.block,
             "program_status",
         ]);
-        let mut reports = match status.and_then(|value| aggregate(&value)) {
+        let reports = match status.and_then(|value| aggregate(&value)) {
             Ok(reports) => reports,
             Err(error) => {
                 warnings.push(format!("Status unavailable for {}: {error}", target.block));
                 BTreeMap::new()
             }
         };
+        let mut reports: BTreeMap<_, _> = reports
+            .into_iter()
+            .map(|(app, (status, records))| {
+                (
+                    app,
+                    Report {
+                        status,
+                        records,
+                        working_dir: None,
+                    },
+                )
+            })
+            .collect();
         let process: Result<Value, String> = self.json(&[
             "block",
             "call",
@@ -231,7 +263,20 @@ impl Rex {
         match process {
             Ok(value) => {
                 if let Some(app) = process_agent(&value) {
-                    reports.entry(app.into()).or_insert((Status::Unknown, 0));
+                    let report = reports.entry(app.into()).or_insert(Report {
+                        status: Status::Unknown,
+                        records: 0,
+                        working_dir: None,
+                    });
+                    report.working_dir = value
+                        .pointer("/foreground/cwd")
+                        .and_then(Value::as_str)
+                        .filter(|path| {
+                            path.len() <= 4096
+                                && !path.contains('\0')
+                                && std::path::Path::new(path).is_absolute()
+                        })
+                        .map(str::to_string);
                 }
             }
             Err(error) => warnings.push(format!(
@@ -246,7 +291,7 @@ impl Rex {
         let sessions: Sessions = self.json(&["ls", "--json"])?;
         let mut snapshot = Snapshot::default();
         let mut seen = BTreeSet::new();
-        for session in sessions.sessions {
+        for (session_index, session) in sessions.sessions.into_iter().enumerate() {
             let Some(id) = session.session_id.filter(|id| valid_id(id, "session")) else {
                 snapshot
                     .warnings
@@ -256,7 +301,7 @@ impl Rex {
             if !seen.insert(id.clone()) {
                 return Err("Duplicate session IDs in Rex snapshot".into());
             }
-            let panes = match self.panes(&id, &mut snapshot.warnings) {
+            let panes = match self.panes(&id, session_index + 1, &mut snapshot.warnings) {
                 Ok(panes) => panes,
                 Err(error) => {
                     snapshot
@@ -266,7 +311,7 @@ impl Rex {
                 }
             };
             for pane in panes {
-                for (agent, (status, records)) in self.reports(&pane, &mut snapshot.warnings) {
+                for (agent, report) in self.reports(&pane, &mut snapshot.warnings) {
                     snapshot.entries.push(Entry {
                         id: EntryId {
                             session: id.clone(),
@@ -275,9 +320,10 @@ impl Rex {
                         },
                         target: pane.target.clone(),
                         name: agent,
-                        status,
+                        status: report.status,
                         location: pane.location.clone(),
-                        records,
+                        working_dir: report.working_dir,
+                        records: report.records,
                     });
                 }
             }
@@ -360,7 +406,7 @@ impl Rex {
         }
         let mut warnings = Vec::new();
         let pane = self
-            .panes(&target.session, &mut warnings)?
+            .panes(&target.session, 1, &mut warnings)?
             .into_iter()
             .find(|pane| pane.target == *target)
             .ok_or("Pane closed or moved; no focus command sent")?;
@@ -399,13 +445,14 @@ impl Rex {
     }
 }
 
-fn named(label: &str, id: &str) -> String {
-    let label: String = plain(label).chars().take(24).collect();
-    let suffix = id.get(id.len().saturating_sub(8)..).unwrap_or(id);
+fn named(label: &str, kind: &str, number: usize) -> Arc<str> {
+    let label = display_text(label);
     if label.is_empty() {
-        id.into()
+        format!("{kind} {number}").into()
+    } else if kind != "Session" && label != format!("{kind} {number}") {
+        format!("{number}: {label}").into()
     } else {
-        format!("{label} [{suffix}]")
+        label.into()
     }
 }
 

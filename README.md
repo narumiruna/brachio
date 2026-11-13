@@ -42,14 +42,16 @@ Brachio uses the CLI's normal server connection. Check `rex whoami --json` befor
 | Enter | Navigate to the selected agent |
 | Left click | Select and navigate to that row |
 | Mouse wheel | Scroll without changing the selected agent |
-| w | Open details with the current message and every warning |
+| w | Open details with messages, warnings, and full values for the selected agent |
 | Up / Down or wheel in details | Scroll details; w / Escape returns to agents |
 | q / Escape / Ctrl-C | Exit |
 | Terminal resize | Recalculate the visible rows |
 
-Each row shows an agent, status, and session / tab / pane labels with ID suffixes. Narrow terminals clip text; enlarge the terminal to see more. Groups use this fixed priority: **Blocked, Error, Done, Unknown, Working, Idle**. No elapsed task time is inferred from status timestamps.
+Each row has separate **Working directory**, **Session**, **Tab**, and **Pane** columns. Locations use readable names, not ID suffixes. Unnamed sessions/tabs/panes use their display positions; generated tab names become `Tab N`. Long names end with `…`; long directories keep the path end visible. Press `w` and scroll to see complete column values and exact navigation IDs. Groups use this fixed priority: **Blocked, Error, Done, Unknown, Working, Idle**. No elapsed task time is inferred from status timestamps.
 
 Selection uses the session ID, block ID, and canonical agent name, not a row number. If the selected entry disappears, navigation stops until you deliberately select another row. Snapshot changes invalidate old mouse hit regions. Queued input is read before list redraws; mouse-down events that arrive during a redraw are discarded with a retry message rather than mapped to a replacement row. Terminal events do not carry a display-generation token, so this is not a guarantee about delayed physical input.
+
+**Working directory** means the current directory (CWD) reported by Rex for the recognized foreground agent. It is not an inferred workspace or repository root. Missing directories, exited agents, and unrelated foreground processes show `Unknown`. Brachio uses the existing process query; it does not send commands to the agent or inspect local project files.
 
 ## Agent and record rules
 

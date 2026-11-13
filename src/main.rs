@@ -275,7 +275,7 @@ fn process_input(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brachio::model::{Entry, EntryId, Snapshot, Status, Target};
+    use brachio::model::{Entry, EntryId, Location, Snapshot, Status, Target};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent};
     use ratatui::backend::TestBackend;
 
@@ -294,7 +294,12 @@ mod tests {
             },
             name: "pi".into(),
             status,
-            location: number.into(),
+            location: Location {
+                session: "session".into(),
+                tab: "tab".into(),
+                pane: number.into(),
+            },
+            working_dir: None,
             records: 1,
         };
         let mut app = App::default();

@@ -87,21 +87,23 @@ The documented raw terminal-event envelope is:
 
 Only the envelope type is needed: events trigger a new authoritative snapshot, not incremental record edits. CLI client join/leave churn is ignored to prevent snapshot feedback loops. A fixed reconciliation also covers missed events and client changes.
 
+The working-directory column uses `foreground.cwd` only when the foreground process has the same recognized agent identity as the row. It does not use a shell/other program directory for retained agent records. Missing, relative, NUL-containing, or oversized paths remain unknown. Session/tab/pane labels are independent display fields; exact IDs remain navigation data and are available in details.
+
 The server describes session focus as shared session state. A client action can be refused, disconnected, unsupported, or timed out. A timed-out action can still execute later. There is no verified atomic operation that both focuses a block and switches only one app. These limits are documented rather than hidden.
 
 ## Automated verification scope
 
-- Model tests: multiple apps, related records, parent inheritance, missing/future states, clear, unsupported apps, safe text, and exact resource IDs.
+- Model tests: multiple apps, related records, parent inheritance, missing/future states, clear, unsupported apps, safe text, and exact resource IDs. Location labels stay separate from IDs; directory changes cannot change agent identity or navigation targets.
 - Mock CLI tests: multiple sessions/tabs/panes, detached and nonterminal blocks, empty status, retained completed reports, malformed JSON, unsupported status, ambiguous locations, pinned app choice, transient startup discovery recovery, refusal to replace a pin, precise ordered arguments, stale/moved panes, focus failure, permission refusal, event refresh, reconnect, navigation during a slow scan, and worker shutdown.
-- TUI tests: empty and long lists, status groups, Unicode clipping, tiny viewports, scroll, resize, stable selection, removed targets, stale click maps, keyboard/mouse target equivalence, disabled navigation, and complete scrollable message/warning details.
+- TUI tests: empty and long lists, status groups, readable location columns, working-directory path clipping, Unicode clipping, tiny viewports, scroll, resize, stable selection, removed targets, stale click maps, keyboard/mouse target equivalence, disabled navigation, and complete scrollable message/warning/selected-agent details.
 - Subprocess tests: timeout, cancellation, argument boundaries, invalid encoding, output limits, stderr failures, stream framing, EOF, and owned descendant cleanup.
 - PTY smoke tests: actual binary startup and keyboard/signal exits with terminal-mode and escape cleanup, including SIGTERM during sustained input. Nonterminal and argument errors exit without starting the TUI.
 
 ### Local results
 
-All four standard checks passed on macOS with the measured Rust toolchain. The suite has 95 tests: 69 library tests, one redraw/input routing test, 15 mock Rex integration tests, and 10 PTY/CLI smoke tests. Three additional complete test runs passed. Release binary help/version checks also passed without terminal setup or Rex navigation.
+All four standard checks passed on macOS with the measured Rust toolchain. The suite has 101 tests: 71 library tests, one redraw/input routing test, 19 mock Rex integration tests, and 10 PTY/CLI smoke tests. Three additional complete test runs passed before the location/working-directory update. Release binary help/version checks also passed without terminal setup or Rex navigation.
 
-Repeated verification exposed and corrected a Darwin process-exit transition where group signaling can report EPERM before waitid exposes exit. The runner retains child identity during a bounded retry; a 100-short-stream regression checks this path. Process fixtures use serialized execution and startup-specific test deadlines to avoid cold-executable timing failures; production request deadlines remain unchanged.
+Repeated verification exposed and corrected a Darwin process-exit transition where group signaling can report EPERM before waitid exposes exit. The runner retains child identity during a bounded retry; a 100-short-stream regression checks this path. Process and mock CLI fixtures use serialized execution to avoid cold-executable launch saturation. Worker concurrency remains active within each fixture, including the slow-scan navigation test. Process fixtures also use startup-specific test deadlines; production request deadlines remain unchanged.
 
 Source review also corrected queued-click retargeting, duplicate-parent record inheritance, input-flood shutdown, and final terminal cleanup after a worker panic. Automated PR review identified non-mutating mouse events that consumed click targets, hidden warning details, startup discovery that did not recover, and navigation delayed by snapshot scans. The fixes preserve motion/release hit targets, expose scrollable details, retry only transient pre-pin discovery, and separate serialized navigation from read-only refresh work. No live app switch or agent input was sent during verification. The CI workflow repeats the standard checks on Linux and macOS; native UI acceptance remains a separate handoff.
 

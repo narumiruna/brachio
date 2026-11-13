@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Status {
@@ -48,13 +49,27 @@ pub struct Target {
     pub block: String,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Location {
+    pub session: Arc<str>,
+    pub tab: Arc<str>,
+    pub pane: Arc<str>,
+}
+
+impl std::fmt::Display for Location {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} / {} / {}", self.session, self.tab, self.pane)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Entry {
     pub id: EntryId,
     pub target: Target,
     pub name: String,
     pub status: Status,
-    pub location: String,
+    pub location: Location,
+    pub working_dir: Option<String>,
     pub records: usize,
 }
 
@@ -84,12 +99,21 @@ pub fn valid_id(value: &str, kind: &str) -> bool {
             .all(|(part, len)| part.len() == len && part.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// Plain single-line text; never render terminal controls or bidi overrides.
-pub fn plain(value: &str) -> String {
+fn display_chars(value: &str) -> impl Iterator<Item = char> + '_ {
     value.chars().filter(|c| {
         !c.is_control()
             && !matches!(*c, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
-    }).take(256).collect()
+    })
+}
+
+/// Bounded single-line text for status messages and errors.
+pub fn plain(value: &str) -> String {
+    display_chars(value).take(256).collect()
+}
+
+/// Complete display text without terminal controls or bidi overrides.
+pub fn display_text(value: &str) -> String {
+    display_chars(value).collect()
 }
 
 pub fn agent_name(value: &str) -> Option<&'static str> {
@@ -264,5 +288,7 @@ mod tests {
     fn display_text_removes_controls_and_direction_overrides() {
         assert_eq!(plain("a\x1b\n\u{202e}b"), "ab");
         assert_eq!(plain(&"x".repeat(500)).len(), 256);
+        assert_eq!(display_text(&"x".repeat(500)).len(), 500);
+        assert_eq!(display_text("a\x1b\n\u{202e}b"), "ab");
     }
 }

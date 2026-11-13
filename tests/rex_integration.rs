@@ -4,21 +4,29 @@ use brachio::rex::Rex;
 use brachio::worker::{Update, Worker};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const CLIENT: &str = "client:00000000-0000-0000-0000-000000000001";
 
+// Avoid cold executable launch saturation on macOS. Worker threads within
+// each fixture still run concurrently, including the slow-scan navigation test.
+static FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+
 struct Fixture {
     dir: TempDir,
     rex: Rex,
     stop: Arc<AtomicBool>,
+    _guard: MutexGuard<'static, ()>,
 }
 
 impl Fixture {
     fn new() -> Self {
+        let guard = FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         for file in fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures")).unwrap() {
             let file = file.unwrap();
@@ -28,7 +36,12 @@ impl Fixture {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let rex = Rex::new(Runner::new(executable.into_os_string(), stop.clone()));
-        Self { dir, rex, stop }
+        Self {
+            _guard: guard,
+            dir,
+            rex,
+            stop,
+        }
     }
 
     fn mode(&self, mode: &str) {
@@ -90,9 +103,30 @@ fn multi_session_snapshot_preserves_exact_locations_and_record_rules() {
         "window:00000000-0000-0000-0000-000000000001"
     );
     assert!(
-        pi.location.contains("Work")
-            && pi.location.contains("Code")
-            && pi.location.contains("Pane 1")
+        pi.location.session.as_ref() == "Work"
+            && pi.location.tab.as_ref() == "1: Code"
+            && pi.location.pane.as_ref() == "Pane 1"
+    );
+    assert_eq!(
+        pi.working_dir.as_deref(),
+        Some("/Users/test/projects/brachio")
+    );
+    assert!(
+        snapshot
+            .entries
+            .iter()
+            .filter(|entry| entry.status == Status::Done || entry.id.agent == "codex")
+            .all(|entry| entry.working_dir.is_none())
+    );
+    assert_eq!(
+        snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id.agent == "claude-code")
+            .unwrap()
+            .working_dir
+            .as_deref(),
+        Some("/work/other-project")
     );
     assert!(
         snapshot
@@ -135,6 +169,105 @@ fn multi_session_snapshot_preserves_exact_locations_and_record_rules() {
         );
     }
     assert!(mutations(&calls).is_empty());
+}
+
+#[test]
+fn directory_changes_do_not_change_agent_identity_or_navigation_target() {
+    let fixture = Fixture::new();
+    let before = fixture.pi();
+    let path = fixture.dir.path().join("process-pi.json");
+    let mut process: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    process["foreground"]["cwd"] = "/work/another-project".into();
+    fs::write(&path, serde_json::to_vec(&process).unwrap()).unwrap();
+    let after = fixture.pi();
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.target, before.target);
+    assert_eq!(after.working_dir.as_deref(), Some("/work/another-project"));
+    assert!(mutations(&fixture.calls()).is_empty());
+}
+
+#[test]
+fn missing_or_unrelated_process_directories_remain_unknown() {
+    for cwd in [
+        serde_json::Value::Null,
+        serde_json::json!(""),
+        serde_json::json!("relative/path"),
+        serde_json::json!(format!("/{}", "x".repeat(4096))),
+        serde_json::json!("/work/\0invalid"),
+    ] {
+        let fixture = Fixture::new();
+        let path = fixture.dir.path().join("process-pi.json");
+        let mut process: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        process["foreground"]["cwd"] = cwd;
+        fs::write(path, serde_json::to_vec(&process).unwrap()).unwrap();
+        assert!(fixture.pi().working_dir.is_none());
+    }
+    let fixture = Fixture::new();
+    fs::copy(
+        fixture.dir.path().join("process-node.json"),
+        fixture.dir.path().join("process-pi.json"),
+    )
+    .unwrap();
+    assert!(fixture.pi().working_dir.is_none());
+}
+
+#[test]
+fn missing_and_generated_location_labels_use_readable_positions_not_ids() {
+    let fixture = Fixture::new();
+    let path = fixture.dir.path().join("view-a.json");
+    let mut view: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    view["label"] = "".into();
+    view["windows"][0]["label"] = "Window 00000001".into();
+    fs::write(path, serde_json::to_vec(&view).unwrap()).unwrap();
+    let path = fixture.dir.path().join("blocks-a.json");
+    let mut blocks: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    blocks["blocks"][0]["label"] = "".into();
+    fs::write(path, serde_json::to_vec(&blocks).unwrap()).unwrap();
+    let pi = fixture.pi();
+    assert_eq!(pi.location.session.as_ref(), "Session 1");
+    assert_eq!(pi.location.tab.as_ref(), "Tab 1");
+    assert_eq!(pi.location.pane.as_ref(), "Pane 1");
+    assert_eq!(
+        pi.target.block,
+        "block:00000000-0000-0000-0000-000000000001"
+    );
+}
+
+#[test]
+fn long_location_names_are_preserved_and_shared_between_pane_entries() {
+    let fixture = Fixture::new();
+    let label = "human-readable-label/".repeat(30);
+    let path = fixture.dir.path().join("view-a.json");
+    let mut view: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    view["label"] = label.clone().into();
+    view["windows"][0]["label"] = label.clone().into();
+    fs::write(path, serde_json::to_vec(&view).unwrap()).unwrap();
+    let path = fixture.dir.path().join("blocks-a.json");
+    let mut blocks: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    blocks["blocks"][0]["label"] = label.clone().into();
+    fs::write(path, serde_json::to_vec(&blocks).unwrap()).unwrap();
+    let snapshot = fixture.rex.snapshot().unwrap();
+    let pi = snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.records == 2)
+        .unwrap();
+    assert_eq!(pi.location.session.as_ref(), label);
+    assert_eq!(pi.location.tab.as_ref(), format!("1: {label}"));
+    assert_eq!(pi.location.pane.as_ref(), format!("1: {label}"));
+    let codex = snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.id.agent == "codex")
+        .unwrap();
+    assert!(Arc::ptr_eq(&pi.location.session, &codex.location.session));
+    assert!(Arc::ptr_eq(&pi.location.tab, &codex.location.tab));
 }
 
 #[test]

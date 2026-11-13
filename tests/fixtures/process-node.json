@@ -3,6 +3,7 @@
   "foreground": {
     "name": "node",
     "argv0": "node",
-    "script": "/tmp/unrelated.js"
+    "script": "/tmp/unrelated.js",
+    "cwd": "/work/not-the-agent"
   }
 }
