@@ -74,15 +74,20 @@ class ReleaseWorkflow(unittest.TestCase):
         for name in ("validate", "wheels", "crates-io"):
             checkout = self.jobs[name]["steps"][0]
             self.assertEqual(checkout["with"]["ref"], "${{ needs.release.outputs.release-commit }}")
-        matrix = self.jobs["wheels"]["strategy"]["matrix"]["include"]
-        self.assertEqual([entry["target"] for entry in matrix], [
-            "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
-            "x86_64-apple-darwin", "aarch64-apple-darwin",
-        ])
         self.assertEqual(self.step("wheels", "Build source distribution")["if"],
                          "matrix.target == 'x86_64-unknown-linux-gnu'")
         for name in ("crates-io", "pypi"):
             self.assertEqual(self.jobs[name]["environment"]["name"], name)
+
+    def test_wheel_matrix_uses_supported_native_runners(self):
+        self.assertEqual(self.jobs["wheels"]["runs-on"], "${{ matrix.runner }}")
+        matrix = self.jobs["wheels"]["strategy"]["matrix"]["include"]
+        self.assertEqual(matrix, [
+            {"runner": "ubuntu-latest", "target": "x86_64-unknown-linux-gnu"},
+            {"runner": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-gnu"},
+            {"runner": "macos-15-intel", "target": "x86_64-apple-darwin"},
+            {"runner": "macos-15", "target": "aarch64-apple-darwin"},
+        ])
 
     def test_obsolete_workflows_and_note_pattern(self):
         for name in ("changenote.yml", "publish.yml"):

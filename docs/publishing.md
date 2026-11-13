@@ -154,7 +154,7 @@ The workflow first runs the Rust checks and a crate publication dry run. It then
 | Linux, glibc 2.28 or newer | x86_64 | `ubuntu-latest` |
 | Linux, glibc 2.28 or newer | aarch64 | `ubuntu-24.04-arm` |
 | macOS | x86_64 | `macos-15-intel` |
-| macOS | aarch64 | `macos-14` |
+| macOS | aarch64 | `macos-15` |
 
 The Linux x86_64 job also builds the source archive. Windows and Alpine/musl wheels are not included. Each installed wheel must report the validated version and accept `--help`. Both upload jobs wait until validation and every wheel build pass. Registry uploads then run independently.
 
