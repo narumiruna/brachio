@@ -6,11 +6,13 @@ Brachio uses one version for crates.io and PyPI. `Cargo.toml` is the version sou
 
 [changenote](https://github.com/narumiruna/changenote) manages pending notes, versions, changelogs, and local annotated tags. It does not publish registry artifacts.
 
-Install the same reviewed revision used by the PR workflow:
+Run the same pinned version used by the PR workflow with uv and Python 3.12 or newer:
 
 ```sh
-cargo install --git https://github.com/narumiruna/changenote --rev f4423760122463bf03a8d161c6f0bc4173afb6e0 --locked
+uvx changenote==0.9.2 status
 ```
+
+No separate tool installation is required. Compatible wheels do not need Rust or Cargo. Use `uvx changenote==0.9.2` in place of `changenote` in the commands below.
 
 Run commands from the repository root. `.changenote/config.json` defines one package, `brachio`, with `Cargo.toml` as its primary version file and `v` as its tag prefix. Do not add the dynamic Python version as an additional version output.
 
@@ -27,7 +29,7 @@ Documentation-only changes, test-only changes, internal refactors, and release-t
 
 ### PR checks
 
-The `Change notes` workflow runs on pull requests with read-only permissions. It installs the CLI from a pinned upstream revision, not contributor code. Keep the CLI, check Action, and schema pins compatible when upgrading.
+The `Change notes` workflow runs on pull requests with read-only permissions. It uses `uvx` to run a pinned CLI version from PyPI, not contributor code. Pending releases and PR check results are printed as JSON in the job logs. Keep the CLI and schema pins compatible when upgrading.
 
 The configured check paths are `src/**`, `Cargo.toml`, `Cargo.lock`, `pyproject.toml`, `uv.lock`, and `.github/workflows/publish.yml`. Changes to these paths require a new or updated note for `brachio`. Review release effects outside these paths manually. An unchanged old note does not satisfy a PR check.
 
