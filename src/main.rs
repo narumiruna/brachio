@@ -225,7 +225,7 @@ fn route_input(app: &mut App, event: Event, crossed_redraw: bool) -> Option<Acti
     if crossed_redraw
         && matches!(&event, Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Down(_)))
     {
-        app.message = "List redrawn; click again to select the displayed row".into();
+        app.discard_redraw_click();
         return None;
     }
     app.handle_event(event)
@@ -329,11 +329,67 @@ mod tests {
         terminal.draw(|frame| app.draw(frame)).unwrap();
         // A queued coordinate crossing this redraw must not acquire the new row.
         assert!(route_input(&mut app, click, true).is_none());
+        assert_eq!(
+            app.message,
+            "List redrawn; click again to select the displayed row"
+        );
         assert!(!app.navigating);
         let quit = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(matches!(
             route_input(&mut app, quit, true),
             Some(Action::Quit)
         ));
+    }
+
+    #[test]
+    fn details_clicks_keep_error_messages_before_and_after_redraw() {
+        for (connected, message) in [
+            (true, "Navigation failed: Remote Control denied"),
+            (
+                false,
+                "Rex disconnected; entries are stale; navigation disabled: fixture",
+            ),
+        ] {
+            let mut app = App::default();
+            app.connected = connected;
+            app.message = message.into();
+            app.snapshot.warnings.push("Fixture status warning".into());
+            let warnings = app.snapshot.warnings.clone();
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('w'),
+                KeyModifiers::NONE,
+            )));
+            let mut terminal = Terminal::new(TestBackend::new(140, 10)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            for crossed_redraw in [false, true] {
+                for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+                    let click = Event::Mouse(MouseEvent {
+                        kind: MouseEventKind::Down(button),
+                        column: 2,
+                        row: 2,
+                        modifiers: KeyModifiers::NONE,
+                    });
+                    assert!(route_input(&mut app, click, crossed_redraw).is_none());
+                    assert_eq!(app.message, message);
+                    assert_eq!(app.snapshot.warnings, warnings);
+                    assert!(!app.navigating);
+                    terminal.draw(|frame| app.draw(frame)).unwrap();
+                    let text: String = terminal
+                        .backend()
+                        .buffer()
+                        .content
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect();
+                    assert!(text.contains("brachio | Details"));
+                    assert!(text.contains(message));
+                }
+            }
+            let quit = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+            assert!(matches!(
+                route_input(&mut app, quit, true),
+                Some(Action::Quit)
+            ));
+        }
     }
 }
