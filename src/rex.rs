@@ -6,7 +6,41 @@ use crate::process::Runner;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+const MACOS_REX_EXECUTABLE: &str = "Library/Application Support/com.superlogical.rex/RexServer/Versions/Current/Rex Server.app/Contents/MacOS/rex";
+
+/// Prefer PATH, then the current app-managed CLI on macOS.
+pub fn find_executable() -> Result<PathBuf, String> {
+    let path = std::env::var_os("PATH");
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    find_executable_in(path.as_deref(), home.as_deref()).ok_or_else(|| {
+        if cfg!(target_os = "macos") {
+            "Rex CLI not found in PATH or the macOS Rex installation. Open Rex to install its server, or add rex to PATH."
+        } else {
+            "Rex CLI not found in PATH. Install the official Rex CLI and add it to PATH."
+        }
+        .into()
+    })
+}
+
+fn find_executable_in(path: Option<&OsStr>, home: Option<&Path>) -> Option<PathBuf> {
+    let installed = home
+        .filter(|home| cfg!(target_os = "macos") && home.is_absolute())
+        .map(|home| home.join(MACOS_REX_EXECUTABLE));
+    path.into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|directory| directory.join("rex"))
+        .chain(installed)
+        .find(|path| {
+            path.metadata().is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+}
 
 #[derive(Clone)]
 pub struct Rex {
@@ -484,6 +518,83 @@ pub fn event_invalidates(line: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
+
+    fn write_executable(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn executable_search_preserves_path_order_and_skips_invalid_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        let directories: Vec<_> = ["missing", "directory", "not-executable", "first", "second"]
+            .into_iter()
+            .map(|name| root.path().join(name))
+            .collect();
+        fs::create_dir_all(directories[1].join("rex")).unwrap();
+        for directory in &directories[2..] {
+            write_executable(&directory.join("rex"));
+        }
+        fs::set_permissions(
+            directories[2].join("rex"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let path = std::env::join_paths(&directories).unwrap();
+        assert_eq!(
+            find_executable_in(Some(&path), None),
+            Some(directories[3].join("rex"))
+        );
+    }
+
+    #[test]
+    fn executable_search_without_path_or_home_finds_nothing() {
+        assert_eq!(find_executable_in(None, None), None);
+    }
+
+    #[test]
+    fn executable_search_ignores_relative_home() {
+        assert_eq!(find_executable_in(None, Some(Path::new("relative"))), None);
+        assert_eq!(find_executable_in(None, Some(Path::new(""))), None);
+    }
+
+    #[test]
+    fn executable_search_uses_managed_installation_only_on_macos() {
+        let home = tempfile::tempdir().unwrap();
+        let installed = home.path().join(MACOS_REX_EXECUTABLE);
+        write_executable(&installed);
+        assert_eq!(
+            find_executable_in(None, Some(home.path())),
+            cfg!(target_os = "macos").then_some(installed.clone())
+        );
+        let bin = home.path().join("custom bin");
+        let preferred = bin.join("rex");
+        write_executable(&preferred);
+        assert_eq!(
+            find_executable_in(Some(bin.as_os_str()), Some(home.path())),
+            Some(preferred)
+        );
+        fs::set_permissions(&installed, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(find_executable_in(None, Some(home.path())), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn executable_search_follows_current_installation_symlink() {
+        let home = tempfile::tempdir().unwrap();
+        let versions = home
+            .path()
+            .join("Library/Application Support/com.superlogical.rex/RexServer/Versions");
+        let installed = versions.join("Current/Rex Server.app/Contents/MacOS/rex");
+        let version = versions.join("1956");
+        write_executable(&version.join("Rex Server.app/Contents/MacOS/rex"));
+        std::os::unix::fs::symlink("1956", versions.join("Current")).unwrap();
+        assert_eq!(find_executable_in(None, Some(home.path())), Some(installed));
+        fs::remove_dir_all(version).unwrap();
+        assert_eq!(find_executable_in(None, Some(home.path())), None);
+    }
 
     #[test]
     fn interpreter_alone_is_not_an_agent() {
