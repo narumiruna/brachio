@@ -65,9 +65,31 @@ Use `--allow-dirty` with the Cargo dry run only to check uncommitted local chang
 
 The Checks workflow runs Rust tests and source-to-wheel builds on Linux and macOS. Installed wheel version and help checks do not start the TUI or call Rex.
 
+## Release automation setup
+
+The `.github/workflows/release.yml` workflow uses the pinned `narumiruna/changenote/release` Action. The Action builds and caches a compatible CLI from its own source, not from Brachio. It prepares the Cargo cache before offline version updates. The PR note workflow still runs its CLI through `uvx`.
+
+A repository maintainer must add an Actions secret named `PAT_TOKEN` before enabling Release runs:
+
+1. Use a fine-grained personal access token with access to this repository and `Contents: read and write` and `Pull requests: read and write` permissions.
+   - Also grant `Workflows: read and write` so the managed release branch can include workflow changes from `main`.
+   - A classic token instead needs `repo` and `workflow` scopes.
+2. The token owner must be permitted to push the managed release branch, create PRs, and create version tags and GitHub Releases. Repository rules still apply.
+3. Keep the token value in the Actions secret. Do not put it in files, issues, logs, or chat. Renew it before expiration.
+
+The workflow fails before checkout if `PAT_TOKEN` is absent. It does not fall back to `GITHUB_TOKEN`. Checkout has read-only permissions and does not retain credentials; the release Action receives the PAT explicitly for its Git pushes and API writes.
+
+PAT-created PRs trigger the existing PR checks, and PAT-pushed version tags trigger Publish. The default `GITHUB_TOKEN` does not trigger those workflows for these events. The repository setting that permits GitHub Actions to create PRs does not replace the PAT or its permissions.
+
+Reserve `narumi/chore/changenote-release-main` for the Action. It creates or updates one Release PR from pending notes and never merges it. Before merging that PR:
+
+1. Review the version, consumed notes, changelog, and lockfile changes. Do not edit the generated release tree by hand.
+2. Apply `skip-changenote` and explain in the PR description that this PR consumes existing notes instead of adding a new note.
+3. Wait for the PR checks and complete the registry setup below. Merging the Release PR starts GitHub publication and tag-triggered registry publication.
+
 ## Registry setup
 
-A repository maintainer must complete these steps before the first automated release:
+A repository maintainer must complete these steps before merging the first Release PR:
 
 1. Confirm ownership and availability of `brachio` on crates.io and PyPI. Check similar names before publication.
 2. Create GitHub environments named `crates-io` and `pypi`.
@@ -87,11 +109,29 @@ PyPI uses the `PYPI_TOKEN` secret, not Trusted Publishing. Other jobs have only 
 
 ## Automated publication
 
-The `.github/workflows/publish.yml` workflow starts when a `v*.*.*` tag is pushed. Manual dispatch also requires a version tag; dispatch from a branch fails validation without an upload.
+### Release PRs and GitHub publication
+
+Release runs on pushes to `main` with operation `auto`. It manages the Release PR and publishes the latest incomplete validated release batch. After a generated Release PR is merged, the Action verifies its saved batch and generated tree, creates the annotated version tag, and creates the GitHub Release. The PAT tag push then triggers the existing Publish workflow.
+
+The Action can complete an older incomplete batch on a later `main` push; it does not require a new batch in that push. Do not merge another Release PR until the current batch and registry uploads are complete. Only one Release run executes at a time. A later push does not cancel an active run.
+
+Run Release manually only on `main`:
+
+1. `manage-pr` is the default. It creates or updates the Release PR without publishing.
+2. `retry-publication` explicitly retries GitHub publication of the latest validated batch. It does not merge a PR or upload registry artifacts itself.
+
+### Registry publication
+
+The `.github/workflows/publish.yml` workflow starts when a `v*.*.*` tag is pushed with the PAT or by an authorized maintainer. Manual dispatch also requires a version tag; dispatch from a branch fails validation without an upload. The tag event can start Publish before Release completes. A later GitHub Release failure does not cancel the registry run.
 
 ```mermaid
 flowchart LR
-    Tag[Version tag] --> Validate[Validate version and Rust checks]
+    Main[Push to main with pending notes] --> PR[Create or update Release PR]
+    PR --> Merge[Maintainer reviews and merges]
+    Merge --> Batch[Validate release batch]
+    Batch --> Tag[Push version tag with PAT]
+    Tag --> GitHub[Create GitHub Release]
+    Tag --> Validate[Validate version and Rust checks]
     Validate --> Wheels[Build and check all platform wheels]
     Wheels --> Crates[Publish crate to crates.io]
     Wheels --> PyPI[Publish wheels and source archive to PyPI]
@@ -110,7 +150,11 @@ The workflow first runs the Rust checks and a crate publication dry run. It then
 
 The Linux x86_64 job also builds the source archive. Windows and Alpine/musl wheels are not included. Each installed wheel must report the validated version and accept `--help`. Both upload jobs wait until validation and every wheel build pass. Registry uploads then run independently.
 
-Version changes, local tag creation, tag pushes, GitHub Releases, and registry uploads each need explicit authorization. Adding notes does not authorize these actions. No automatic Release PR or GitHub Release workflow is configured.
+Adding notes does not merge or publish a release. Once automation is enabled, a maintainer merges the generated Release PR to start its release. Separate manual versioning, local tag creation, tag pushes, GitHub Releases, and registry uploads still require explicit authorization.
+
+### Manual release preparation
+
+Use this procedure only when preparing a release outside the automatic Release PR workflow. Do not run it against an Action-managed release branch.
 
 To prepare an authorized version change:
 
@@ -133,13 +177,15 @@ This uses the saved release batch to create an annotated `v<version>` tag. Push 
 git push origin refs/tags/v0.1.0
 ```
 
-A normal branch push or pull request does not publish. Do not move a tag after either registry has received its version.
+Feature-branch pushes and ordinary PRs do not publish. A push to `main` can complete the latest validated release batch as described above. Do not move a tag after either registry has received its version.
 
 ## Partial failures and recovery
 
 The two registry uploads are not a transaction. One can succeed while the other fails.
 
-Use GitHub Actions **Re-run failed jobs** for the same tagged run. This retains successful build artifacts and does not repeat a successful registry job. A manual dispatch on the same tag runs the whole workflow again and can fail if the crate version is already published.
+For incomplete tags or GitHub Releases, run Release on `main` with `operation=retry-publication`. Existing tags and release text are not replaced. A retry does not push an existing tag again, so it does not restart Publish when that tag already exists.
+
+For registry failures, use GitHub Actions **Re-run failed jobs** on the original tagged Publish run. This retains successful build artifacts and does not repeat a successful registry job. A manual Publish dispatch on the same tag runs the whole workflow again and can fail if the crate version is already published.
 
 The PyPI upload uses `uv publish --check-url https://pypi.org/simple/`. Matching uploaded files are skipped; files with different contents are rejected. If a rebuilt wheel conflicts, inspect the original artifacts instead of replacing published files.
 
@@ -147,11 +193,13 @@ Crates.io does not permit a second upload of an existing version. If Cargo repor
 
 If local versioning fails, stop and inspect Git state. Changenote attempts to restore its known release files, but recovery is not atomic. Do not discard unrelated changes or retry without checking the result.
 
-Before publication, revert the packaging or workflow change to disable it. After publication, fix a faulty release with a new version. Registry yanks are separate maintainer actions and do not remove installed copies.
+Disable Release to stop automatic PR updates and GitHub publication. Disable Publish separately if registry uploads must stop. Disabling a workflow does not cancel a run already in progress. After publication, fix a faulty release with a new version. Registry yanks are separate maintainer actions and do not remove installed copies.
 
 ## Verification handoff
 
-A maintainer must create and control the `skip-changenote` label, verify the hosted `Change notes` workflow, and select required branch checks. Local tests do not establish GitHub label permissions, branch rules, or hosted Action behavior.
+A maintainer must configure `PAT_TOKEN`, create and control the `skip-changenote` label, and select required branch checks. Verify that a PAT-created Release PR starts the Checks and Change notes workflows, and that a PAT tag push starts Publish during an authorized release. Local tests do not establish token permissions, GitHub label permissions, branch rules, hosted Action behavior, or event delivery.
+
+Supply the PAT and registry prerequisites before using automation. Implementation and local verification do not authorize a Release dispatch or a publication.
 
 Local verification can establish host-platform Rust behavior, source archive completeness, and installed wheel behavior. It does not verify registry name ownership, the initial crate upload, Trusted Publishing configuration, PyPI tokens, environment approval rules, real uploads, or wheel behavior on other platforms.
 

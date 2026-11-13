@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Manage the release PR or retry GitHub publication
+        type: choice
+        default: manage-pr
+        options: [manage-pr, retry-publication]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: changenote-release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check release token
+        shell: bash
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          if [[ -z "$PAT_TOKEN" ]]; then
+            echo '::error::Set the PAT_TOKEN repository secret before running Release.'
+            exit 1
+          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: narumiruna/changenote/release@f4423760122463bf03a8d161c6f0bc4173afb6e0
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          base-branch: main
+          operation: ${{ inputs.operation || 'auto' }}
