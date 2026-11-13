@@ -1,5 +1,5 @@
 use crate::model::{Entry, Snapshot};
-use crate::rex::{Rex, event_invalidates};
+use crate::rex::{ClientSelection, Rex, event_invalidates};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -29,6 +29,16 @@ impl Worker {
         let (commands, commands_rx) = mpsc::sync_channel(1);
         let dirty = Arc::new(AtomicBool::new(true));
         let stream_error = Arc::new(Mutex::new(None::<String>));
+        let client = Arc::new(Mutex::new(ClientSelection::Retry(
+            "Discovering Rex app".into(),
+        )));
+        // Own threads as soon as they start, including partial startup failure.
+        let mut worker = Self {
+            updates,
+            commands,
+            stop: stop.clone(),
+            threads: Vec::new(),
+        };
         let event_thread = {
             let rex = rex.clone();
             let stop = stop.clone();
@@ -61,35 +71,74 @@ impl Worker {
                 })
                 .map_err(|error| format!("Cannot start event worker: {error}"))?
         };
+        worker.threads.push(event_thread);
+        let navigation_thread = {
+            let rex = rex.clone();
+            let stop = stop.clone();
+            let dirty = dirty.clone();
+            let client = client.clone();
+            let updates_tx = updates_tx.clone();
+            thread::Builder::new()
+                .name("rex-navigation".into())
+                .spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let entry = match commands_rx.recv_timeout(Duration::from_millis(50)) {
+                            Ok(entry) => entry,
+                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        };
+                        // Only this thread mutates Rex focus. Snapshot/event threads are read-only.
+                        let selected = client
+                            .lock()
+                            .map_err(|_| "Client selection state is unavailable".to_string())
+                            .and_then(|selection| selection.result());
+                        let result = selected.and_then(|id| rex.navigate(&entry, &id));
+                        if !publish(&updates_tx, Update::Navigation(result), &stop) {
+                            break;
+                        }
+                        dirty.store(true, Ordering::Relaxed);
+                    }
+                })
+                .map_err(|error| format!("Cannot start navigation worker: {error}"))?
+        };
+        worker.threads.push(navigation_thread);
         let refresh_thread = {
             let stop = stop.clone();
             thread::Builder::new()
                 .name("rex-refresh".into())
                 .spawn(move || {
-                    let client = rex.select_client(requested_client.as_deref());
-                    if !publish(&updates_tx, Update::Client(client.clone()), &stop) {
-                        return;
-                    }
                     let mut next_refresh = Instant::now();
                     let mut next_event_refresh = Instant::now();
+                    let mut reported_client = false;
                     while !stop.load(Ordering::Relaxed) {
-                        if let Ok(entry) = commands_rx.recv_timeout(Duration::from_millis(50)) {
-                            let result = match &client {
-                                Ok(client) => rex.navigate(&entry, client),
-                                Err(error) => Err(error.clone()),
-                            };
-                            if !publish(&updates_tx, Update::Navigation(result), &stop) {
-                                break;
-                            }
-                            dirty.store(true, Ordering::Relaxed);
-                        }
-                        if stop.load(Ordering::Relaxed) {
-                            break;
-                        }
                         let now = Instant::now();
                         if now >= next_refresh
                             || (now >= next_event_refresh && dirty.swap(false, Ordering::Relaxed))
                         {
+                            let retry = client.lock().is_ok_and(|selection| {
+                                matches!(*selection, ClientSelection::Retry(_))
+                            });
+                            if retry {
+                                let selection = rex.discover_client(requested_client.as_deref());
+                                let changed = match client.lock() {
+                                    Ok(mut current) => {
+                                        let changed = *current != selection || !reported_client;
+                                        *current = selection.clone();
+                                        changed
+                                    }
+                                    Err(_) => return,
+                                };
+                                if changed
+                                    && !publish(
+                                        &updates_tx,
+                                        Update::Client(selection.result()),
+                                        &stop,
+                                    )
+                                {
+                                    break;
+                                }
+                                reported_client = true;
+                            }
                             let mut result = rex.snapshot();
                             if let Ok(snapshot) = &mut result
                                 && let Ok(error) = stream_error.lock()
@@ -100,27 +149,17 @@ impl Worker {
                             if !publish(&updates_tx, Update::Snapshot(result), &stop) {
                                 break;
                             }
-                            // Fixed reconciliation repairs missed, malformed, or out-of-order events.
+                            // Reconciliation repairs missed/out-of-order events. It never focuses.
                             next_refresh = Instant::now() + Duration::from_secs(2);
                             next_event_refresh = Instant::now() + Duration::from_millis(250);
                         }
+                        pause(&stop, Duration::from_millis(50));
                     }
                 })
+                .map_err(|error| format!("Cannot start refresh worker: {error}"))?
         };
-        let refresh_thread = match refresh_thread {
-            Ok(thread) => thread,
-            Err(error) => {
-                stop.store(true, Ordering::Relaxed);
-                let _ = event_thread.join();
-                return Err(format!("Cannot start refresh worker: {error}"));
-            }
-        };
-        Ok(Self {
-            updates,
-            commands,
-            stop,
-            threads: vec![event_thread, refresh_thread],
-        })
+        worker.threads.push(refresh_thread);
+        Ok(worker)
     }
 
     pub fn navigate(&self, entry: Entry) -> Result<(), String> {

@@ -3,7 +3,7 @@ use ratatui::{
     Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Paragraph},
 };
 
@@ -32,6 +32,9 @@ pub struct App {
     received_snapshot: bool,
     scroll: usize,
     reveal_selection: bool,
+    details: bool,
+    details_scroll: usize,
+    details_limit: usize,
     viewport: Rect,
     hits: Vec<HitRegion>,
 }
@@ -55,11 +58,14 @@ impl App {
     pub fn handle_event(&mut self, event: Event) -> Option<Action> {
         // Resolve clicks from the last draw, never from a newly sorted row index.
         let clicked = match &event {
-            Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => self
-                .hits
-                .iter()
-                .find(|hit| contains(hit.area, mouse.column, mouse.row))
-                .map(|hit| hit.entry.clone()),
+            Event::Mouse(mouse)
+                if !self.details && mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
+            {
+                self.hits
+                    .iter()
+                    .find(|hit| contains(hit.area, mouse.column, mouse.row))
+                    .map(|hit| hit.entry.clone())
+            }
             _ => None,
         };
         // Preserve targets for motion, release, and other non-mutating input.
@@ -87,7 +93,19 @@ impl App {
                 KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     Some(Action::Quit)
                 }
+                KeyCode::Esc if self.details => {
+                    self.toggle_details();
+                    None
+                }
                 KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
+                KeyCode::Char('w') => {
+                    self.toggle_details();
+                    None
+                }
+                KeyCode::Up | KeyCode::Down if self.details => {
+                    self.scroll_details(key.code == KeyCode::Down, 1);
+                    None
+                }
                 KeyCode::Up => {
                     self.move_selection(false);
                     None
@@ -96,9 +114,19 @@ impl App {
                     self.move_selection(true);
                     None
                 }
-                KeyCode::Enter => self.navigate_selected(),
+                KeyCode::Enter if !self.details => self.navigate_selected(),
                 _ => None,
             },
+            Event::Mouse(mouse) if self.details => {
+                if matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                ) && contains(self.viewport, mouse.column, mouse.row)
+                {
+                    self.scroll_details(mouse.kind == MouseEventKind::ScrollDown, 3);
+                }
+                None
+            }
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     let entry = clicked?;
@@ -133,7 +161,9 @@ impl App {
             },
             Event::Resize(_, _) => {
                 self.viewport = Rect::default();
-                self.reveal_selection = true;
+                if !self.details {
+                    self.reveal_selection = true;
+                }
                 None
             }
             _ => None,
@@ -145,11 +175,16 @@ impl App {
         self.viewport = Rect::default();
         let area = frame.area();
         if area.width == 0 || area.height == 0 {
+            self.details_limit = 0;
             return;
         }
         self.snapshot.sort();
         if self.selected.is_some() && self.selected_index().is_none() {
             self.selection_removed();
+        }
+        if self.details {
+            self.draw_details(frame);
+            return;
         }
 
         // Keep the status and help visible. Omit headings in very short views.
@@ -245,7 +280,7 @@ impl App {
         if footer_height == 2 {
             frame.render_widget(
                 Paragraph::new(
-                    "↑/↓ select | Enter/left click navigate | Wheel scroll | q/Esc/Ctrl-C quit",
+                    "↑/↓ select | Enter/click navigate | Wheel scroll | w details | q/Esc/Ctrl-C quit",
                 ),
                 Rect::new(area.x, area.bottom() - 2, area.width, 1),
             );
@@ -253,6 +288,93 @@ impl App {
         let (status, color) = self.footer();
         frame.render_widget(
             Paragraph::new(status).style(Style::default().fg(color)),
+            Rect::new(area.x, area.bottom() - 1, area.width, 1),
+        );
+    }
+
+    fn toggle_details(&mut self) {
+        self.details = !self.details;
+        self.details_scroll = 0;
+        self.details_limit = 0;
+        self.viewport = Rect::default();
+        self.hits.clear();
+    }
+
+    fn scroll_details(&mut self, down: bool, amount: usize) {
+        self.details_scroll = if down {
+            self.details_scroll.saturating_add(amount)
+        } else {
+            self.details_scroll.saturating_sub(amount)
+        }
+        .min(self.details_limit);
+    }
+
+    fn draw_details(&mut self, frame: &mut Frame) {
+        let area = frame.area();
+        let title_height = u16::from(area.height >= 3);
+        let body = Rect::new(
+            area.x,
+            area.y + title_height,
+            area.width,
+            area.height - title_height - 1,
+        );
+        self.viewport = body;
+        let message = report_text(&self.message);
+        let mut lines = wrap_details(
+            &format!(
+                "Message: {}",
+                if message.is_empty() {
+                    "No current message."
+                } else {
+                    &message
+                }
+            ),
+            body.width,
+        );
+        lines.push(Line::raw(""));
+        lines.extend(wrap_details(
+            &format!("Warnings: {}", self.snapshot.warnings.len()),
+            body.width,
+        ));
+        if self.snapshot.warnings.is_empty() {
+            lines.extend(wrap_details("No snapshot warnings.", body.width));
+        } else {
+            for (index, warning) in self.snapshot.warnings.iter().enumerate() {
+                lines.extend(wrap_details(
+                    &format!("{}. {}", index + 1, report_text(warning)),
+                    body.width,
+                ));
+            }
+        }
+        let count = lines.len();
+        let height = usize::from(body.height);
+        self.details_limit = count.saturating_sub(height);
+        self.details_scroll = self.details_scroll.min(self.details_limit);
+        if title_height > 0 {
+            let first = if height == 0 {
+                0
+            } else {
+                self.details_scroll + 1
+            };
+            let last = (self.details_scroll + height).min(count);
+            frame.render_widget(
+                Paragraph::new(format!("brachio | Details | lines {first}-{last}/{count}"))
+                    .style(Style::default().add_modifier(Modifier::BOLD)),
+                Rect::new(area.x, area.y, area.width, 1),
+            );
+        }
+        frame.render_widget(
+            Paragraph::new(
+                lines
+                    .into_iter()
+                    .skip(self.details_scroll)
+                    .take(height)
+                    .collect::<Vec<_>>(),
+            ),
+            body,
+        );
+        frame.render_widget(
+            Paragraph::new("↑/↓/Wheel scroll | Esc/w back | q/Ctrl-C quit"),
             Rect::new(area.x, area.bottom() - 1, area.width, 1),
         );
     }
@@ -322,7 +444,10 @@ impl App {
         } else {
             ("Connected", Color::Green)
         };
-        let mut text = state.to_string();
+        let mut text = format!(
+            "{state} | Warnings: {} (w details)",
+            self.snapshot.warnings.len()
+        );
         let message = plain(&self.message);
         if !message.is_empty() {
             text.push_str(" | ");
@@ -331,18 +456,44 @@ impl App {
                 color = Color::Yellow;
             }
         }
-        if let Some(warning) = self.snapshot.warnings.first() {
-            text.push_str(" | WARNING: ");
-            text.push_str(&plain(warning));
-            if self.snapshot.warnings.len() > 1 {
-                text.push_str(&format!(" (+{} more)", self.snapshot.warnings.len() - 1));
-            }
-            if self.connected {
-                color = Color::Yellow;
-            }
+        if !self.snapshot.warnings.is_empty() && self.connected {
+            color = Color::Yellow;
         }
         (text, color)
     }
+}
+
+// Keep the model's display filter, but not its 256-character row limit.
+fn report_text(value: &str) -> String {
+    let mut text = String::new();
+    let mut remaining = value;
+    while !remaining.is_empty() {
+        let end = remaining
+            .char_indices()
+            .nth(256)
+            .map_or(remaining.len(), |(index, _)| index);
+        text.push_str(&plain(&remaining[..end]));
+        remaining = &remaining[end..];
+    }
+    text
+}
+
+fn wrap_details(value: &str, width: u16) -> Vec<Line<'static>> {
+    let text = Span::raw(value);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut used = 0;
+    for grapheme in text.styled_graphemes(Style::default()) {
+        let size = Span::raw(grapheme.symbol).width();
+        if used + size > usize::from(width) && !line.is_empty() {
+            lines.push(Line::raw(std::mem::take(&mut line)));
+            used = 0;
+        }
+        line.push_str(grapheme.symbol);
+        used += size;
+    }
+    lines.push(Line::raw(line));
+    lines
 }
 
 fn contains(area: Rect, x: u16, y: u16) -> bool {
@@ -483,7 +634,7 @@ mod tests {
         assert!(rows[0].contains("brachio | 0 agents"));
         assert!(rows[1].contains("Session / Tab / Pane"));
         assert!(rows[2].contains("No agents"));
-        assert!(rows[8].contains("Enter/left click navigate"));
+        assert!(rows[8].contains("Enter/click navigate"));
         assert!(rows[9].contains("STALE: disconnected"));
         assert!(app.hits.is_empty());
         assert!(app.handle_event(click(3, 2)).is_none());
@@ -549,7 +700,7 @@ mod tests {
         assert!(rows[2].contains("session-00 / tab-00 / pane-00"));
         assert!(!rows[3].contains('界'));
         assert!(rows[7].contains("failure: denied"));
-        assert!(rows[7].contains("WARNING: warning"));
+        assert!(rows[7].contains("Warnings: 1 (w details)"));
         for cell in &terminal.backend().buffer().content {
             assert_eq!(plain(cell.symbol()), cell.symbol());
         }
@@ -971,12 +1122,291 @@ mod tests {
         let mut terminal = terminal(160, 8);
         let rows = render(&mut app, &mut terminal);
         assert!(rows[7].contains("Navigation failed: Remote Control denied"));
-        assert!(rows[7].contains("WARNING: Pane status unavailable (+1 more)"));
+        assert!(rows[7].contains("Warnings: 2 (w details)"));
         app.connected = false;
         let rows = render(&mut app, &mut terminal);
         assert!(rows[7].contains("STALE: disconnected"));
         assert!(rows[7].contains("Navigation failed"));
         assert!(rows[2].contains("agent-00"));
+    }
+
+    #[test]
+    fn warning_access_precedes_long_client_notices_and_errors_at_eighty_columns() {
+        let mut app = many(1);
+        let message = "Target app client:00000000-0000-0000-0000-000000000001; session focus is shared with other clients";
+        app.message = message.into();
+        app.snapshot.warnings = vec!["First warning".into(), "Second warning".into()];
+        let mut terminal = terminal(80, 8);
+        let rows = render(&mut app, &mut terminal);
+        assert!(rows[6].contains("w details"));
+        assert!(rows[6].contains("q/Esc/Ctrl-C quit"));
+        assert!(rows[7].contains("Warnings: 2 (w details)"));
+        assert!(rows[7].contains("Target app client:"));
+        assert!(rows[7].find("Warnings:").unwrap() < rows[7].find("Target app").unwrap());
+        assert_eq!(app.message, message);
+
+        app.message = "Navigation failed: Remote Control denied".into();
+        let rows = render(&mut app, &mut terminal);
+        assert!(rows[7].contains("Warnings: 2 (w details)"));
+        assert!(rows[7].contains("Navigation failed: Remote Control denied"));
+        app.connected = false;
+        let rows = render(&mut app, &mut terminal);
+        assert!(rows[7].contains("STALE: disconnected"));
+        assert!(rows[7].contains("Warnings: 2 (w details)"));
+        assert!(rows[7].contains("Navigation"));
+    }
+
+    #[test]
+    fn details_scroll_exposes_the_full_sanitized_message_and_every_warning() {
+        let mut app = many(2);
+        app.message = format!(
+            "Navigation failed: {} \x1b\n\u{202e}MESSAGE-END",
+            "界e\u{301}🦕".repeat(100)
+        );
+        app.snapshot.warnings = (0..8)
+            .map(|index| {
+                format!(
+                    "WARNING-{index}: {} \r\u{2066}WARNING-END-{index}",
+                    "pane status unavailable; ".repeat(20)
+                )
+            })
+            .collect();
+        let message = app.message.clone();
+        let warnings = app.snapshot.warnings.clone();
+        let selected = app.selected.clone();
+        let mut terminal = terminal(80, 8);
+        assert!(app.handle_event(key(KeyCode::Char('w'))).is_none());
+        let rows = render(&mut app, &mut terminal);
+        assert!(rows[0].contains("Details | lines"));
+        assert!(rows[1].contains("Message: Navigation failed:"));
+        assert!(rows[7].contains("Esc/w back | q/Ctrl-C quit"));
+        let mut text: String = rows[1..7].iter().map(|row| row.trim_end()).collect();
+        assert!(!text.contains("WARNING-END-7"));
+        app.handle_event(key(KeyCode::Up));
+        assert_eq!(app.details_scroll, 0);
+        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 7));
+        assert_eq!(app.details_scroll, 0);
+        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 1));
+        assert_eq!(app.details_scroll, 3);
+        app.handle_event(mouse(MouseEventKind::ScrollUp, 0, 1));
+        assert_eq!(app.details_scroll, 0);
+
+        let limit = app.details_limit;
+        for _ in 0..limit {
+            app.handle_event(key(KeyCode::Down));
+            let rows = render(&mut app, &mut terminal);
+            text.push_str(rows[6].trim_end());
+            for cell in &terminal.backend().buffer().content {
+                assert_eq!(plain(cell.symbol()), cell.symbol());
+            }
+        }
+        assert!(text.contains("MESSAGE-END"));
+        assert!(text.contains("Warnings: 8"));
+        for index in 0..8 {
+            assert!(text.contains(&format!("WARNING-{index}:")));
+            assert!(text.contains(&format!("WARNING-END-{index}")));
+        }
+        app.handle_event(key(KeyCode::Down));
+        app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 1));
+        assert_eq!(app.details_scroll, limit);
+        assert_eq!(app.message, message);
+        assert_eq!(app.snapshot.warnings, warnings);
+        assert_eq!(app.selected, selected);
+        assert!(!app.navigating);
+    }
+
+    #[test]
+    fn details_never_navigates_on_enter_or_click_and_toggles_invalidate_hits() {
+        let mut app = many(3);
+        app.handle_event(key(KeyCode::Down));
+        app.message = "Navigation failed: denied".into();
+        let selected = app.selected.clone();
+        let mut terminal = terminal(80, 8);
+        render(&mut app, &mut terminal);
+        assert_eq!(app.hits.len(), 3);
+        app.handle_event(key(KeyCode::Char('w')));
+        assert!(app.hits.is_empty());
+        assert!(app.handle_event(click(0, 2)).is_none());
+        render(&mut app, &mut terminal);
+        assert!(app.hits.is_empty());
+        for event in [
+            key(KeyCode::Enter),
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            )),
+            click(0, 2),
+            click(79, 3),
+            click(0, 7),
+            mouse(MouseEventKind::Down(MouseButton::Right), 0, 2),
+        ] {
+            assert!(app.handle_event(event).is_none());
+            assert_eq!(app.selected, selected);
+            assert!(!app.navigating);
+            assert!(app.hits.is_empty());
+            assert_eq!(app.message, "Navigation failed: denied");
+        }
+        app.handle_event(key(KeyCode::Char('w')));
+        assert!(!app.details);
+        assert!(app.handle_event(click(0, 2)).is_none());
+        render(&mut app, &mut terminal);
+        assert_eq!(
+            navigation(app.handle_event(key(KeyCode::Enter))),
+            entry(1, Status::Working)
+        );
+    }
+
+    #[test]
+    fn closing_details_preserves_the_stable_target_and_manual_list_scroll() {
+        let mut app = many(20);
+        for _ in 0..5 {
+            app.handle_event(key(KeyCode::Down));
+        }
+        let mut terminal = terminal(80, 8);
+        render(&mut app, &mut terminal);
+        for _ in 0..2 {
+            app.handle_event(mouse(MouseEventKind::ScrollDown, 0, 2));
+        }
+        render(&mut app, &mut terminal);
+        let scroll = app.scroll;
+        let selected = app.selected.clone();
+        assert!(
+            !app.hits
+                .iter()
+                .any(|hit| Some(&hit.entry.id) == selected.as_ref())
+        );
+        app.message = "Full message. ".repeat(80);
+        app.handle_event(key(KeyCode::Char('w')));
+        render(&mut app, &mut terminal);
+        app.handle_event(key(KeyCode::Down));
+        app.replace_snapshot(app.snapshot.clone());
+        render(&mut app, &mut terminal);
+        assert!(app.details_scroll > 0);
+        assert!(app.handle_event(key(KeyCode::Esc)).is_none());
+        assert!(!app.details);
+        assert!(app.handle_event(click(0, 2)).is_none());
+        render(&mut app, &mut terminal);
+        assert_eq!(app.scroll, scroll);
+        assert_eq!(app.selected, selected);
+        assert_eq!(
+            navigation(app.handle_event(key(KeyCode::Enter))),
+            entry(5, Status::Working)
+        );
+    }
+
+    #[test]
+    fn selection_removed_during_details_still_requires_deliberate_reselection() {
+        let mut app = many(2);
+        app.handle_event(key(KeyCode::Down));
+        app.handle_event(key(KeyCode::Char('w')));
+        app.replace_snapshot(Snapshot {
+            entries: vec![entry(0, Status::Working)],
+            warnings: Vec::new(),
+        });
+        let mut terminal = terminal(80, 8);
+        let rows = render(&mut app, &mut terminal);
+        assert!(rows[1].contains("Selected agent is no longer available"));
+        app.handle_event(key(KeyCode::Char('w')));
+        render(&mut app, &mut terminal);
+        assert!(app.handle_event(key(KeyCode::Enter)).is_none());
+        assert!(app.selected.is_none());
+        assert!(!app.navigating);
+        app.handle_event(key(KeyCode::Down));
+        assert_eq!(
+            navigation(app.handle_event(key(KeyCode::Enter))),
+            entry(0, Status::Working)
+        );
+    }
+
+    #[test]
+    fn details_resize_and_empty_reports_clamp_scroll_without_creating_targets() {
+        let mut app = many(1);
+        app.snapshot.warnings = vec!["Long warning. ".repeat(80)];
+        let selected = app.selected.clone();
+        let mut terminal = terminal(80, 8);
+        render(&mut app, &mut terminal);
+        app.handle_event(key(KeyCode::Char('w')));
+        render(&mut app, &mut terminal);
+        for _ in 0..100 {
+            app.handle_event(key(KeyCode::Down));
+        }
+        assert!(app.details_scroll > 0);
+        app.handle_event(Event::Resize(30, 5));
+        assert!(app.hits.is_empty());
+        assert_eq!(app.viewport, Rect::default());
+        assert!(app.handle_event(click(0, 2)).is_none());
+        terminal.backend_mut().resize(30, 5);
+        terminal.resize(Rect::new(0, 0, 30, 5)).unwrap();
+        let rows = render(&mut app, &mut terminal);
+        assert!(rows[0].contains("Details"));
+        assert_eq!(app.viewport, Rect::new(0, 1, 30, 3));
+        assert!(app.details_scroll <= app.details_limit);
+
+        app.message.clear();
+        app.replace_snapshot(Snapshot {
+            entries: app.snapshot.entries.clone(),
+            warnings: Vec::new(),
+        });
+        app.handle_event(Event::Resize(80, 8));
+        terminal.backend_mut().resize(80, 8);
+        terminal.resize(Rect::new(0, 0, 80, 8)).unwrap();
+        let rows = render(&mut app, &mut terminal);
+        assert!(rows[1].contains("Message: No current message."));
+        assert!(rows[3].contains("Warnings: 0"));
+        assert!(rows[4].contains("No snapshot warnings."));
+        assert_eq!(app.details_scroll, 0);
+        assert_eq!(app.details_limit, 0);
+        assert_eq!(app.selected, selected);
+        assert!(app.hits.is_empty());
+        assert!(!app.navigating);
+    }
+
+    #[test]
+    fn tiny_details_views_have_no_overflow_or_agent_hit_regions() {
+        for width in [0, 1, 2, 8, 17, 80] {
+            for height in [0, 1, 2, 3, 4, 5, 24] {
+                let mut app = many(3);
+                app.snapshot.warnings = vec!["界e\u{301}🦕".repeat(100)];
+                app.handle_event(key(KeyCode::Char('w')));
+                render(&mut app, &mut terminal(width, height));
+                assert!(app.details);
+                assert!(app.hits.is_empty());
+                assert!(app.handle_event(click(0, 0)).is_none());
+                assert!(app.handle_event(key(KeyCode::Enter)).is_none());
+                assert!(!app.navigating);
+            }
+        }
+    }
+
+    #[test]
+    fn details_return_and_quit_keys_ignore_key_releases() {
+        let mut app = many(1);
+        let mut terminal = terminal(80, 8);
+        render(&mut app, &mut terminal);
+        let release = Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('w'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+        assert!(app.handle_event(release.clone()).is_none());
+        assert!(!app.details);
+        assert_eq!(app.hits.len(), 1);
+        app.handle_event(key(KeyCode::Char('w')));
+        assert!(app.handle_event(release).is_none());
+        assert!(app.details);
+        assert!(app.handle_event(key(KeyCode::Esc)).is_none());
+        assert!(!app.details);
+        app.handle_event(key(KeyCode::Char('w')));
+        app.connected = false;
+        app.navigating = true;
+        for event in [
+            key(KeyCode::Char('q')),
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Event::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL)),
+        ] {
+            assert!(matches!(app.handle_event(event), Some(Action::Quit)));
+        }
     }
 
     #[test]

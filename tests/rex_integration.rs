@@ -398,6 +398,120 @@ fn concurrent_focus_change_prevents_app_selection_and_is_not_retried() {
     assert!(calls.iter().all(|args| !args.iter().any(|arg| arg == "do")));
 }
 
+fn await_client(worker: &Worker) -> Result<String, String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Ok(Update::Client(result)) = worker.updates.recv_timeout(Duration::from_millis(50)) {
+            return result;
+        }
+    }
+    panic!("client discovery result not received");
+}
+
+fn await_navigation(worker: &Worker, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(Update::Navigation(result)) =
+            worker.updates.recv_timeout(Duration::from_millis(20))
+        {
+            return result;
+        }
+    }
+    panic!("navigation did not finish within {timeout:?}");
+}
+
+#[test]
+fn startup_client_discovery_recovers_before_pinning_but_does_not_replace_a_pin() {
+    for initial in ["offline", "no-client"] {
+        let fixture = Fixture::new();
+        fixture.mode(initial);
+        let worker = Worker::start(fixture.rex.clone(), None, fixture.stop.clone()).unwrap();
+        assert!(await_client(&worker).is_err());
+        fixture.mode("normal");
+        assert_eq!(await_client(&worker).unwrap(), CLIENT);
+        let snapshot = await_snapshot(&worker, |snapshot| {
+            snapshot.entries.iter().any(|entry| entry.records == 2)
+        });
+        let pi = snapshot
+            .entries
+            .into_iter()
+            .find(|entry| entry.records == 2)
+            .unwrap();
+        // Replacing the only connected app must not replace an established pin.
+        let replacement = fs::read_to_string(fixture.dir.path().join("clients.json"))
+            .unwrap()
+            .replace(CLIENT, "client:00000000-0000-0000-0000-000000000002");
+        fs::write(fixture.dir.path().join("clients.json"), replacement).unwrap();
+        fixture.clear_log();
+        worker.navigate(pi).unwrap();
+        assert!(
+            await_navigation(&worker, Duration::from_secs(4))
+                .unwrap_err()
+                .contains("selected Rex app is not connected")
+        );
+        drop(worker);
+        assert!(mutations(&fixture.calls()).is_empty());
+    }
+}
+
+#[test]
+fn ambiguous_startup_client_selection_is_not_retried_into_an_arbitrary_pin() {
+    let fixture = Fixture::new();
+    fixture.mode("multiple");
+    let worker = Worker::start(fixture.rex.clone(), None, fixture.stop.clone()).unwrap();
+    assert!(
+        await_client(&worker)
+            .unwrap_err()
+            .contains("Multiple Rex apps")
+    );
+    fixture.mode("normal");
+    let snapshot = await_snapshot(&worker, |snapshot| {
+        snapshot.entries.iter().any(|entry| entry.records == 2)
+    });
+    let pi = snapshot
+        .entries
+        .into_iter()
+        .find(|entry| entry.records == 2)
+        .unwrap();
+    worker.navigate(pi).unwrap();
+    assert!(
+        await_navigation(&worker, Duration::from_secs(4))
+            .unwrap_err()
+            .contains("Multiple Rex apps")
+    );
+    drop(worker);
+    assert!(mutations(&fixture.calls()).is_empty());
+}
+
+#[test]
+fn navigation_does_not_wait_for_a_slow_background_session_scan() {
+    let fixture = Fixture::new();
+    let worker = Worker::start(fixture.rex.clone(), None, fixture.stop.clone()).unwrap();
+    let first = await_snapshot(&worker, |snapshot| {
+        snapshot.entries.iter().any(|entry| entry.records == 2)
+    });
+    let pi = first
+        .entries
+        .into_iter()
+        .find(|entry| entry.records == 2)
+        .unwrap();
+    fixture.mode("slow-scan");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while !fixture.dir.path().join("scan-waiting").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "background scan did not reach its slow session"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let started = Instant::now();
+    worker.navigate(pi).unwrap();
+    await_navigation(&worker, Duration::from_millis(1500)).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    drop(worker);
+    assert_eq!(mutations(&fixture.calls()).len(), 2);
+}
+
 #[test]
 fn worker_shutdown_cancels_owned_listener() {
     let fixture = Fixture::new();

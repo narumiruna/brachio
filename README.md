@@ -32,7 +32,7 @@ rex --autostart=false client ls --json
 brachio --client 'client:<full-uuid-from-the-list>'
 ```
 
-With one connected app, Brachio selects and retains its full client ID. With multiple apps, use `--client` with a full ID. Labels and suffixes are not accepted. No app, an ambiguous target, or a disconnected selected app prevents navigation. Restart to select a different client; Brachio never substitutes another app.
+With one connected app, Brachio selects and retains its full client ID. Connection failures and an absent app are retried until the first pin. With multiple apps, use `--client` with a full ID; ambiguity remains refused until restart, even if an app later disconnects. Labels and suffixes are not accepted. Once pinned, a disconnected selected app prevents navigation without substitution. Restart to select a different client.
 
 Brachio uses the CLI's normal server connection. Check `rex whoami --json` before starting if the server is uncertain. It does not aggregate hosts or start a missing server. Inherited `REX_CLIENT` does not override the selected app.
 
@@ -42,6 +42,8 @@ Brachio uses the CLI's normal server connection. Check `rex whoami --json` befor
 | Enter | Navigate to the selected agent |
 | Left click | Select and navigate to that row |
 | Mouse wheel | Scroll without changing the selected agent |
+| w | Open details with the current message and every warning |
+| Up / Down or wheel in details | Scroll details; w / Escape returns to agents |
 | q / Escape / Ctrl-C | Exit |
 | Terminal resize | Recalculate the visible rows |
 
@@ -68,7 +70,7 @@ Recognized status `app` / `effective_app` values are `pi`, `claude-code` (alias 
 
 ## Updates, navigation, and safety
 
-A background worker obtains the initial snapshot. The CLI event stream invalidates snapshots; event bursts are coalesced. Full reconciliation also runs two seconds after each completed refresh, so missed or unknown events cannot permanently leave old state. Commands run outside the input/render loop.
+A background worker obtains the initial snapshot. The CLI event stream invalidates snapshots; event bursts are coalesced. Full reconciliation also runs two seconds after each completed refresh, so missed or unknown events cannot permanently leave old state. Commands run outside the input/render loop. One dedicated navigation thread performs focus and app selection; read-only snapshot and event workers cannot change focus. A slow full-session scan does not delay navigation to a healthy target pane.
 
 A failed server snapshot retains the old list as **STALE** and disables navigation. Per-session or per-pane failures produce a partial list and warnings. Event-stream loss is shown as a warning while periodic snapshots continue; the listener reconnects. A silent recovered listener remains marked uncertain until it delivers an event.
 
@@ -113,7 +115,7 @@ flowchart LR
 
 ## Recovery and release limits
 
-Exit and restart Brachio to reconnect or choose another client. It has no persistent state or migrations. Remove the local binary to uninstall. If an uncatchable termination leaves a damaged terminal, use that terminal's reset operation.
+Brachio retries transient connection and initial app-discovery failures. Exit and restart to choose another client or resolve ambiguous selection. It has no persistent state or migrations. Remove the local binary to uninstall. If an uncatchable termination leaves a damaged terminal, use that terminal's reset operation.
 
 Native app switching and physical mouse delivery require the manual checks in the handoff document before claiming end-to-end platform support. Windows is not supported. The CI workflow checks Linux and macOS PTY/process behavior; native Rex UI behavior is not established by those tests.
 

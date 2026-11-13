@@ -180,6 +180,7 @@ fn run() -> Result<(), String> {
                 }
                 Update::Client(result) => match result {
                     Ok(id) => {
+                        client_error = None;
                         notice =
                             format!("Target app {id}; session focus is shared with other clients");
                         app.message = notice.clone();

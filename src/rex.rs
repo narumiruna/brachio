@@ -11,6 +11,22 @@ pub struct Rex {
     runner: Runner,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClientSelection {
+    Pinned(String),
+    Retry(String),
+    Refused(String),
+}
+
+impl ClientSelection {
+    pub fn result(&self) -> Result<String, String> {
+        match self {
+            Self::Pinned(id) => Ok(id.clone()),
+            Self::Retry(error) | Self::Refused(error) => Err(error.clone()),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct Sessions {
     sessions: Vec<Session>,
@@ -270,14 +286,18 @@ impl Rex {
         Ok(snapshot)
     }
 
-    /// Select once, then retain the full ID. Never switch clients after reconnect.
-    pub fn select_client(&self, requested: Option<&str>) -> Result<String, String> {
+    /// Retry connection/no-app failures only until a full client ID is pinned.
+    /// Ambiguity is a selection decision, not a transient connection failure.
+    pub fn discover_client(&self, requested: Option<&str>) -> ClientSelection {
         if requested.is_some_and(|id| !valid_id(id, "client")) {
-            return Err(
+            return ClientSelection::Refused(
                 "--client requires a full client:<uuid> ID; use rex client ls --json".into(),
             );
         }
-        let clients: Clients = self.json(&["client", "ls", "--json"])?;
+        let clients: Clients = match self.json(&["client", "ls", "--json"]) {
+            Ok(clients) => clients,
+            Err(error) => return ClientSelection::Retry(error),
+        };
         let apps: Vec<_> = clients
             .clients
             .into_iter()
@@ -288,17 +308,20 @@ impl Rex {
             .filter_map(|client| client.client_id.filter(|id| valid_id(id, "client")))
             .collect();
         match requested {
-            Some(id) if apps.iter().any(|app| app == id) => Ok(id.into()),
-            Some(_) => {
-                Err("The selected Rex app is not connected; no other client will be used".into())
-            }
-            None if apps.len() == 1 => Ok(apps[0].clone()),
-            None if apps.is_empty() => Err("No connected Rex app; open Rex and retry".into()),
-            None => Err(
-                "Multiple Rex apps: restart with --client client:<uuid> from rex client ls --json"
-                    .into(),
+            Some(id) if apps.iter().any(|app| app == id) => ClientSelection::Pinned(id.into()),
+            Some(_) => ClientSelection::Retry(
+                "The selected Rex app is not connected; waiting for its exact ID. No other client will be used".into(),
+            ),
+            None if apps.len() == 1 => ClientSelection::Pinned(apps[0].clone()),
+            None if apps.is_empty() => ClientSelection::Retry("No connected Rex app; waiting for an app".into()),
+            None => ClientSelection::Refused(
+                "Multiple Rex apps: restart with --client client:<uuid> from rex client ls --json".into(),
             ),
         }
+    }
+
+    pub fn select_client(&self, requested: Option<&str>) -> Result<String, String> {
+        self.discover_client(requested).result()
     }
 
     pub fn navigate(&self, entry: &Entry, client: &str) -> Result<(), String> {

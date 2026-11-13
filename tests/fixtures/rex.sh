@@ -27,7 +27,9 @@ case "$1 ${2-}" in
           moved) cat "$root/view-a-moved.json" ;;
           *) cat "$root/view-a.json" ;;
         esac ;;
-      session:00000000-0000-0000-0000-000000000002) cat "$root/view-b.json" ;;
+      session:00000000-0000-0000-0000-000000000002)
+        if [ "$mode" = slow-scan ]; then : > "$root/scan-waiting"; sleep 2; fi
+        cat "$root/view-b.json" ;;
       *) exit 91 ;;
     esac ;;
   'block ls')
