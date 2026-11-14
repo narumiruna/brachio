@@ -1,8 +1,74 @@
-//! Pure grouping and filtering for snapshots. Row indices refer to the supplied snapshot.
+//! Pure sorting, grouping, and filtering. Row indices refer to the supplied snapshot.
 
 use std::cmp::Ordering;
 
 use crate::model::{Entry, Snapshot, Status, agent_name, display_text};
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum SortBy {
+    #[default]
+    None,
+    Status,
+    Agent,
+    Cwd,
+    Session,
+}
+
+impl SortBy {
+    pub(super) fn next(self) -> Self {
+        match self {
+            Self::None => Self::Status,
+            Self::Status => Self::Agent,
+            Self::Agent => Self::Cwd,
+            Self::Cwd => Self::Session,
+            Self::Session => Self::None,
+        }
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Status => "Status",
+            Self::Agent => "Agent",
+            Self::Cwd => "CWD",
+            Self::Session => "Session",
+        }
+    }
+
+    fn compare(self, a: &Entry, b: &Entry) -> Ordering {
+        match self {
+            Self::None => Ordering::Equal,
+            Self::Status => (a.status, &a.location, &a.id).cmp(&(b.status, &b.location, &b.id)),
+            Self::Agent => canonical_agent(a).cmp(canonical_agent(b)),
+            Self::Cwd => (a.working_dir.is_none(), &a.working_dir)
+                .cmp(&(b.working_dir.is_none(), &b.working_dir)),
+            Self::Session => (&a.location, &a.id).cmp(&(&b.location, &b.id)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum GroupOrder {
+    #[default]
+    Default,
+    Reverse,
+}
+
+impl GroupOrder {
+    pub(super) fn toggle(self) -> Self {
+        match self {
+            Self::Default => Self::Reverse,
+            Self::Reverse => Self::Default,
+        }
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::Reverse => "Reverse",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum GroupBy {
@@ -45,7 +111,7 @@ impl GroupBy {
         }
     }
 
-    /// Compare group order only, without the legacy order within each group.
+    /// Compare group order only, independently of member sorting.
     pub(super) fn compare(self, a: &Entry, b: &Entry) -> Ordering {
         match self {
             Self::None => Ordering::Equal,
@@ -59,12 +125,17 @@ impl GroupBy {
         }
     }
 
-    pub(super) fn sort(self, snapshot: &mut Snapshot) {
-        snapshot.sort();
-        if !matches!(self, Self::None | Self::Status) {
-            // Stable sorting preserves status, location, and ID order within each group.
-            snapshot.entries.sort_by(|a, b| self.compare(a, b));
-        }
+    /// Stable sorting keeps source order for equal row keys. The caller restores
+    /// source order first so None can undo any previous sorting.
+    pub(super) fn sort(self, snapshot: &mut Snapshot, rows: SortBy, order: GroupOrder) {
+        snapshot.entries.sort_by(|a, b| {
+            let group = self.compare(a, b);
+            let group = match order {
+                GroupOrder::Default => group,
+                GroupOrder::Reverse => group.reverse(),
+            };
+            group.then_with(|| rows.compare(a, b))
+        });
     }
 
     pub(super) fn key(self, entry: &Entry) -> Option<GroupKey> {
@@ -247,7 +318,7 @@ mod tests {
                 if reverse {
                     sorted.entries.reverse();
                 }
-                mode.sort(&mut sorted);
+                mode.sort(&mut sorted, SortBy::Status, GroupOrder::Default);
                 let expected: Vec<_> = order.map(|i| original.entries[i].clone()).into();
                 assert_eq!(sorted.entries, expected, "{mode:?}");
                 assert_eq!(sorted.warnings, original.warnings);
@@ -263,7 +334,7 @@ mod tests {
                     }
                     assert!(group.entries.windows(2).all(|pair| pair[0] < pair[1]));
                 }
-                mode.sort(&mut sorted);
+                mode.sort(&mut sorted, SortBy::Status, GroupOrder::Default);
                 assert_eq!(sorted.entries, expected);
             }
         }
@@ -274,7 +345,7 @@ mod tests {
         let mut expected = fixture();
         expected.sort();
         let mut actual = fixture();
-        GroupBy::None.sort(&mut actual);
+        GroupBy::None.sort(&mut actual, SortBy::Status, GroupOrder::Default);
         assert_eq!(actual.entries, expected.entries);
         assert_eq!(GroupBy::None.key(&actual.entries[0]), None);
         assert_eq!(GroupBy::None.group_label(&actual.entries[0]), "");
@@ -301,7 +372,7 @@ mod tests {
             GroupBy::Session,
         ] {
             let mut actual = input.clone();
-            mode.sort(&mut actual);
+            mode.sort(&mut actual, SortBy::Status, GroupOrder::Default);
             for group in groups(&actual, mode, "") {
                 let entries: Vec<_> = group.entries.iter().map(|&i| &actual.entries[i]).collect();
                 let legacy: Vec<_> = expected
@@ -317,7 +388,7 @@ mod tests {
     #[test]
     fn session_identity_is_exact_even_when_labels_match() {
         let mut data = fixture();
-        GroupBy::Session.sort(&mut data);
+        GroupBy::Session.sort(&mut data, SortBy::Status, GroupOrder::Default);
         let grouped = groups(&data, GroupBy::Session, "");
         assert_eq!(grouped[0].label, "Alpha");
         assert_eq!(grouped[1].label, "Alpha");
@@ -338,7 +409,7 @@ mod tests {
         assert_eq!(GroupBy::Agent.compare(&a, &b), Ordering::Equal);
         assert_ne!(GroupBy::Agent.compare(&a, &c), Ordering::Equal);
         let mut data = snapshot(vec![a, b, c]);
-        GroupBy::Agent.sort(&mut data);
+        GroupBy::Agent.sort(&mut data, SortBy::Status, GroupOrder::Default);
         let grouped = groups(&data, GroupBy::Agent, "");
         assert_eq!(grouped.len(), 2);
         assert_eq!(grouped[0].key, GroupKey::Agent("claude-code".into()));
@@ -352,7 +423,7 @@ mod tests {
         let mut literal = entry(6, "pi", Status::Working);
         literal.working_dir = Some("Unknown".into());
         data.entries.push(literal);
-        GroupBy::Cwd.sort(&mut data);
+        GroupBy::Cwd.sort(&mut data, SortBy::Status, GroupOrder::Default);
         let grouped = groups(&data, GroupBy::Cwd, "");
         assert_eq!(grouped.len(), 4);
         assert_eq!(grouped[2].key, GroupKey::Cwd(Some("Unknown".into())));
@@ -465,7 +536,7 @@ mod tests {
     #[test]
     fn filtering_keeps_original_indices_and_removes_empty_groups() {
         let mut data = fixture();
-        GroupBy::Agent.sort(&mut data);
+        GroupBy::Agent.sort(&mut data, SortBy::Status, GroupOrder::Default);
         assert_eq!(matching_indices(&data, "agent:codex status:idle"), vec![3]);
         let grouped = groups(&data, GroupBy::Agent, "agent:codex status:idle");
         assert_eq!(grouped.len(), 1);
@@ -477,6 +548,101 @@ mod tests {
         assert_eq!(filtered[1].entries, vec![2]);
         assert_eq!(filtered[2].entries, vec![4, 5]);
         assert!(groups(&data, GroupBy::Agent, "no-match").is_empty());
+    }
+
+    #[test]
+    fn row_sort_modes_use_their_own_keys_and_preserve_equal_source_order() {
+        let original = fixture();
+        for (mode, order) in [
+            (SortBy::None, [0, 1, 2, 3, 4, 5]),
+            (SortBy::Status, [3, 2, 4, 1, 5, 0]),
+            (SortBy::Agent, [1, 4, 2, 5, 0, 3]),
+            (SortBy::Cwd, [2, 4, 0, 3, 1, 5]),
+            (SortBy::Session, [1, 2, 3, 5, 0, 4]),
+        ] {
+            let mut actual = original.clone();
+            GroupBy::None.sort(&mut actual, mode, GroupOrder::Default);
+            let expected: Vec<_> = order.map(|index| original.entries[index].clone()).into();
+            assert_eq!(actual.entries, expected, "{mode:?}");
+            assert_eq!(actual.warnings, original.warnings);
+            GroupBy::None.sort(&mut actual, mode, GroupOrder::Default);
+            assert_eq!(actual.entries, expected, "{mode:?} is not stable");
+        }
+    }
+
+    #[test]
+    fn reversing_groups_never_reverses_members_for_any_sort_mode() {
+        for mode in [
+            GroupBy::Agent,
+            GroupBy::Status,
+            GroupBy::Cwd,
+            GroupBy::Session,
+        ] {
+            for rows in [
+                SortBy::None,
+                SortBy::Status,
+                SortBy::Agent,
+                SortBy::Cwd,
+                SortBy::Session,
+            ] {
+                let mut normal = fixture();
+                let mut reverse = normal.clone();
+                mode.sort(&mut normal, rows, GroupOrder::Default);
+                mode.sort(&mut reverse, rows, GroupOrder::Reverse);
+                let expected: Vec<_> = groups(&normal, mode, "")
+                    .into_iter()
+                    .rev()
+                    .flat_map(|group| {
+                        group
+                            .entries
+                            .into_iter()
+                            .map(|index| normal.entries[index].clone())
+                    })
+                    .collect();
+                assert_eq!(reverse.entries, expected, "{mode:?}, {rows:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn agent_sort_uses_canonical_identity_and_cwd_sort_uses_full_paths() {
+        let mut a = entry(0, "claude", Status::Idle);
+        a.name = "zzz".into();
+        a.working_dir = Some("/work/b/project".into());
+        let mut b = entry(1, "claude-code", Status::Blocked);
+        b.name = "aaa".into();
+        b.working_dir = Some("/work/a/project".into());
+        let missing = entry(2, "codex", Status::Working);
+        let original = snapshot(vec![a.clone(), missing.clone(), b.clone()]);
+        let mut actual = original.clone();
+        GroupBy::None.sort(&mut actual, SortBy::Agent, GroupOrder::Default);
+        assert_eq!(actual.entries, vec![a.clone(), b.clone(), missing.clone()]);
+        actual = original;
+        GroupBy::None.sort(&mut actual, SortBy::Cwd, GroupOrder::Default);
+        assert_eq!(actual.entries, vec![b, a, missing]);
+    }
+
+    #[test]
+    fn row_and_group_order_cycles_have_independent_defaults() {
+        assert_eq!(SortBy::default(), SortBy::None);
+        let mut rows = SortBy::None;
+        for (expected, label) in [
+            (SortBy::Status, "Status"),
+            (SortBy::Agent, "Agent"),
+            (SortBy::Cwd, "CWD"),
+            (SortBy::Session, "Session"),
+            (SortBy::None, "None"),
+        ] {
+            rows = rows.next();
+            assert_eq!(rows, expected);
+            assert_eq!(rows.label(), label);
+        }
+        let order = GroupOrder::default();
+        assert_eq!(order, GroupOrder::Default);
+        assert_eq!(order.label(), "Default");
+        assert_eq!(order.toggle(), GroupOrder::Reverse);
+        assert_eq!(order.toggle().label(), "Reverse");
+        assert_eq!(order.toggle().toggle(), order);
     }
 
     #[test]
