@@ -65,7 +65,7 @@ class ReleaseWorkflow(unittest.TestCase):
                         self.assertEqual(step["with"]["persist-credentials"], "false")
         action = self.jobs["release"]["steps"][-1]
         self.assertEqual(action["uses"],
-                         "narumiruna/changenote/release@f4423760122463bf03a8d161c6f0bc4173afb6e0")
+                         "changenote/changenote/release@f4423760122463bf03a8d161c6f0bc4173afb6e0")
         self.assertEqual(action["with"], {
             "github-token": "${{ secrets.PAT_TOKEN }}", "base-branch": "main",
             "operation": "${{ inputs.operation || 'auto' }}",

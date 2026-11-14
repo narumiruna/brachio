@@ -4,7 +4,7 @@ Brachio uses one version for crates.io and PyPI. `Cargo.toml` is the version sou
 
 ## Change notes
 
-[changenote](https://github.com/narumiruna/changenote) manages pending notes, versions, changelogs, and local annotated tags. It does not publish registry artifacts.
+[changenote](https://github.com/changenote/changenote) manages pending notes, versions, changelogs, and local annotated tags. It does not publish registry artifacts.
 
 Run the same pinned version used by the PR workflow with uv and Python 3.12 or newer:
 
@@ -84,7 +84,7 @@ The `.github/workflows/release.yml` workflow contains PR note checks, Release PR
 
 The PR note check uses `.github/scripts/check-pr-notes.sh` to inspect the merge-base diff and, for managed releases, the GitHub PR event. The token guard stays inline because it runs before checkout. The installed-wheel check stays inline because a retried release can use an older commit without the script. Simple build and publish commands also stay inline.
 
-The release job uses the pinned `narumiruna/changenote/release` Action. The Action builds and caches a compatible CLI from its own source, not from Brachio. It prepares the Cargo cache before offline version updates. The PR notes job still runs its CLI through `uvx`.
+The release job uses the pinned `changenote/changenote/release` Action. The Action builds and caches a compatible CLI from its own source, not from Brachio. It prepares the Cargo cache before offline version updates. The PR notes job still runs its CLI through `uvx`.
 
 A repository maintainer must add an Actions secret named `PAT_TOKEN` before enabling Release runs:
 
