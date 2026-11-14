@@ -22,6 +22,20 @@ class ReleaseWorkflow(unittest.TestCase):
     def step(self, job, name):
         return next(step for step in self.jobs[job]["steps"] if step.get("name") == name)
 
+    def test_pr_note_script_is_wired_and_valid_bash(self):
+        step = self.step("notes", "Check PR notes")
+        self.assertEqual(step["shell"], "bash")
+        self.assertEqual(step["run"], "bash .github/scripts/check-pr-notes.sh")
+        script = ROOT / ".github/scripts/check-pr-notes.sh"
+        self.assertNotIn("${{", script.read_text())
+        result = subprocess.run(["bash", "-n", str(script)],
+                                text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.step("notes", "Check PR notes")["env"], {
+            "BASE_BRANCH": "${{ github.base_ref }}",
+            "SKIP_RELEASE": "${{ contains(github.event.pull_request.labels.*.name, 'skip-changenote') }}",
+        })
+
     def test_event_routing_and_manual_default(self):
         events = self.workflow["on"]
         self.assertEqual(set(events), {"pull_request", "push", "workflow_dispatch"})
@@ -97,6 +111,9 @@ class ReleaseWorkflow(unittest.TestCase):
         self.assertNotIn(".github/workflows/publish.yml", patterns)
 
     def test_pat_guard_fails_without_disclosing_token(self):
+        steps = self.jobs["release"]["steps"]
+        self.assertEqual(steps[0]["name"], "Check release token")
+        self.assertTrue(steps[1]["uses"].startswith("actions/checkout@"))
         script = self.step("release", "Check release token")["run"]
         for token, expected in ((None, 1), ("", 1), ("fixture-token-do-not-log", 0)):
             with self.subTest(token_present=bool(token)):
@@ -123,8 +140,9 @@ class ReleaseWorkflow(unittest.TestCase):
             uvx.chmod(0o755)
             env = dict(os.environ, PATH=str(top) + os.pathsep + os.environ["PATH"],
                        CALLS=str(calls), BASE_BRANCH=base, SKIP_RELEASE=skip)
-            result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step["run"]],
-                                    cwd=top, env=env, text=True, capture_output=True, timeout=10)
+            script = ROOT / ".github/scripts/check-pr-notes.sh"
+            result = subprocess.run(["bash", str(script)], cwd=top, env=env,
+                                    text=True, capture_output=True, timeout=10)
             args = calls.read_bytes().decode().split("\0")[:-1] if calls.exists() else []
             self.assertFalse((top / "injected").exists())
             return result, args
@@ -152,6 +170,57 @@ class ReleaseWorkflow(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("PR base branch is required", result.stderr)
         self.assertEqual(args, [])
+
+    def run_wheel_check(self, expected="0.1.0", actual="brachio 0.1.0",
+                        version_exit=0, help_exit=0):
+        with tempfile.TemporaryDirectory() as temporary:
+            top = Path(temporary)
+            calls = top / "calls"
+            uvx = top / "uvx"
+            uvx.write_text(
+                '#!/usr/bin/env bash\n'
+                'printf "%s\\0" "--call--" "$@" >> "$CALLS"\n'
+                'case "${!#}" in\n'
+                '  --version) printf "%s\\n" "$VERSION_OUTPUT"; exit "$VERSION_EXIT" ;;\n'
+                '  --help) exit "$HELP_EXIT" ;;\n'
+                '  *) exit 99 ;;\n'
+                'esac\n'
+            )
+            uvx.chmod(0o755)
+            env = dict(os.environ, PATH=str(top) + os.pathsep + os.environ["PATH"],
+                       CALLS=str(calls), EXPECTED_VERSION=expected, VERSION_OUTPUT=actual,
+                       VERSION_EXIT=str(version_exit), HELP_EXIT=str(help_exit))
+            script = self.step("wheels", "Check installed wheel")["run"]
+            self.assertNotIn(".github/scripts/", script)
+            result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script],
+                                    cwd=top, env=env, text=True, capture_output=True, timeout=10)
+            args = [call.decode().split("\0")[:-1]
+                    for call in calls.read_bytes().split(b"--call--\0")[1:]] if calls.exists() else []
+            return result, args
+
+    def test_wheel_check_uses_local_artifacts_without_repository_scripts(self):
+        result, calls = self.run_wheel_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prefix = ["--isolated", "--no-index", "--find-links", "dist", "brachio"]
+        self.assertEqual(calls, [prefix + ["--version"], prefix + ["--help"]])
+
+    def test_wheel_version_mismatch_stops_before_help(self):
+        result, calls = self.run_wheel_check(actual="brachio 9.9.9")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][-1], "--version")
+
+    def test_wheel_version_command_failure_stops_before_help(self):
+        result, calls = self.run_wheel_check(version_exit=42)
+        self.assertEqual(result.returncode, 42, result.stderr)
+        self.assertEqual(len(calls), 1)
+
+    def test_wheel_help_command_failure_is_preserved(self):
+        result, calls = self.run_wheel_check(help_exit=43)
+        self.assertEqual(result.returncode, 43, result.stderr)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[-1][-1], "--help")
+
 
 if __name__ == "__main__":
     unittest.main()

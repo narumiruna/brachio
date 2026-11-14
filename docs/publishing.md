@@ -50,6 +50,7 @@ A maintainer can apply the `skip-changenote` label when a change in the checked 
 Install Rust stable, Cargo, uv, and Python 3.12. Run from the repository root:
 
 ```sh
+bash -n .github/scripts/check-pr-notes.sh
 uv run --no-project --with pyyaml==6.0.3 python -m unittest discover -s tests/workflows -v
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
@@ -71,6 +72,8 @@ The Checks workflow runs release-workflow regression tests, plus Rust tests and 
 ## Release automation setup
 
 The `.github/workflows/release.yml` workflow contains PR note checks, Release PR management, GitHub publication, validation, wheel builds, and registry uploads. It replaces the separate Changenotes and Publish workflows.
+
+The PR note check uses `.github/scripts/check-pr-notes.sh`, with inputs supplied through environment variables. The token guard stays inline because it runs before checkout. The installed-wheel check stays inline because a retried release can use an older commit without the script. Simple build and publish commands also stay inline.
 
 The release job uses the pinned `narumiruna/changenote/release` Action. The Action builds and caches a compatible CLI from its own source, not from Brachio. It prepares the Cargo cache before offline version updates. The PR notes job still runs its CLI through `uvx`.
 
