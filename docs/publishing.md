@@ -6,13 +6,13 @@ Brachio uses one version for crates.io and PyPI. `Cargo.toml` is the version sou
 
 [changenote](https://github.com/changenote/changenote) manages pending notes, versions, changelogs, and local annotated tags. It does not publish registry artifacts.
 
-Run the same pinned version used by the PR workflow with uv and Python 3.12 or newer:
+Run the latest stable CLI from PyPI with uv and Python 3.12 or newer:
 
 ```sh
-uvx changenote==0.9.2 status
+uvx changenote status
 ```
 
-No separate tool installation is required. Compatible wheels do not need Rust or Cargo. Use `uvx changenote==0.9.2` in place of `changenote` in the commands below.
+No separate tool installation is required. Compatible wheels do not need Rust or Cargo. Use `uvx changenote` in place of `changenote` in the commands below.
 
 Run commands from the repository root. `.changenote/config.json` defines one package, `brachio`, with `Cargo.toml` as its primary version file and `v` as its tag prefix. Do not add the dynamic Python version as an additional version output.
 
@@ -29,9 +29,9 @@ Documentation-only changes, test-only changes, internal refactors, and release-t
 
 ### PR checks
 
-The `notes` job in the Release workflow runs only on pull requests, with read-only permissions and no release credentials. It uses `uvx` to run a pinned CLI version from PyPI, not contributor code. Pending releases and PR check results are printed as JSON in the job logs. Keep the CLI and schema pins compatible when upgrading.
+The `notes` job in the Release workflow runs only on pull requests, with read-only permissions and no release credentials. It uses `uvx` without a version constraint to run the latest stable CLI from PyPI, not contributor code. Pending releases and PR check results are printed as JSON in the job logs. The CLI is not pinned; check compatibility with the reviewed configuration schema when changing configuration.
 
-Manual Release runs skip PR note comparison because `github.base_ref` is unavailable outside PR events. They run the selected release operation instead.
+Manual Release runs skip PR note comparison because `github.base_ref` is unavailable outside PR events. They only manage the Release PR.
 
 The configured check paths are `src/**`, `Cargo.toml`, `Cargo.lock`, `pyproject.toml`, `uv.lock`, and `.github/workflows/release.yml`. Changes to these paths normally require a new or updated changenote entry for `brachio`, subject to the automatic rules below. Review release effects outside these paths manually. An unchanged old note does not satisfy a PR check.
 
@@ -84,7 +84,9 @@ The `.github/workflows/release.yml` workflow contains PR note checks, Release PR
 
 The PR note check uses `.github/scripts/check-pr-notes.sh` to inspect the merge-base diff and, for managed releases, the GitHub PR event. The token guard stays inline because it runs before checkout. The installed-wheel check stays inline because a retried release can use an older commit without the script. Simple build and publish commands also stay inline.
 
-The release job uses the pinned `changenote/changenote/release` Action. The Action builds and caches a compatible CLI from its own source, not from Brachio. It prepares the Cargo cache before offline version updates. The PR notes job still runs its CLI through `uvx`.
+The release job uses one `changenote/action` call pinned to a full commit SHA. It omits the CLI `version` input and uses the default `latest` stable PyPI release. The Action installs a prebuilt CLI wheel, prepares project tools and offline caches, and manages the Release PR. Both `push-git-tags` and `create-github-releases` are explicitly enabled for push events. Manual events only manage the PR.
+
+The Action SHA and configuration schema remain pinned to reviewed snapshots; neither pins the installed CLI. The PR notes job also uses an unpinned CLI through `uvx`. Separate jobs and runs can resolve different stable CLI versions.
 
 A repository maintainer must add an Actions secret named `PAT_TOKEN` before enabling Release runs:
 
@@ -131,18 +133,17 @@ PyPI uses the `PYPI_TOKEN` secret, not Trusted Publishing. Other jobs have only 
 
 ### Release PRs and GitHub publication
 
-On pushes to `main`, the release job uses operation `auto`. It manages the Release PR and publishes the latest incomplete validated release batch. After a generated Release PR is merged, the Action verifies its saved batch and generated tree, creates the annotated version tag, and creates the GitHub Release. It passes the verified release commit and metadata to the validation and registry jobs.
+On pushes to `main`, the root Action prepares the project tools and caches, manages the Release PR, and inspects the latest validated release batch. It creates missing annotated tags and GitHub Releases. The Action verifies the saved batch and generated tree, and stops if the selected batch changes before publication.
+
+The Action returns the verified commit even when GitHub publication is already complete. Its `publication-needed` output records whether inspection found incomplete GitHub work before publication. Registry validation requires this output to be `true` and the verified commit to be nonempty. Completed batches do not start registry jobs on later pushes.
 
 The Action can complete an older incomplete batch on a later `main` push; it does not require a new batch in that push. Do not merge another Release PR until the current batch and registry uploads are complete. Runs on the same ref are serialized. PR refs have separate concurrency groups and cannot replace a pending `main` release. A later push does not cancel an active run.
 
-Run Release manually only on `main`:
-
-1. `manage-pr` is the default. It creates or updates the Release PR without publishing.
-2. `retry-publication` retries the latest validated batch, including registry validation, builds, and uploads even when its GitHub tag and Release already exist. It does not merge a PR. For partial registry failures, prefer **Re-run failed jobs** as described below.
+Run Release manually only on `main`. Manual dispatch prepares the pending-note environment and creates or updates the Release PR. It does not publish tags, GitHub Releases, or registry artifacts. There is no operation menu or whole-batch retry mode. For partial registry failures, use **Re-run failed jobs** as described below.
 
 ### Registry publication
 
-Validation starts only after a successful release job returns a nonempty verified release commit. PR events, manual `manage-pr` operations, and pushes without an incomplete batch do not run registry jobs. A failed release job also prevents registry uploads.
+Validation starts only after a successful release job returns a nonempty verified release commit and `publication-needed: 'true'`. PR events, manual dispatches, and pushes without an incomplete batch do not run registry jobs. A failed release job also prevents registry uploads.
 
 Changenote owns release metadata validation. Rust checks, wheel builds, and Cargo publication use its verified commit. Wheel version checks use the version from the Action's `releases` output. The workflow does not repeat metadata validation or use the triggering branch name as a version tag.
 
@@ -197,7 +198,7 @@ This uses the saved release batch to create an annotated `v<version>` tag. Push 
 git push origin refs/tags/v0.1.0
 ```
 
-Feature-branch pushes and ordinary PRs do not publish. Tag pushes alone do not start registry uploads. After manual preparation, re-enable Release only with publication authorization and use `retry-publication` on `main` to publish the latest validated batch. Do not move a tag after either registry has received its version.
+Feature-branch pushes and ordinary PRs do not publish. Tag pushes alone do not start registry uploads. After manual preparation, re-enable Release only with publication authorization. An authorized push to `main` can complete an incomplete saved batch; manual dispatch cannot publish it. If its tag and GitHub Release already exist, this workflow does not start registry jobs. Arrange a separately reviewed recovery procedure in that case. Do not move a tag after either registry has received its version.
 
 ## Partial failures and recovery
 
@@ -205,7 +206,7 @@ The two registry uploads are not a transaction. One can succeed while the other 
 
 For a failed job, use GitHub Actions **Re-run failed jobs** on the same Release run. This retains successful release-job outputs and wheel artifacts and does not repeat a successful registry job.
 
-For an explicit retry of the latest batch, run Release on `main` with `operation=retry-publication`. Existing tags and release text are not replaced. Registry validation, builds, and uploads run again even when GitHub publication has no remaining work. This whole-batch retry can fail if the crate version is already published; prefer the original run's failed-job retry after a partial registry failure.
+Do not use manual dispatch or **Re-run all jobs** to retry registry publication. The root Action can find GitHub publication already complete and skip the downstream jobs. If the original successful release-job outputs or wheel artifacts are unavailable, stop and arrange a separately reviewed recovery procedure for the exact release commit. Hosted writes still require explicit authorization.
 
 The PyPI upload uses `uv publish --check-url https://pypi.org/simple/`. Matching uploaded files are skipped; files with different contents are rejected. If a rebuilt wheel conflicts, inspect the original artifacts instead of replacing published files.
 
