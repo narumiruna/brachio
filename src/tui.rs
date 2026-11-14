@@ -955,8 +955,9 @@ impl App {
             "w: Full selected-agent values, status source, exact IDs, client diagnostics, messages, and warnings.",
             "?: Keyboard help. q / Esc closes details or help. Ctrl-C always quits.",
             "Details / help: ↑ / ↓, PageUp / PageDown, or wheel scrolls.",
-            "Statuses: ! Blocked, × Error, ✓ Done, ? Unknown, ● Working, ○ Idle.",
-            "States come from Rex reports. Foreground identity without reports is Unknown, not Working or Idle.",
+            "Statuses: ! Blocked, × Error, ✓ Done, ● Working, ○ Idle.",
+            "Unrecognized states use Idle, as the Rex schema requires.",
+            "Foreground identity without reports uses an Idle fallback. Details identifies the no-report source.",
             "Blocked is not proof that input is needed. Done is a reported state, not whole-session completion.",
         ].into_iter().map(String::from).collect();
         self.draw_overlay(frame, "Help", values);

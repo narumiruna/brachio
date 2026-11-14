@@ -94,7 +94,7 @@ The default **None** view keeps the original ungrouped list and its status, loca
 Grouped views show the mode in the title. Foldable headers with matching-agent counts appear only when at least two nonempty groups remain after filtering. With zero or one group, there are no group headers or folds. Under actual multiple headers, Status, Agent, CWD, or Session grouping hides its matching data column without leaving an empty gap. With one group, that column returns. Tab and Pane remain independent in every mode. Equal group values appear together:
 
 - **Agent** uses canonical agent names.
-- **Status** uses this priority: **Blocked, Error, Done, Unknown, Working, Idle**.
+- **Status** uses this priority: **Blocked, Error, Done, Working, Idle**.
 - **CWD** uses full reported paths, not clipped labels or repository roots.
   - All missing directories form one final **Unknown** group.
 - **Session** uses session names, with exact IDs to keep same-name sessions separate.
@@ -119,9 +119,9 @@ Recognized status `app` / `effective_app` values are `pi`, `claude-code` (alias 
 
 - Pi status and foreground identity were observed on the local Rex installation.
 - Claude Code and Codex mappings have fixture coverage only. Their actual status reporting depends on the agent and Rex integration; it is not native end-to-end support evidence.
-- An exact recognized foreground script basename, `argv0`, or executable name can identify an agent with **Unknown** status. An interpreter such as `node` or `python` alone cannot.
+- An exact recognized foreground script basename, `argv0`, or executable name can identify an agent without a status report. Brachio displays an **Idle** fallback, with zero records and an explicit no-report source in Details. An interpreter such as `node` or `python` alone cannot.
 - Other applications and agents without an explicit recognized identity are omitted. An empty list is not proof that no agents are running.
-- The status model is unchanged: **Blocked, Error, Done, Unknown, Working, Idle**. Missing or future states are **Unknown**, never assumed Working or Idle. Unknown has a neutral gray display. No **Waiting** state or need for input is inferred from Blocked. A failed status query is shown as a warning.
+- Status follows the Rex schema: **Blocked, Error, Done, Working, Idle**. Missing or unrecognized `state` values use **Idle**; there is no **Unknown** status. An empty `records` array means no status report, not a reported Idle state. No **Waiting** state or need for input is inferred from Blocked. A failed status query is shown as a warning.
 - **Done** is a reported state, not proof of whole-session completion. Status timestamps do not establish elapsed task time.
 - Records inherit `app` from their nearest reported ancestor if Rex does not supply `effective_app`. Duplicate parent IDs are ambiguous and do not establish inheritance. Replies over the protocol limit of 256 records are rejected.
 - All records for the same recognized app in one pane become one row. The most urgent reported status wins; record order does not change the result.

@@ -202,13 +202,11 @@ pub(super) fn status_text(status: Status, compact: bool) -> &'static str {
         (Status::Blocked, true) => "!",
         (Status::Error, true) => "×",
         (Status::Done, true) => "✓",
-        (Status::Unknown, true) => "?",
         (Status::Working, true) => "●",
         (Status::Idle, true) => "○",
         (Status::Blocked, false) => "! Blocked",
         (Status::Error, false) => "× Error",
         (Status::Done, false) => "✓ Done",
-        (Status::Unknown, false) => "? Unknown",
         (Status::Working, false) => "● Working",
         (Status::Idle, false) => "○ Idle",
     }
@@ -219,7 +217,6 @@ pub(super) fn status_color(status: Status) -> Color {
         Status::Blocked => Color::Yellow,
         Status::Error => Color::Red,
         Status::Done => Color::Green,
-        Status::Unknown => Color::Gray,
         Status::Working => Color::Cyan,
         Status::Idle => Color::Gray,
     }
@@ -271,11 +268,10 @@ pub(super) fn shortcuts(width: u16, grouped: bool) -> String {
 mod tests {
     use super::*;
 
-    const STATUSES: [Status; 6] = [
+    const STATUSES: [Status; 5] = [
         Status::Blocked,
         Status::Error,
         Status::Done,
-        Status::Unknown,
         Status::Working,
         Status::Idle,
     ];
@@ -621,7 +617,6 @@ mod tests {
             (Status::Blocked, "!", "! Blocked", Color::Yellow),
             (Status::Error, "×", "× Error", Color::Red),
             (Status::Done, "✓", "✓ Done", Color::Green),
-            (Status::Unknown, "?", "? Unknown", Color::Gray),
             (Status::Working, "●", "● Working", Color::Cyan),
             (Status::Idle, "○", "○ Idle", Color::Gray),
         ] {
@@ -631,7 +626,6 @@ mod tests {
             assert_eq!(status_color(status), color);
             assert!(!label.contains("Waiting"));
         }
-        assert_eq!(status_color(Status::Unknown), Color::Gray);
     }
 
     #[test]

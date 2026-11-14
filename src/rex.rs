@@ -306,7 +306,7 @@ impl Rex {
             Ok(value) => {
                 if let Some(app) = process_agent(&value) {
                     let report = reports.entry(app.into()).or_insert(Report {
-                        status: Status::Unknown,
+                        status: Status::Idle,
                         records: 0,
                         working_dir: None,
                     });

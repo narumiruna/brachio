@@ -216,7 +216,7 @@ mod tests {
                 ("codex", Status::Error, Some("/work/a"), "Alpha", "alpha-1"),
                 ("pi", Status::Blocked, Some("/work/b"), "Alpha", "alpha-2"),
                 ("claude-code", Status::Done, Some("/work/a"), "Beta", "beta"),
-                ("codex", Status::Unknown, None, "Alpha", "alpha-2"),
+                ("codex", Status::Idle, None, "Alpha", "alpha-2"),
             ]
             .into_iter()
             .enumerate()
@@ -236,10 +236,10 @@ mod tests {
     fn modes_preserve_base_order_and_group_counts() {
         let original = fixture();
         for (mode, order, sizes) in [
-            (GroupBy::None, [3, 2, 4, 5, 1, 0], vec![]),
+            (GroupBy::None, [3, 2, 4, 1, 5, 0], vec![]),
             (GroupBy::Agent, [4, 1, 2, 5, 3, 0], vec![2, 2, 2]),
-            (GroupBy::Status, [3, 2, 4, 5, 1, 0], vec![1; 6]),
-            (GroupBy::Cwd, [2, 4, 3, 0, 5, 1], vec![2, 2, 2]),
+            (GroupBy::Status, [3, 2, 4, 1, 5, 0], vec![1, 1, 1, 1, 2]),
+            (GroupBy::Cwd, [2, 4, 3, 0, 1, 5], vec![2, 2, 2]),
             (GroupBy::Session, [2, 1, 3, 5, 4, 0], vec![2, 2, 2]),
         ] {
             for reverse in [false, true] {
@@ -370,13 +370,13 @@ mod tests {
 
     #[test]
     fn labels_are_sanitized_without_path_abbreviation_or_length_limit() {
-        let mut a = entry(0, "pi", Status::Unknown);
+        let mut a = entry(0, "pi", Status::Idle);
         let path = format!("/root/{}/project", "long/".repeat(100));
         a.working_dir = Some(format!("{path}\n\u{202e}"));
         a.location.session = "Session\n\u{202e}name".into();
         assert_eq!(GroupBy::Cwd.group_label(&a), path);
         assert_eq!(GroupBy::Session.group_label(&a), "Sessionname");
-        assert_eq!(GroupBy::Status.group_label(&a), "Unknown");
+        assert_eq!(GroupBy::Status.group_label(&a), "Idle");
         let mut b = a.clone();
         b.working_dir = Some(format!("/other/{}/project", "long/".repeat(100)));
         assert_ne!(GroupBy::Cwd.key(&a), GroupBy::Cwd.key(&b));
@@ -389,7 +389,7 @@ mod tests {
         a.location.session = "Production".into();
         a.location.tab = "Build Tools".into();
         a.location.pane = "Review Pane".into();
-        let mut b = entry(1, "pi", Status::Unknown);
+        let mut b = entry(1, "pi", Status::Idle);
         b.name = "Status:Future".into();
         snapshot(vec![a, b])
     }
@@ -439,7 +439,8 @@ mod tests {
             assert!(matching_indices(&data, query).is_empty(), "{query}");
         }
         assert_eq!(matching_indices(&data, "cwd:unknown"), vec![1]);
-        assert_eq!(matching_indices(&data, "status:unknown"), vec![1]);
+        assert_eq!(matching_indices(&data, "status:idle"), vec![1]);
+        assert!(matching_indices(&data, "status:unknown").is_empty());
     }
 
     #[test]
@@ -454,7 +455,7 @@ mod tests {
         }
         assert!(matching_indices(&data, "assistant unknown").is_empty());
         assert!(matching_indices(&data, "other:assistant").is_empty());
-        // An unknown status term must not be parsed as Status::Unknown.
+        // Status filters match labels; they do not apply the schema's Idle fallback.
         assert!(matching_indices(&data, "status:sleeping").is_empty());
         // Literal substring matching, without regex or fuzzy expansion.
         assert!(matching_indices(&data, "agent:cl.*").is_empty());
@@ -465,8 +466,8 @@ mod tests {
     fn filtering_keeps_original_indices_and_removes_empty_groups() {
         let mut data = fixture();
         GroupBy::Agent.sort(&mut data);
-        assert_eq!(matching_indices(&data, "status:unknown"), vec![3]);
-        let grouped = groups(&data, GroupBy::Agent, "status:unknown");
+        assert_eq!(matching_indices(&data, "agent:codex status:idle"), vec![3]);
+        let grouped = groups(&data, GroupBy::Agent, "agent:codex status:idle");
         assert_eq!(grouped.len(), 1);
         assert_eq!(grouped[0].key, GroupKey::Agent("codex".into()));
         assert_eq!(grouped[0].entries, vec![3]);
