@@ -370,7 +370,6 @@ impl Rex {
                 }
             }
         }
-        snapshot.sort();
         Ok(snapshot)
     }
 

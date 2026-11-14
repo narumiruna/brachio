@@ -244,7 +244,7 @@ fn default_and_empty_view_have_status_help_and_no_hit_targets() {
     let mut app = App::default();
     let rows = render(&mut app, &mut terminal(100, 10));
     // Before the first snapshot, the view reports a connection attempt, not an empty list.
-    assert_eq!(rows[0].trim_end(), "brachio");
+    assert_eq!(rows[0].trim_end(), "brachio · Sort: None");
     assert!(!rows[0].contains("Group"));
     let labels = COLUMN_LABELS;
     assert!(!rows[1].contains("Location"));
@@ -320,12 +320,11 @@ fn grouped_app(entries: Vec<Entry>, group_by: GroupBy) -> App {
 }
 
 #[test]
-fn default_view_preserves_the_original_flat_list_and_navigation() {
-    let mut expected = Snapshot {
+fn default_view_preserves_snapshot_discovery_order_and_navigation() {
+    let expected = Snapshot {
         entries: grouping_entries(),
         warnings: Vec::new(),
     };
-    expected.sort();
     let mut app = App {
         connected: true,
         ..App::default()
@@ -519,6 +518,7 @@ fn every_grouping_mode_has_deterministic_groups_and_status_priority_within_group
         let expected: Vec<_> = order.map(|index| entries[index].clone()).into();
         for input in [entries.clone(), entries.iter().cloned().rev().collect()] {
             let mut app = grouped_app(input, mode);
+            app.handle_event(key(KeyCode::Char('s')));
             assert_eq!(app.snapshot.entries, expected, "{mode:?}");
             let rows = render(&mut app, &mut terminal(120, 18));
             assert_eq!(rows[0].contains("Group:"), mode != GroupBy::None);
@@ -578,10 +578,10 @@ fn mode_key_cycles_all_modes_without_changing_the_selected_identity() {
 fn tab_and_backtab_jump_to_group_starts_and_wrap_in_every_mode() {
     let entries = grouping_entries();
     for (mode, starts) in [
-        (GroupBy::Agent, vec![4, 2, 3]),
-        (GroupBy::Status, vec![3, 2, 4, 1, 5]),
-        (GroupBy::Cwd, vec![2, 3, 1]),
-        (GroupBy::Session, vec![2, 3, 4]),
+        (GroupBy::Agent, vec![1, 2, 0]),
+        (GroupBy::Status, vec![3, 2, 4, 1, 0]),
+        (GroupBy::Cwd, vec![2, 0, 1]),
+        (GroupBy::Session, vec![1, 3, 0]),
     ] {
         let mut app = grouped_app(entries.clone(), mode);
         app.selected = None;
@@ -843,7 +843,7 @@ fn group_jumps_reveal_the_selected_group_after_manual_scroll_and_resize() {
 }
 
 #[test]
-fn rows_are_grouped_by_model_priority_with_name_status_and_location() {
+fn status_sort_uses_priority_and_keeps_name_status_and_location_visible() {
     let statuses = [
         Status::Idle,
         Status::Working,
@@ -856,6 +856,8 @@ fn rows_are_grouped_by_model_priority_with_name_status_and_location() {
         .enumerate()
         .map(|(i, status)| entry(i, status))
         .collect());
+    let selected = app.selected.clone();
+    app.handle_event(key(KeyCode::Char('s')));
     let rows = render(&mut app, &mut terminal(100, 16));
     for (i, entry) in app.snapshot.entries.iter().enumerate() {
         let row = &rows[usize::from(app.hits[i].area.y)];
@@ -871,11 +873,11 @@ fn rows_are_grouped_by_model_priority_with_name_status_and_location() {
     }
     assert_eq!(app.snapshot.entries[0].status, Status::Blocked);
     assert_eq!(app.snapshot.entries[4].status, Status::Idle);
-    assert_eq!(app.selected, Some(app.snapshot.entries[0].id.clone()));
+    assert_eq!(app.selected, selected);
 }
 
 #[test]
-fn equal_statuses_use_the_same_location_and_identity_order_as_the_model() {
+fn status_sort_orders_equal_statuses_by_location_and_exact_identity() {
     let mut a = entry(1, Status::Working);
     let mut b = entry(2, Status::Working);
     a.location = Location {
@@ -889,7 +891,8 @@ fn equal_statuses_use_the_same_location_and_identity_order_as_the_model() {
         warnings: Vec::new(),
     };
     expected.sort();
-    let app = app(expected.entries.iter().cloned().rev().collect());
+    let mut app = app(expected.entries.iter().cloned().rev().collect());
+    app.handle_event(key(KeyCode::Char('s')));
     assert_eq!(app.snapshot.entries, expected.entries);
 }
 
@@ -1102,7 +1105,7 @@ fn selection_follows_identity_through_status_name_and_location_changes() {
         warnings: Vec::new(),
     });
     assert_eq!(app.selected, Some(selected.id.clone()));
-    assert_eq!(app.selected_index(), Some(0));
+    assert_eq!(app.selected_index(), Some(1));
     assert_eq!(navigation(app.handle_event(key(KeyCode::Enter))), selected);
 }
 
@@ -1130,7 +1133,7 @@ fn removed_selection_stays_empty_across_draws_and_future_snapshots() {
     app.handle_event(key(KeyCode::Down));
     assert_eq!(
         navigation(app.handle_event(key(KeyCode::Enter))),
-        entry(2, Status::Blocked)
+        entry(0, Status::Working)
     );
 }
 
@@ -2453,6 +2456,8 @@ fn overlays_block_navigation_and_group_changes_and_close_without_quitting() {
                 key(KeyCode::Enter),
                 key(KeyCode::Char('g')),
                 key(KeyCode::Char('G')),
+                key(KeyCode::Char('s')),
+                key(KeyCode::Char('S')),
                 key(KeyCode::Tab),
                 key(KeyCode::Left),
                 key(KeyCode::Char('/')),
@@ -2462,6 +2467,8 @@ fn overlays_block_navigation_and_group_changes_and_close_without_quitting() {
                 assert!(app.handle_event(event).is_none());
                 assert_eq!(app.selected, selected);
                 assert_eq!(app.group_by, GroupBy::Agent);
+                assert_eq!(app.sort_by, SortBy::None);
+                assert_eq!(app.group_order, GroupOrder::Default);
                 assert!(!app.navigating);
                 assert_no_hits(&app);
             }
@@ -2518,6 +2525,9 @@ fn help_scrolls_to_all_filter_fold_attention_and_status_safety_rules() {
         "On a collapsed group, expand only",
         "apply without jumping",
         "restore the previous filter",
+        "Cycle row sorting: None, Status, Agent, CWD, Session",
+        "Toggle group order: Default or Reverse",
+        "Keep snapshot discovery order",
         "first match is selected",
         "Blocked or Error",
         "agent: cwd: session: status:",
@@ -3390,15 +3400,17 @@ fn title_shows_counts_grouping_and_filter_and_drops_status_counts_first() {
     let rows = render(&mut app, &mut terminal(100, 12));
     assert_eq!(
         rows[0].trim_end(),
-        format!("brachio · 6 agents · {summary} · Group: Session")
+        format!(
+            "brachio · 6 agents · {summary} · Group: Session · Sort: None · Group order: Default"
+        )
     );
     let rows = render(&mut app, &mut terminal(40, 12));
     assert_eq!(rows[0].trim_end(), "brachio · 6 agents · Group: Session");
     apply_filter(&mut app, "agent:pi");
-    let rows = render(&mut app, &mut terminal(100, 12));
+    let rows = render(&mut app, &mut terminal(140, 12));
     assert_eq!(
         rows[0].trim_end(),
-        "brachio · 2/6 agents · !1 ○1 · Group: Session · Filter: agent:pi"
+        "brachio · 2/6 agents · !1 ○1 · Group: Session · Sort: None · Group order: Default · Filter: agent:pi"
     );
     // When the line is short, the filter outranks the grouping mode.
     let rows = render(&mut app, &mut terminal(40, 12));
@@ -3429,6 +3441,254 @@ fn clipped_directory_headings_use_cwd() {
     assert!(rows[1].contains("CWD"));
     assert!(!rows[1].contains("Working direc"));
     assert_independent_fields(&app, &terminal);
+}
+
+#[test]
+fn sort_key_cycles_all_types_and_restores_discovery_order_without_reselection() {
+    let entries = grouping_entries();
+    let mut app = app(entries.clone());
+    let selected = app.selected.clone();
+    assert_eq!(app.sort_by, SortBy::None);
+    assert_eq!(app.snapshot.entries, entries);
+    for (mode, order) in [
+        (SortBy::Status, [3, 2, 4, 1, 5, 0]),
+        (SortBy::Agent, [1, 4, 2, 5, 0, 3]),
+        (SortBy::Cwd, [2, 4, 0, 3, 1, 5]),
+        (SortBy::Session, [1, 2, 3, 5, 0, 4]),
+        (SortBy::None, [0, 1, 2, 3, 4, 5]),
+    ] {
+        render(&mut app, &mut terminal(120, 18));
+        assert!(app.handle_event(key(KeyCode::Char('s'))).is_none());
+        assert_no_hits(&app);
+        assert_eq!(app.sort_by, mode);
+        assert_eq!(app.selected, selected);
+        assert!(!app.navigating);
+        let expected: Vec<_> = order.map(|index| entries[index].clone()).into();
+        assert_eq!(app.snapshot.entries, expected);
+        let rows = render(&mut app, &mut terminal(120, 18));
+        assert!(rows[0].contains(&format!("Sort: {}", mode.label())));
+        assert_eq!(app.snapshot.entries, expected);
+    }
+}
+
+#[test]
+fn row_sort_cycles_keep_group_order_and_restore_source_order_within_groups() {
+    for mode in [
+        GroupBy::Agent,
+        GroupBy::Status,
+        GroupBy::Cwd,
+        GroupBy::Session,
+    ] {
+        let mut app = grouped_app(grouping_entries(), mode);
+        let original = app.snapshot.entries.clone();
+        let keys: Vec<_> = app
+            .current_groups()
+            .into_iter()
+            .map(|group| group.key)
+            .collect();
+        let selected = app.selected.clone();
+        for _ in 0..5 {
+            assert!(app.handle_event(key(KeyCode::Char('s'))).is_none());
+            let actual: Vec<_> = app
+                .current_groups()
+                .into_iter()
+                .map(|group| group.key)
+                .collect();
+            assert_eq!(actual, keys);
+            assert_eq!(app.selected, selected);
+            assert_eq!(app.group_order, GroupOrder::Default);
+            assert!(!app.navigating);
+        }
+        assert_eq!(app.sort_by, SortBy::None);
+        assert_eq!(app.snapshot.entries, original);
+    }
+}
+
+#[test]
+fn uppercase_sort_without_grouping_does_not_change_order_or_mouse_targets() {
+    let mut app = app(grouping_entries());
+    let original = app.snapshot.entries.clone();
+    let selected = app.selected.clone();
+    render(&mut app, &mut terminal(120, 18));
+    let area = app.hits[1].area;
+    let target = app.hits[1].entry.clone();
+    assert!(app.handle_event(key(KeyCode::Char('S'))).is_none());
+    assert_eq!(app.group_order, GroupOrder::Default);
+    assert_eq!(app.sort_by, SortBy::None);
+    assert_eq!(app.snapshot.entries, original);
+    assert_eq!(app.selected, selected);
+    assert_eq!(navigation(app.handle_event(click(area.x, area.y))), target);
+}
+
+#[test]
+fn uppercase_sort_reverses_only_groups_and_invalidates_old_mouse_targets() {
+    for mode in [
+        GroupBy::Agent,
+        GroupBy::Status,
+        GroupBy::Cwd,
+        GroupBy::Session,
+    ] {
+        let mut app = grouped_app(grouping_entries(), mode);
+        app.handle_event(key(KeyCode::Char('s')));
+        render(&mut app, &mut terminal(160, 18));
+        let selected = app.selected.clone();
+        let old_area = app.hits[0].area;
+        let expected: Vec<_> = app
+            .current_groups()
+            .into_iter()
+            .rev()
+            .flat_map(|group| {
+                group
+                    .entries
+                    .into_iter()
+                    .map(|index| app.snapshot.entries[index].clone())
+            })
+            .collect();
+        assert!(
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('S'),
+                KeyModifiers::SHIFT
+            )))
+            .is_none()
+        );
+        assert_eq!(app.group_order, GroupOrder::Reverse);
+        assert_eq!(app.sort_by, SortBy::Status);
+        assert_eq!(app.snapshot.entries, expected);
+        assert_eq!(app.selected, selected);
+        assert_no_hits(&app);
+        assert!(app.handle_event(click(old_area.x, old_area.y)).is_none());
+        assert_eq!(app.selected, selected);
+        assert!(!app.navigating);
+        let rows = render(&mut app, &mut terminal(160, 18));
+        assert!(rows[0].contains("Group order: Reverse"));
+        let expected = app.hits[1].entry.clone();
+        let area = app.hits[1].area;
+        assert_eq!(
+            navigation(app.handle_event(click(area.x, area.y))),
+            expected
+        );
+        app.navigating = false;
+        assert_eq!(navigation(app.handle_event(key(KeyCode::Enter))), expected);
+    }
+}
+
+#[test]
+fn sorting_retains_filter_folds_and_identity_through_group_changes_and_refresh() {
+    let entries = grouping_entries();
+    let mut app = grouped_app(entries.clone(), GroupBy::Agent);
+    app.selected = Some(entries[3].id.clone());
+    app.handle_event(key(KeyCode::Left));
+    apply_filter(&mut app, "cwd:/work");
+    let selected = app.selected.clone();
+    let collapsed = app.collapsed.clone();
+    for character in ['s', 'S', 'g', 'G'] {
+        assert!(app.handle_event(key(KeyCode::Char(character))).is_none());
+        assert_eq!(app.selected, selected);
+        assert_eq!(app.collapsed, collapsed);
+        assert_eq!(app.query, "cwd:/work");
+        assert!(!app.navigating);
+    }
+    assert_eq!(app.group_by, GroupBy::Agent);
+    assert_eq!(app.sort_by, SortBy::Status);
+    assert_eq!(app.group_order, GroupOrder::Reverse);
+    let mut refreshed = entries.clone();
+    refreshed.reverse();
+    app.replace_snapshot(Snapshot {
+        entries: refreshed,
+        warnings: Vec::new(),
+    });
+    assert_eq!(app.selected, selected);
+    assert_eq!(app.collapsed, collapsed);
+    assert_eq!(app.query, "cwd:/work");
+    assert_eq!(app.sort_by, SortBy::Status);
+    assert_eq!(app.group_order, GroupOrder::Reverse);
+    for _ in 0..4 {
+        app.handle_event(key(KeyCode::Char('s')));
+    }
+    assert_eq!(app.sort_by, SortBy::None);
+    // Reverse Agent groups, but keep the refreshed source order inside each group.
+    let expected: Vec<_> = [3, 0, 5, 2, 4, 1]
+        .map(|index| entries[index].clone())
+        .into();
+    assert_eq!(app.snapshot.entries, expected);
+    for _ in 0..4 {
+        app.handle_event(key(KeyCode::Char('g')));
+    }
+    assert_eq!(app.group_by, GroupBy::None);
+    assert_eq!(
+        app.snapshot.entries,
+        entries.into_iter().rev().collect::<Vec<_>>()
+    );
+    let previous = app.snapshot.entries.clone();
+    app.handle_event(key(KeyCode::Char('S')));
+    assert_eq!(app.group_order, GroupOrder::Reverse);
+    assert_eq!(app.snapshot.entries, previous);
+    assert_eq!(App::default().sort_by, SortBy::None);
+    assert_eq!(App::default().group_order, GroupOrder::Default);
+}
+
+#[test]
+fn sorting_never_restores_removed_or_hidden_selections() {
+    for mode in [GroupBy::None, GroupBy::Agent] {
+        let mut app = grouped_app(grouping_entries(), mode);
+        let removed = app.selected.clone().unwrap();
+        let mut snapshot = app.snapshot.clone();
+        snapshot.entries.retain(|entry| entry.id != removed);
+        app.replace_snapshot(snapshot);
+        for character in ['s', 'S', 's', 's', 's', 's'] {
+            assert!(app.handle_event(key(KeyCode::Char(character))).is_none());
+            assert!(app.selected.is_none());
+            assert!(app.handle_event(key(KeyCode::Enter)).is_none());
+            assert!(!app.navigating);
+        }
+    }
+    let mut app = app(grouping_entries());
+    app.query = "no-match".into();
+    let selected = app.selected.clone();
+    app.handle_event(key(KeyCode::Char('s')));
+    assert_eq!(app.selected, selected);
+    assert!(app.handle_event(key(KeyCode::Enter)).is_none());
+    assert!(!app.navigating);
+}
+
+#[test]
+fn sort_keys_are_filter_text_and_key_releases_do_not_sort() {
+    let mut app = grouped_app(grouping_entries(), GroupBy::Agent);
+    let original = app.snapshot.entries.clone();
+    for character in ['s', 'S'] {
+        let mut event = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
+        event.kind = KeyEventKind::Release;
+        assert!(app.handle_event(Event::Key(event)).is_none());
+    }
+    assert_eq!(app.sort_by, SortBy::None);
+    assert_eq!(app.group_order, GroupOrder::Default);
+    assert_eq!(app.snapshot.entries, original);
+    app.handle_event(key(KeyCode::Char('/')));
+    for character in ['s', 'S'] {
+        assert!(app.handle_event(key(KeyCode::Char(character))).is_none());
+    }
+    assert_eq!(app.query, "sS");
+    assert_eq!(app.sort_by, SortBy::None);
+    assert_eq!(app.group_order, GroupOrder::Default);
+    assert_eq!(app.snapshot.entries, original);
+}
+
+#[test]
+fn sorting_details_and_title_remain_complete_or_bounded_at_small_widths() {
+    let mut app = grouped_app(grouping_entries(), GroupBy::Agent);
+    app.handle_event(key(KeyCode::Char('s')));
+    app.handle_event(key(KeyCode::Char('S')));
+    for width in 0..=160 {
+        let matching = matching_indices(&app.snapshot, &app.query);
+        assert!(app.title(width, &matching).width() <= usize::from(width));
+    }
+    let rows = render(&mut app, &mut terminal(160, 18));
+    assert!(rows[0].contains("Sort: Status"));
+    assert!(rows[0].contains("Group order: Reverse"));
+    app.handle_event(key(KeyCode::Char('w')));
+    let text = compact(&overlay_text(&mut app, &mut terminal(80, 10)));
+    assert!(text.contains(&compact("Sort Status")));
+    assert!(text.contains(&compact("Group order Reverse")));
 }
 
 #[test]

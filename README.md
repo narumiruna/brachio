@@ -68,6 +68,8 @@ Brachio uses the CLI's normal server connection. Check `rex whoami --json` befor
 | PageUp / PageDown | Move the selection by one page of rows |
 | Home / End | Select the first / last row |
 | g / G | Cycle grouping forward / backward: None → Agent → Status → CWD → Session |
+| s | Cycle row sorting: None → Status → Agent → CWD → Session; sort within each group when grouped |
+| S (Shift+s) | Toggle group order: Default / Reverse; no effect without grouping |
 | Tab / Shift+Tab | Select the first matching agent in the next / previous group; wrap at either end |
 | Left / Right | Collapse / expand the selected group |
 | Enter | Jump to the selected visible agent in Rex; on a collapsed group, expand only |
@@ -91,17 +93,28 @@ When space is limited, values shorten before lower-priority columns disappear. P
 
 Long names end with `…`; long directories keep the path end visible. An absolute path under `HOME` is displayed with `~` at a path-component boundary. Abbreviation and clipping change display only: Details retains the original full path and exact navigation IDs.
 
-The default **None** view keeps the original ungrouped list and its status, location, and exact identity order. It has no grouping title or group headers. Keyboard hints appear only below the list. When space permits, a solid line appears below the column headings.
+Grouping and row sorting both default to **None**. The ungrouped list keeps snapshot discovery order rather than status priority. Discovery follows Rex's session order, then the returned block order, then canonical agent names within a pane. It is not the visual pane order. The default view has no grouping title or group headers. Keyboard hints appear only below the list. When space permits, a solid line appears below the column headings.
+
+Press `s` to cycle row sorting: **None → Status → Agent → CWD → Session → None**. Without grouping, this sorts the whole list. With grouping, it sorts only members within each group and does not change group order.
+
+- **None** restores the latest snapshot's discovery order, within each group when grouped.
+- **Status** uses Blocked, Error, Done, Working, Idle, then Session/Tab/Pane names and exact identity. This restores the previous default ordering.
+- **Agent** uses canonical agent names, not display labels.
+- **CWD** uses full paths, with missing directories last.
+- **Session** uses Session, Tab, and Pane names, then exact identity.
+- Equal Agent or CWD sort values keep discovery order. Text comparisons are case-sensitive.
+
+Press `S` (Shift+s) to toggle **Default / Reverse** group order. This reverses groups only; member order does not change. In CWD grouping, the missing-directory group moves from last to first in Reverse. In Status grouping, Reverse starts with Idle and ends with Blocked. `S` does nothing without grouping. Sorting and group direction remain active when grouping changes or data refreshes. They retain the selected agent's exact ID, filter, and fold state, and do not navigate Rex. They are not saved after exit.
 
 Grouped views show the mode in the title. Foldable headers with matching-agent counts appear only when at least two nonempty groups remain after filtering. Headers start one column left of agent rows. Except in Status grouping, a header also summarizes its members' statuses, such as `!1 ●2`, when the group is collapsed or mixes statuses, so a collapsed group still shows Blocked or Error members. The summary drops out before the label and count when space is short. A selected collapsed header uses the full-row highlight. With zero or one group, there are no group headers or folds. Under actual multiple headers, Status, Agent, CWD, or Session grouping hides its matching data column without leaving an empty gap. With one group, that column returns. Tab and Pane remain independent in every mode. Equal group values appear together:
 
 - **Agent** uses canonical agent names.
 - **Status** uses this priority: **Blocked, Error, Done, Working, Idle**.
 - **CWD** uses full reported paths, not clipped labels or repository roots.
-  - All missing directories form one final **Unknown** group.
+  - Missing directories form one **Unknown** group, last in Default order and first in Reverse.
 - **Session** uses session names, with exact IDs to keep same-name sessions separate.
 
-Agent names, paths, and session names use case-sensitive text order. Within each group, rows keep status priority, then location and exact identity order.
+Agent names, paths, and session names use case-sensitive text order. Group direction is independent of row sorting. Within each group, rows use the selected sort mode; None keeps discovery order.
 
 Press `g` or `G` to change the grouping mode without changing the selected agent. `Tab` and `Shift+Tab` keep their group-jump operation: they skip the current group and select the first matching agent in the next or previous nonempty group, not the next or previous agent. With no visible selection, they select the first or last group; with one group, they select its first agent. They do not navigate Rex, expand folds, or act in None, Details, Help, or filter editing. Grouping, folds, and filters are not saved after exit.
 
@@ -111,7 +124,7 @@ Press `/` to edit a case-insensitive substring filter. Every whitespace-separate
 
 A refresh that hides the selected agent, for example after a status change, does not select another agent. A hidden selection cannot navigate. Use arrows, a group jump, an attention jump, or a click to select a matching target.
 
-The title shows the agent count followed by colored nonzero status counts, such as `!2 ×1 ●3`, then the grouping mode and active filter. When space is short, status counts drop first, then the grouping mode, and then the filter is clipped. Keyboard hints below the list include `a Attention (N)` when matching agents are Blocked or Error.
+The title shows the agent count followed by colored nonzero status counts, such as `!2 ×1 ●3`, then the grouping mode, `Sort: None` or the selected row sort, `Group order: Default/Reverse` when grouped, and the active filter. When space is short, status counts drop first, then group direction, row sorting, and grouping; the filter is clipped last. Details always includes the complete view settings. Keyboard hints below the list include `s Sort`, `S Group order` when multiple group headers exist, and `a Attention (N)` when matching agents are Blocked or Error, when space permits.
 
 The status line shows the connection state (**Connecting** before the first snapshot, then **Connected**, **Navigating**, or **Disconnected**), a nonzero warning count, and the latest notice. A notice is either feedback for your last action, such as a navigation error, or a persistent connection or client problem. Feedback lasts until your next list input; refreshes and opening Details or Help do not clear it. A notice that does not fit ends with `… (w)`, and Details shows the full text. `?` shows all controls even when footer hints do not fit.
 
@@ -188,7 +201,7 @@ flowchart LR
 - `src/process.rs`: bounded subprocess I/O and owned-process cleanup.
 - `src/worker.rs`: reconciliation, event reconnect, and navigation scheduling.
 - `src/tui.rs`: view state, rendering, selection, scrolling, and input.
-- `src/tui/list.rs`: grouping and filtering.
+- `src/tui/list.rs`: sorting, grouping, and filtering.
 - `src/tui/presentation.rs`: responsive columns, status display, clipping, and footer text.
 - `src/main.rs`: CLI, terminal guard, signal handling, and application loop.
 

@@ -83,6 +83,35 @@ fn mutations(calls: &[Vec<String>]) -> Vec<&Vec<String>> {
 }
 
 #[test]
+fn snapshots_keep_server_discovery_order_instead_of_sorting_by_status() {
+    let fixture = Fixture::new();
+    let path = fixture.dir.path().join("sessions.json");
+    let mut sessions: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    sessions["sessions"].as_array_mut().unwrap().reverse();
+    fs::write(path, serde_json::to_vec(&sessions).unwrap()).unwrap();
+    let snapshot = fixture.rex.snapshot().unwrap();
+    assert_eq!(snapshot.entries.len(), 4);
+    let blocks: Vec<_> = snapshot
+        .entries
+        .iter()
+        .map(|entry| entry.target.block.as_str())
+        .collect();
+    assert_eq!(
+        blocks,
+        vec![
+            "block:00000000-0000-0000-0000-000000000008",
+            "block:00000000-0000-0000-0000-000000000001",
+            "block:00000000-0000-0000-0000-000000000002",
+            "block:00000000-0000-0000-0000-000000000005",
+        ]
+    );
+    assert_eq!(snapshot.entries[0].status, Status::Idle);
+    assert_eq!(snapshot.entries[1].status, Status::Blocked);
+    assert!(mutations(&fixture.calls()).is_empty());
+}
+
+#[test]
 fn multi_session_snapshot_preserves_exact_locations_and_record_rules() {
     let fixture = Fixture::new();
     let snapshot = fixture.rex.snapshot().unwrap();

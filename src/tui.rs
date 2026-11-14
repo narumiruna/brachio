@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::{
@@ -13,7 +13,7 @@ use crate::model::{Entry, EntryId, Snapshot, Status, display_text};
 
 mod list;
 mod presentation;
-use list::{Group, GroupBy, GroupKey, groups, matching_indices};
+use list::{Group, GroupBy, GroupKey, GroupOrder, SortBy, groups, matching_indices};
 use presentation::{
     STATUSES, clip_text, column_label, columns, compact_line, compact_spans, field_lines,
     home_path, measure_columns, plural, shortcuts, spans_width, status_fg, status_summary,
@@ -83,6 +83,9 @@ pub struct App {
     feedback: Option<Feedback>,
     jump_target: Option<String>,
     group_by: GroupBy,
+    sort_by: SortBy,
+    group_order: GroupOrder,
+    source_order: BTreeMap<EntryId, usize>,
     collapsed: BTreeSet<GroupKey>,
     query: String,
     filter_edit: Option<String>,
@@ -106,11 +109,17 @@ pub struct App {
 }
 
 impl App {
-    pub fn replace_snapshot(&mut self, mut snapshot: Snapshot) {
+    pub fn replace_snapshot(&mut self, snapshot: Snapshot) {
         let old_row = self.selected_row();
-        self.group_by.sort(&mut snapshot);
+        self.source_order = snapshot
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.id.clone(), index))
+            .collect();
         self.clear_hits();
         self.snapshot = snapshot;
+        self.sort_snapshot();
         let keys: BTreeSet<_> = self
             .snapshot
             .entries
@@ -328,9 +337,12 @@ impl App {
                     | KeyCode::Home
                     | KeyCode::End
                     | KeyCode::Enter
-                    | KeyCode::Char('j' | 'k' | 'g' | 'G' | 'a' | 'A' | '/' | '?' | 'w')
+                    | KeyCode::Char('j' | 'k' | 'g' | 'G' | 's' | 'a' | 'A' | '/' | '?' | 'w')
             ) || (self.group_by != GroupBy::None
-                && matches!(key.code, KeyCode::Tab | KeyCode::BackTab));
+                && matches!(
+                    key.code,
+                    KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('S')
+                ));
             if mutating {
                 self.clear_hits();
             }
@@ -365,7 +377,19 @@ impl App {
                     } else {
                         self.group_by.next()
                     };
-                    self.group_by.sort(&mut self.snapshot);
+                    self.sort_snapshot();
+                    self.reveal_selection = true;
+                    None
+                }
+                KeyCode::Char('s') => {
+                    self.sort_by = self.sort_by.next();
+                    self.sort_snapshot();
+                    self.reveal_selection = true;
+                    None
+                }
+                KeyCode::Char('S') if self.group_by != GroupBy::None => {
+                    self.group_order = self.group_order.toggle();
+                    self.sort_snapshot();
                     self.reveal_selection = true;
                     None
                 }
@@ -491,6 +515,17 @@ impl App {
         {
             self.select_index(index);
         }
+    }
+
+    fn sort_snapshot(&mut self) {
+        self.snapshot.entries.sort_by_key(|entry| {
+            self.source_order
+                .get(&entry.id)
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+        self.group_by
+            .sort(&mut self.snapshot, self.sort_by, self.group_order);
     }
 
     fn current_groups(&self) -> Vec<Group> {
@@ -760,7 +795,7 @@ impl App {
             self.details_limit = 0;
             return;
         }
-        self.group_by.sort(&mut self.snapshot);
+        self.sort_snapshot();
         if self.selected.is_some() && self.selected_index().is_none() {
             self.selection_removed();
         }
@@ -1060,6 +1095,9 @@ impl App {
             .then(|| format!("Filter: {}", display_text(&self.query)));
         let group =
             (self.group_by != GroupBy::None).then(|| format!("Group: {}", self.group_by.label()));
+        let sort = format!("Sort: {}", self.sort_by.label());
+        let order = (self.group_by != GroupBy::None)
+            .then(|| format!("Group order: {}", self.group_order.label()));
         let summary = status_summary(
             matching
                 .iter()
@@ -1076,7 +1114,13 @@ impl App {
         };
         let cells = |text: &str| Line::raw(text).width();
         let head = format!("brachio{}", joined(&Vec::from_iter(count)));
-        let mut rest: Vec<String> = group.iter().chain(&filter).cloned().collect();
+        let mut rest: Vec<String> = group
+            .iter()
+            .chain(std::iter::once(&sort))
+            .chain(&order)
+            .chain(&filter)
+            .cloned()
+            .collect();
         let summary_width = spans_width(&summary);
         let show_summary =
             summary_width > 0 && cells(&head) + 3 + summary_width + cells(&joined(&rest)) <= width;
@@ -1091,8 +1135,13 @@ impl App {
             spans.push(Span::raw(joined(&rest)));
             return Line::from(spans);
         }
-        if cells(&head) + cells(&joined(&rest)) > width {
-            rest = Vec::from_iter(filter.clone());
+        for optional in [order.as_ref(), Some(&sort), group.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if cells(&head) + cells(&joined(&rest)) > width {
+                rest.retain(|part| part != optional);
+            }
         }
         if let Some(filter) = &filter
             && cells(&head) + cells(&joined(&rest)) > width
@@ -1277,6 +1326,8 @@ impl App {
         lines.push(Line::default());
         lines.push(Line::styled("View", heading));
         field(&mut lines, "Grouping", self.group_by.label());
+        field(&mut lines, "Sort", self.sort_by.label());
+        field(&mut lines, "Group order", self.group_order.label());
         field(&mut lines, "Filter", &none(&self.query));
         lines.push(Line::default());
         lines.push(Line::styled(
@@ -1347,10 +1398,31 @@ impl App {
                         "Cycle grouping forward or backward: None, Agent, Status, CWD, Session.",
                     ),
                     (
+                        "S",
+                        "Toggle group order: Default or Reverse. No effect without grouping. Member order does not change.",
+                    ),
+                    (
                         "Tab  Shift+Tab",
                         "Select the next or previous group, with wraparound.",
                     ),
                     ("←  →", "Collapse or expand the selected group."),
+                ],
+            ),
+            (
+                "Sort",
+                &[
+                    (
+                        "s",
+                        "Cycle row sorting: None, Status, Agent, CWD, Session. With grouping, sort only within each group.",
+                    ),
+                    (
+                        "None",
+                        "Keep snapshot discovery order within groups, or across the ungrouped list. Equal Agent or CWD values keep discovery order.",
+                    ),
+                    (
+                        "Order",
+                        "Status uses priority, then location and exact identity. CWD uses full paths, with missing values last. Session uses Session, Tab, Pane, then exact identity.",
+                    ),
                 ],
             ),
             (

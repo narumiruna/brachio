@@ -421,11 +421,16 @@ pub(super) fn shortcuts(width: u16, grouped: bool, attention: usize) -> Line<'st
     parts.extend([
         Span::raw("/ Filter"),
         Span::raw("g/G Group"),
+        Span::raw("s Sort"),
         Span::raw("? Help"),
         Span::raw("q Quit"),
     ]);
     if grouped {
-        parts.extend([Span::raw("Tab Groups"), Span::raw("←/→ Fold")]);
+        parts.extend([
+            Span::raw("S Group order"),
+            Span::raw("Tab Groups"),
+            Span::raw("←/→ Fold"),
+        ]);
     }
     parts.push(Span::raw("w Details"));
     compact_spans(&parts, width)
@@ -949,11 +954,11 @@ mod tests {
         );
         assert_eq!(
             shortcuts(160, false, 0).to_string(),
-            "↑↓ Select · Enter Jump · / Filter · g/G Group · ? Help · q Quit · w Details"
+            "↑↓ Select · Enter Jump · / Filter · g/G Group · s Sort · ? Help · q Quit · w Details"
         );
         assert_eq!(
             shortcuts(160, true, 0).to_string(),
-            "↑↓ Select · Enter Jump · / Filter · g/G Group · ? Help · q Quit · Tab Groups · ←/→ Fold · w Details"
+            "↑↓ Select · Enter Jump · / Filter · g/G Group · s Sort · ? Help · q Quit · S Group order · Tab Groups · ←/→ Fold · w Details"
         );
         // The attention jump is advertised third and still fits a 40-cell view.
         let line = shortcuts(40, false, 3);
