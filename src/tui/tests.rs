@@ -1,3 +1,4 @@
+use super::presentation::COLUMN_LABELS;
 use super::*;
 use crate::model::{Location, Target, plain};
 use crossterm::event::{KeyEvent, MouseEvent};
@@ -94,7 +95,7 @@ fn app_columns(app: &App, area: Rect) -> presentation::ColumnLayout {
             GroupBy::Session => hidden[3] = true,
         }
     }
-    columns(area, measured, hidden)
+    columns(column_area(area), measured, hidden)
 }
 
 // Compare display cells, not UTF-8 byte offsets or wide-character placeholders.
@@ -137,7 +138,7 @@ fn assert_independent_fields(app: &App, terminal: &Terminal<TestBackend>) {
             assert_cell_text(
                 buffer,
                 Rect { y: 1, ..area },
-                COLUMN_LABELS[index - 1],
+                column_label(index - 1, area.width),
                 false,
             );
         }
@@ -184,7 +185,7 @@ fn agent_area(app: &App, id: &EntryId) -> Rect {
 
 fn click_agent(app: &mut App, id: &EntryId) -> Option<Action> {
     let area = agent_area(app, id);
-    app.handle_event(click(area.right() - 1, area.y))
+    app.handle_event(click(area.x, area.y))
 }
 
 fn wheel(app: &mut App, down: bool) {
@@ -227,6 +228,10 @@ fn overlay_text(app: &mut App, terminal: &mut Terminal<TestBackend>) -> String {
     text
 }
 
+fn compact(value: &str) -> String {
+    value.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 fn navigation(action: Option<Action>) -> Entry {
     match action {
         Some(Action::Navigate(entry)) => *entry,
@@ -238,9 +243,9 @@ fn navigation(action: Option<Action>) -> Entry {
 fn default_and_empty_view_have_status_help_and_no_hit_targets() {
     let mut app = App::default();
     let rows = render(&mut app, &mut terminal(100, 10));
-    assert!(rows[0].starts_with("brachio | 0 agents"));
-    assert!(!rows[0].contains("Group by"));
-    assert!(rows[0].contains("0 agents"));
+    // Before the first snapshot, the view reports a connection attempt, not an empty list.
+    assert_eq!(rows[0].trim_end(), "brachio");
+    assert!(!rows[0].contains("Group"));
     let labels = COLUMN_LABELS;
     assert!(!rows[1].contains("Location"));
     for label in labels {
@@ -251,18 +256,28 @@ fn default_and_empty_view_have_status_help_and_no_hit_targets() {
             .windows(2)
             .all(|pair| rows[1].find(pair[0]) < rows[1].find(pair[1]))
     );
-    assert!(rows[3].contains("No agents"));
+    assert!(rows[3].contains("Connecting to Rex…"));
     assert!(rows[8].contains("Enter Jump"));
     assert!(rows[8].contains("g/G Group"));
-    assert!(rows[9].contains("Disconnected; navigation disabled"));
-    assert!(!rows[9].contains("0 warnings"));
+    assert!(!rows[8].contains("Attention"));
+    assert!(rows[9].starts_with("Connecting"));
+    assert!(!rows[9].contains("warning"));
+    app.refresh_failed("refused");
+    let rows = render(&mut app, &mut terminal(100, 10));
+    assert!(rows[9].starts_with("Connecting · Cannot reach Rex; retrying: refused"));
+    app.message.clear();
+    app.replace_snapshot(Snapshot::default());
+    app.connected = true;
+    let rows = render(&mut app, &mut terminal(100, 10));
+    assert!(rows[0].starts_with("brachio · 0 agents"));
+    assert!(rows[3].contains("No agents with reported status."));
+    assert_eq!(rows[9].trim_end(), "Connected");
     assert_eq!(app.group_by, GroupBy::None);
     assert!(app.group_hits.is_empty());
     assert!(app.hits.is_empty());
     assert!(app.handle_event(click(3, 3)).is_none());
-    app.connected = true;
     assert!(app.handle_event(key(KeyCode::Enter)).is_none());
-    assert!(app.message.contains("No agent selected"));
+    assert!(app.notice().contains("No agent selected"));
     assert!(app.handle_event(key(KeyCode::Down)).is_none());
     assert!(app.handle_event(key(KeyCode::Up)).is_none());
     assert!(app.selected.is_none());
@@ -321,7 +336,7 @@ fn default_view_preserves_the_original_flat_list_and_navigation() {
     let mut terminal = terminal(100, 12);
     app.handle_event(key(KeyCode::Down));
     let rows = render(&mut app, &mut terminal);
-    assert!(rows[0].starts_with("brachio | 6 agents"));
+    assert!(rows[0].starts_with("brachio · 6 agents"));
     assert!(!rows.iter().any(|row| row.contains("Group:")));
     assert!(rows[10].contains("g/G Group"));
     assert!(!rows[10].contains("Tab Groups"));
@@ -892,9 +907,8 @@ fn long_unicode_names_are_clipped_without_covering_status_or_location() {
         assert!(rows[3].contains(label));
     }
     assert!(!rows[4].contains('界'));
-    assert!(rows[7].contains("Notice (w)"));
-    assert!(rows[7].contains("1 warnings (w)"));
-    assert!(!rows[7].contains("failure"));
+    assert!(rows[7].contains("1 warning (w)"));
+    assert!(rows[7].contains("failure: denied"));
     for cell in &terminal.backend().buffer().content {
         assert_eq!(plain(cell.symbol()), cell.symbol());
     }
@@ -974,21 +988,25 @@ fn details_include_complete_selected_location_directory_and_exact_ids() {
         let rows = render(&mut app, &mut terminal);
         text.push_str(rows[6].trim_end());
     }
-    for value in [
-        expected.location.session.as_ref(),
-        expected.location.tab.as_ref(),
-        expected.location.pane.as_ref(),
-        expected.working_dir.as_deref().unwrap(),
-        expected.target.session.as_str(),
-        expected.target.window.as_str(),
-        expected.target.block.as_str(),
+    for (label, value) in [
+        ("Session", expected.location.session.as_ref()),
+        ("Tab", expected.location.tab.as_ref()),
+        ("Pane", expected.location.pane.as_ref()),
+        (
+            "Working directory",
+            expected.working_dir.as_deref().unwrap(),
+        ),
+        ("Session ID", expected.target.session.as_str()),
+        ("Tab ID", expected.target.window.as_str()),
+        ("Pane ID", expected.target.block.as_str()),
     ] {
-        assert!(text.contains(value), "missing {value:?}");
+        let field = compact(&format!("{label} {value}"));
+        assert!(
+            compact(&text).contains(&field),
+            "missing {label}: {value:?}"
+        );
     }
-    assert!(text.contains("Working directory:"));
-    assert!(text.contains("Session ID:"));
-    assert!(text.contains("Tab ID:"));
-    assert!(text.contains("Pane ID:"));
+    assert!(text.starts_with("Selected agent"));
     app.handle_event(key(KeyCode::Esc));
     assert_eq!(navigation(app.handle_event(key(KeyCode::Enter))), expected);
 }
@@ -1097,7 +1115,7 @@ fn removed_selection_stays_empty_across_draws_and_future_snapshots() {
         warnings: Vec::new(),
     });
     assert!(app.selected.is_none());
-    assert!(app.message.contains("no longer available"));
+    assert!(app.notice().contains("no longer available"));
     let mut terminal = terminal(100, 8);
     let rows = render(&mut app, &mut terminal);
     assert!(!rows[3].starts_with('>'));
@@ -1251,7 +1269,7 @@ fn removed_rows_cannot_be_clicked_before_the_next_draw() {
     });
     assert!(app.handle_event(click(0, 3)).is_none());
     assert!(app.selected.is_none());
-    assert!(app.message.contains("no longer available"));
+    assert!(app.notice().contains("no longer available"));
     render(&mut app, &mut terminal);
     assert_eq!(
         navigation(click_agent(&mut app, &entry(1, Status::Working).id)),
@@ -1351,7 +1369,7 @@ fn unchanged_refresh_preserves_manual_scroll_and_missing_selection_notice() {
     app.replace_snapshot(snapshot.clone());
     app.message = "Previous app selection accepted".into();
     app.replace_snapshot(snapshot);
-    assert!(app.message.contains("no longer available"));
+    assert!(app.notice().contains("no longer available"));
     assert!(app.selected.is_none());
 }
 
@@ -1393,7 +1411,7 @@ fn disconnected_and_in_progress_navigation_are_rejected_for_keys_and_mouse() {
     app.connected = false;
     assert!(app.handle_event(key(KeyCode::Enter)).is_none());
     assert!(!app.navigating);
-    assert!(app.message.contains("disconnected"));
+    assert!(app.notice().contains("disconnected"));
     let mut terminal = terminal(100, 8);
     render(&mut app, &mut terminal);
     assert!(click_agent(&mut app, &entry(1, Status::Working).id).is_none());
@@ -1403,7 +1421,7 @@ fn disconnected_and_in_progress_navigation_are_rejected_for_keys_and_mouse() {
     assert_eq!(target, entry(1, Status::Working));
     assert!(app.navigating);
     assert!(app.handle_event(key(KeyCode::Enter)).is_none());
-    assert!(app.message.contains("already in progress"));
+    assert!(app.notice().contains("already in progress"));
     let rows = render(&mut app, &mut terminal);
     assert!(rows[7].contains("Navigating"));
     assert!(click_agent(&mut app, &entry(0, Status::Working).id).is_none());
@@ -1421,18 +1439,30 @@ fn errors_and_partial_snapshot_warnings_remain_visible() {
     app.snapshot.warnings = vec!["Pane status unavailable".into(), "Other warning".into()];
     let mut terminal = terminal(160, 8);
     let rows = render(&mut app, &mut terminal);
-    assert!(rows[7].contains("Notice (w)"));
-    assert!(rows[7].contains("2 warnings (w)"));
-    assert!(!rows[7].contains("Remote Control denied"));
+    assert_eq!(
+        rows[7].trim_end(),
+        "Connected · 2 warnings (w) · Navigation failed: Remote Control denied"
+    );
+    let row = app.hits[0].area;
+    assert!(
+        !terminal.backend().buffer()[(row.x + 4, row.y)]
+            .modifier
+            .contains(Modifier::DIM)
+    );
     app.connected = false;
     let rows = render(&mut app, &mut terminal);
-    assert!(rows[7].contains("Disconnected; navigation disabled"));
-    assert!(rows[7].contains("Notice (w)"));
+    assert!(rows[7].starts_with("Disconnected · 2 warnings (w) · Navigation failed"));
+    // Last known rows stay visible but dimmed while the list is stale.
     assert!(rows[3].contains("agent-00"));
+    assert!(
+        terminal.backend().buffer()[(row.x + 4, row.y)]
+            .modifier
+            .contains(Modifier::DIM)
+    );
 }
 
 #[test]
-fn footer_keeps_diagnostics_in_details_instead_of_full_messages_or_ids() {
+fn footer_clips_long_notices_and_points_to_details_for_the_full_text() {
     let mut app = many(1);
     let client = "client:00000000-0000-0000-0000-000000000001";
     let message = format!("Target app {client}; session focus is shared with other clients");
@@ -1440,30 +1470,111 @@ fn footer_keeps_diagnostics_in_details_instead_of_full_messages_or_ids() {
     app.client = Some(client.into());
     app.snapshot.warnings = vec!["First warning".into(), "Second warning".into()];
     let mut terminal = terminal(80, 8);
-    for connected in [true, false] {
+    for (connected, state) in [(true, "Connected"), (false, "Disconnected")] {
         app.connected = connected;
         let rows = render(&mut app, &mut terminal);
         assert!(rows[6].contains("g/G Group"));
-        assert!(rows[7].contains("2 warnings (w)"));
-        assert!(!rows[7].contains("Target app"));
-        assert!(!rows[7].contains(client));
+        assert!(rows[7].starts_with(&format!("{state} · 2 warnings (w) · Target app")));
+        assert!(rows[7].trim_end().ends_with("… (w)"), "{}", rows[7]);
         assert_eq!(app.message, message);
         app.handle_event(key(KeyCode::Char('w')));
-        let text = overlay_text(&mut app, &mut terminal);
-        assert!(text.contains(&message));
-        assert!(text.contains(&format!("Client ID: {client}")));
-        assert!(text.contains("Session focus is shared with other connected clients."));
+        let text = compact(&overlay_text(&mut app, &mut terminal));
+        assert!(text.contains(&compact(&message)));
+        assert!(text.contains(&compact(&format!("Client ID {client}"))));
+        assert!(text.contains(&compact(
+            "Session focus is shared with other connected clients."
+        )));
         for warning in &app.snapshot.warnings {
-            assert!(text.contains(warning));
+            assert!(text.contains(&compact(warning)));
         }
         app.handle_event(key(KeyCode::Esc));
     }
     app.message = "Navigation failed: Remote Control denied".into();
     let rows = render(&mut app, &mut terminal);
-    assert!(rows[7].contains("Disconnected; navigation disabled"));
-    assert!(!rows[7].contains("Remote Control denied"));
+    assert_eq!(
+        rows[7].trim_end(),
+        "Disconnected · 2 warnings (w) · Navigation failed: Remote Control denied"
+    );
     app.handle_event(key(KeyCode::Char('w')));
-    assert!(overlay_text(&mut app, &mut terminal).contains(&app.message));
+    assert!(compact(&overlay_text(&mut app, &mut terminal)).contains(&compact(&app.message)));
+}
+
+#[test]
+fn action_feedback_lasts_until_the_next_list_input_but_survives_overlays() {
+    let mut app = many(2);
+    let mut terminal = terminal(100, 10);
+    app.message = "Persistent client problem".into();
+    app.handle_event(key(KeyCode::Esc));
+    assert_eq!(app.notice(), "Press q to quit.");
+    let rows = render(&mut app, &mut terminal);
+    assert!(rows[9].trim_end().ends_with("Press q to quit."));
+    // A refresh does not replace feedback; Details shows it and closing keeps it.
+    app.replace_snapshot(app.snapshot.clone());
+    app.handle_event(key(KeyCode::Char('w')));
+    assert!(compact(&overlay_text(&mut app, &mut terminal)).contains("LatestPressqtoquit."));
+    app.handle_event(key(KeyCode::Esc));
+    assert_eq!(app.notice(), "Press q to quit.");
+    app.handle_event(key(KeyCode::Char('?')));
+    app.handle_event(key(KeyCode::Char('?')));
+    assert_eq!(app.notice(), "Press q to quit.");
+    // Clicking empty space keeps feedback; the next list key replaces it.
+    render(&mut app, &mut terminal);
+    app.handle_event(click(0, 8));
+    assert_eq!(app.notice(), "Press q to quit.");
+    app.handle_event(key(KeyCode::Down));
+    assert_eq!(app.notice(), "Persistent client problem");
+    // Navigation results are feedback with full text in Details, not persistent messages.
+    app.message.clear();
+    let target = navigation(app.handle_event(key(KeyCode::Enter)));
+    assert_eq!(app.notice(), format!("Jumping to {}…", target.location));
+    app.navigation_finished(Err("Rex.app is not accepting actions".into()));
+    assert!(!app.navigating);
+    assert_eq!(app.notice(), "Rex.app is not accepting actions");
+    assert_eq!(app.diagnostic, "Rex.app is not accepting actions");
+    let rows = render(&mut app, &mut terminal);
+    assert!(
+        rows[9]
+            .trim_end()
+            .ends_with("Rex.app is not accepting actions")
+    );
+    app.replace_snapshot(app.snapshot.clone());
+    app.handle_event(key(KeyCode::Up));
+    assert_eq!(app.notice(), "");
+    let target = navigation(app.handle_event(key(KeyCode::Enter)));
+    app.navigation_finished(Ok(()));
+    assert_eq!(
+        app.notice(),
+        format!("Rex accepted the jump to {}.", target.location)
+    );
+    assert!(app.diagnostic.starts_with("Rex accepted app selection"));
+}
+
+#[test]
+fn missing_selection_refreshes_preserve_navigation_feedback() {
+    for result in [Ok(()), Err("Rex.app is not accepting actions".into())] {
+        let mut app = many(3);
+        let target = navigation(app.handle_event(key(KeyCode::Enter)));
+        let mut snapshot = app.snapshot.clone();
+        snapshot.entries.retain(|entry| entry.id != target.id);
+        app.replace_snapshot(snapshot.clone());
+        assert_eq!(app.notice(), SELECTION_REMOVED);
+        app.navigation_finished(result);
+        let feedback = app.feedback.clone();
+        assert!(feedback.is_some());
+        assert_ne!(app.notice(), SELECTION_REMOVED);
+        for _ in 0..2 {
+            app.replace_snapshot(snapshot.clone());
+            assert_eq!(app.feedback, feedback);
+            assert!(app.selected.is_none());
+            assert!(app.selection_missing);
+        }
+        app.handle_event(key(KeyCode::Char('x')));
+        assert!(app.feedback.is_none());
+        assert_eq!(app.notice(), SELECTION_REMOVED);
+        app.replace_snapshot(snapshot);
+        assert!(app.feedback.is_none());
+        assert_eq!(app.notice(), SELECTION_REMOVED);
+    }
 }
 
 #[test]
@@ -1487,8 +1598,14 @@ fn details_scroll_exposes_the_full_sanitized_message_and_every_warning() {
     let mut terminal = terminal(80, 8);
     assert!(app.handle_event(key(KeyCode::Char('w'))).is_none());
     let rows = render(&mut app, &mut terminal);
-    assert!(rows[0].contains("Details | lines"));
-    assert!(rows[1].contains("Message: Navigation failed:"));
+    assert!(rows[0].starts_with("brachio · Details"));
+    assert!(
+        rows[0]
+            .trim_end()
+            .ends_with(&format!("lines 1–6 of {}", app.details_limit + 6))
+    );
+    assert_eq!(rows[1].trim_end(), "Selected agent");
+    assert!(rows[7].contains("PgUp/PgDn Scroll"));
     assert!(rows[7].contains("Esc/q Back"));
     let mut text: String = rows[1..7].iter().map(|row| row.trim_end()).collect();
     assert!(!text.contains("WARNING-END-7"));
@@ -1510,18 +1627,12 @@ fn details_scroll_exposes_the_full_sanitized_message_and_every_warning() {
             assert_eq!(plain(cell.symbol()), cell.symbol());
         }
     }
-    let compact = |value: &str| {
-        value
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect::<String>()
-    };
     assert!(compact(&text).contains(&compact(&display_text(&message))));
     for warning in &warnings {
         assert!(compact(&text).contains(&compact(&display_text(warning))));
     }
     assert!(text.contains("MESSAGE-END"));
-    assert!(text.contains("Warnings: 8"));
+    assert!(text.contains("Warnings (8)"));
     for index in 0..8 {
         assert!(text.contains(&format!("WARNING-{index}:")));
         assert!(text.contains(&format!("WARNING-END-{index}")));
@@ -1625,8 +1736,10 @@ fn selection_removed_during_details_still_requires_deliberate_reselection() {
         warnings: Vec::new(),
     });
     let mut terminal = terminal(80, 8);
-    let rows = render(&mut app, &mut terminal);
-    assert!(rows[1].contains("Selected agent is no longer available"));
+    let text = compact(&overlay_text(&mut app, &mut terminal));
+    assert!(text.starts_with("Selectedagent"));
+    assert!(text.contains("Noagentselected."));
+    assert!(text.contains(&compact("Latest Selected agent is no longer available")));
     app.handle_event(key(KeyCode::Char('w')));
     render(&mut app, &mut terminal);
     assert!(app.handle_event(key(KeyCode::Enter)).is_none());
@@ -1678,10 +1791,12 @@ fn details_resize_and_empty_reports_clamp_scroll_without_creating_targets() {
         app.handle_event(key(KeyCode::Up));
     }
     let rows = render(&mut app, &mut terminal);
-    assert!(rows[1].contains("Message: No current message."));
+    assert_eq!(rows[1].trim_end(), "Selected agent");
     assert_eq!(app.details_scroll, 0);
     let text = overlay_text(&mut app, &mut terminal);
-    assert!(text.contains("Warnings: 0"));
+    assert!(compact(&text).contains("LatestNoneConnectionNoneLastnavigationNone"));
+    assert!(compact(&text).contains("FilterNone"));
+    assert!(text.contains("Warnings (0)"));
     assert!(text.contains("No snapshot warnings."));
     assert!(app.details_limit > 0);
     assert_eq!(app.selected, selected);
@@ -1743,12 +1858,12 @@ fn direct_public_snapshot_mutation_cannot_retarget_an_old_click() {
     render(&mut app, &mut terminal(80, 8));
     app.snapshot.entries[0].target.window = "different-tab".into();
     assert!(app.handle_event(click(0, 3)).is_none());
-    assert!(app.message.contains("list changed"));
+    assert!(app.notice().contains("list changed"));
     assert!(!app.navigating);
     app.snapshot.entries.remove(0);
     assert!(app.handle_event(key(KeyCode::Enter)).is_none());
     assert!(app.selected.is_none());
-    assert!(app.message.contains("no longer available"));
+    assert!(app.notice().contains("no longer available"));
 }
 
 fn apply_filter(app: &mut App, query: &str) {
@@ -1875,7 +1990,7 @@ fn enter_on_a_collapsed_header_expands_even_when_navigation_is_blocked() {
         assert_eq!(app.selected, selected);
         assert_eq!(app.navigating, navigating);
         assert!(app.handle_event(key(KeyCode::Enter)).is_none());
-        assert!(app.message.contains(if connected {
+        assert!(app.notice().contains(if connected {
             "already in progress"
         } else {
             "disconnected"
@@ -1902,8 +2017,15 @@ fn folds_persist_across_group_cycles_filter_changes_and_refresh_then_prune_remov
             .iter()
             .all(|row| matches!(row, ListRow::Agent(_)))
     );
+    // The filter hid the selection, so the first codex agent became selected.
+    let first_codex = app.snapshot.entries[app.current_groups()[0].entries[0]]
+        .id
+        .clone();
+    assert_eq!(app.selected, Some(first_codex.clone()));
     app.handle_event(key(KeyCode::Esc));
+    assert_eq!(app.selected, Some(first_codex));
     assert!(app.collapsed.contains(&group));
+    app.selected = selected.clone();
     let mut refreshed = app.snapshot.clone();
     refreshed.entries.reverse();
     app.replace_snapshot(refreshed);
@@ -1978,24 +2100,26 @@ fn headers_and_counts_include_only_matching_members_and_disappear_for_one_group(
 }
 
 #[test]
-fn hidden_selection_is_retained_blocked_and_restored_without_implicit_reselection() {
+fn filter_edits_select_the_first_match_when_the_selection_is_hidden() {
     let mut app = many(3);
     app.handle_event(key(KeyCode::Down));
-    let expected = entry(1, Status::Working);
+    let visible = entry(1, Status::Working);
     let mut terminal = terminal(100, 10);
+    // A filter that still matches the selection keeps it.
+    apply_filter(&mut app, "agent-0");
+    assert_eq!(app.selected, Some(visible.id.clone()));
+    // A filter that hides it selects the first visible match, so Enter can jump.
     apply_filter(&mut app, "agent:agent-02");
-    render(&mut app, &mut terminal);
-    assert_eq!(app.selected, Some(expected.id.clone()));
-    assert_eq!(app.selected_row(), None);
-    assert_eq!(app.hits.len(), 1);
-    assert!(app.handle_event(key(KeyCode::Enter)).is_none());
-    assert!(app.message.contains("hidden by the filter"));
-    assert!(!app.navigating);
-    app.replace_snapshot(app.snapshot.clone());
-    for _ in 0..5 {
-        app.handle_event(key(KeyCode::Char('g')));
-    }
-    assert_eq!(app.selected, Some(expected.id.clone()));
+    let rows = render(&mut app, &mut terminal);
+    assert!(rows[0].contains("Filter: agent:agent-02"));
+    assert_eq!(app.selected, Some(entry(2, Status::Working).id));
+    assert_eq!(app.selected_row(), Some(0));
+    assert_eq!(
+        navigation(app.handle_event(key(KeyCode::Enter))),
+        entry(2, Status::Working)
+    );
+    app.navigating = false;
+    // No match keeps the last selection without a visible target.
     apply_filter(&mut app, "no-such-agent");
     let rows = render(&mut app, &mut terminal);
     assert!(rows[usize::from(app.viewport.y)].contains("No agents match the filter"));
@@ -2003,17 +2127,48 @@ fn hidden_selection_is_retained_blocked_and_restored_without_implicit_reselectio
     for code in [
         KeyCode::Up,
         KeyCode::Down,
+        KeyCode::PageDown,
+        KeyCode::Home,
         KeyCode::Tab,
         KeyCode::BackTab,
         KeyCode::Enter,
     ] {
         assert!(app.handle_event(key(code)).is_none());
-        assert_eq!(app.selected, Some(expected.id.clone()));
+        assert_eq!(app.selected, Some(entry(2, Status::Working).id));
     }
+    assert!(app.handle_event(key(KeyCode::Esc)).is_none());
+    assert!(app.query.is_empty());
+    assert_eq!(app.selected_row(), Some(2));
+}
+
+#[test]
+fn a_refresh_that_hides_the_selection_does_not_reselect_implicitly() {
+    let mut app = many(3);
+    app.handle_event(key(KeyCode::Down));
+    let expected = entry(1, Status::Working);
+    let mut terminal = terminal(100, 10);
+    apply_filter(&mut app, "status:working");
+    assert_eq!(app.selected, Some(expected.id.clone()));
+    let mut changed = app.snapshot.clone();
+    changed.entries[1].status = Status::Idle;
+    app.replace_snapshot(changed);
+    render(&mut app, &mut terminal);
+    assert_eq!(app.selected, Some(expected.id.clone()));
+    assert_eq!(app.selected_row(), None);
+    assert_eq!(app.hits.len(), 2);
+    assert!(app.handle_event(key(KeyCode::Enter)).is_none());
+    assert!(app.notice().contains("hidden by the filter"));
+    assert!(!app.navigating);
+    for _ in 0..5 {
+        app.handle_event(key(KeyCode::Char('g')));
+    }
+    assert_eq!(app.selected, Some(expected.id.clone()));
     assert!(app.handle_event(key(KeyCode::Esc)).is_none());
     render(&mut app, &mut terminal);
     assert!(app.selected_row().is_some());
-    assert_eq!(navigation(app.handle_event(key(KeyCode::Enter))), expected);
+    let mut idle = expected.clone();
+    idle.status = Status::Idle;
+    assert_eq!(navigation(app.handle_event(key(KeyCode::Enter))), idle);
 }
 
 #[test]
@@ -2071,13 +2226,81 @@ fn filter_cancel_restores_the_previous_query_and_escape_clears_before_quitting()
     assert!(app.handle_event(key(KeyCode::Esc)).is_none());
     assert!(app.query.is_empty());
     assert_no_hits(&app);
+    // Escape backs out of views but never quits the list.
+    assert!(app.handle_event(key(KeyCode::Esc)).is_none());
+    assert_eq!(app.notice(), "Press q to quit.");
     assert!(matches!(
-        app.handle_event(key(KeyCode::Esc)),
+        app.handle_event(key(KeyCode::Char('q'))),
         Some(Action::Quit)
     ));
     app.handle_event(key(KeyCode::Char('/')));
     assert!(app.handle_event(key(KeyCode::Esc)).is_none());
     assert!(app.filter_edit.is_none());
+}
+
+#[test]
+fn filter_cancel_restores_an_absent_selection() {
+    for missing in [false, true] {
+        for edited in [false, true] {
+            let mut view = if missing { many(3) } else { app(Vec::new()) };
+            view.replace_snapshot(Snapshot {
+                entries: vec![entry(1, Status::Working), entry(2, Status::Working)],
+                warnings: Vec::new(),
+            });
+            assert!(view.selected.is_none());
+            assert_eq!(view.selection_missing, missing);
+            view.handle_event(key(KeyCode::Char('/')));
+            if edited {
+                view.handle_event(Event::Paste("agent:agent-01".into()));
+                assert!(view.selected.is_some());
+            }
+            view.handle_event(key(KeyCode::Esc));
+            assert!(view.query.is_empty());
+            assert!(
+                view.selected.is_none(),
+                "missing={missing}, edited={edited}"
+            );
+            assert_eq!(view.selection_missing, missing);
+            assert!(view.handle_event(key(KeyCode::Enter)).is_none());
+            assert!(!view.navigating);
+        }
+    }
+}
+
+#[test]
+fn filter_cancel_restores_a_hidden_selection() {
+    let mut app = many(3);
+    let selected = app.selected.clone();
+    apply_filter(&mut app, "status:working");
+    let mut snapshot = app.snapshot.clone();
+    snapshot.entries[0].status = Status::Idle;
+    app.replace_snapshot(snapshot);
+    assert!(app.selected_row().is_none());
+    app.handle_event(key(KeyCode::Char('/')));
+    app.handle_event(key(KeyCode::Esc));
+    assert_eq!(app.query, "status:working");
+    assert_eq!(app.selected, selected);
+    assert!(app.selected_row().is_none());
+    assert!(app.handle_event(key(KeyCode::Enter)).is_none());
+    assert!(!app.navigating);
+}
+
+#[test]
+fn filter_cancel_keeps_a_removed_original_selection_missing() {
+    let mut app = many(3);
+    let original = app.selected.clone().unwrap();
+    app.handle_event(key(KeyCode::Char('/')));
+    app.handle_event(Event::Paste("agent:agent-01".into()));
+    assert_ne!(app.selected.as_ref(), Some(&original));
+    let mut snapshot = app.snapshot.clone();
+    snapshot.entries.retain(|entry| entry.id != original);
+    app.replace_snapshot(snapshot);
+    app.handle_event(key(KeyCode::Esc));
+    assert!(app.query.is_empty());
+    assert!(app.selected.is_none());
+    assert!(app.selection_missing);
+    assert!(app.handle_event(key(KeyCode::Enter)).is_none());
+    assert!(!app.navigating);
 }
 
 #[test]
@@ -2286,21 +2509,26 @@ fn help_scrolls_to_all_filter_fold_attention_and_status_safety_rules() {
     assert_eq!(app.details_scroll, 0);
     wheel(&mut app, true);
     assert_eq!(app.details_scroll, 3);
-    let text = overlay_text(&mut app, &mut terminal);
+    let text = compact(&overlay_text(&mut app, &mut terminal));
     for value in [
-        "Collapsed headers are selectable",
-        "expand only",
-        "Enter applies without navigation",
-        "restores the previous filter",
+        "Move",
+        "PgUp PgDn",
+        "Home End",
+        "Collapsed group headers are selectable",
+        "On a collapsed group, expand only",
+        "apply without jumping",
+        "restore the previous filter",
+        "first match is selected",
         "Blocked or Error",
-        "Unrecognized states use Idle",
-        "Idle fallback",
-        "no-report source",
-        "Blocked is not proof",
-        "not whole-session completion",
+        "agent: cwd: session: status:",
+        "Ctrl-C quits from any view",
+        "! Blocked × Error ✓ Done ● Working ○ Idle",
+        "agents without a status report use Idle, as the Rex schema requires",
+        "status source",
     ] {
-        assert!(text.contains(value), "missing {value}: {text}");
+        assert!(text.contains(&compact(value)), "missing {value}: {text}");
     }
+    assert!(!text.contains(&compact("Blocked is not proof")));
     assert_no_hits(&app);
 }
 
@@ -2340,7 +2568,6 @@ fn attention_keys_visit_only_blocked_or_error_with_wraparound_and_expand_groups(
         app.snapshot.entries[app.selected_index().unwrap()].status,
         Status::Error
     );
-    let selected = app.selected.clone();
     for query in [
         "status:done",
         "status:unknown",
@@ -2349,10 +2576,11 @@ fn attention_keys_visit_only_blocked_or_error_with_wraparound_and_expand_groups(
         "no-match",
     ] {
         apply_filter(&mut app, query);
+        let selected = app.selected.clone();
         for character in ['a', 'A'] {
             app.handle_event(key(KeyCode::Char(character)));
             assert_eq!(app.selected, selected);
-            assert!(app.message.contains("No matching Blocked or Error"));
+            assert!(app.notice().contains("No matching Blocked or Error"));
         }
     }
 }
@@ -2435,9 +2663,10 @@ fn idle_fallback_and_details_identify_foreground_only_sources() {
     let rows = render(&mut app, &mut terminal);
     let status = app_columns(&app, app.hits[0].area).areas[1];
     assert!(rows[usize::from(status.y)].contains("○ Idle"));
+    // The only row is selected; Idle switches from gray to white on the highlight.
     assert_eq!(
         terminal.backend().buffer()[(status.x, status.y)].fg,
-        Color::Gray
+        Color::White
     );
     assert!(!rows[9].contains("attention"));
     assert!(!rows[9].contains("working"));
@@ -2832,13 +3061,77 @@ fn long_header_labels_keep_matching_counts_visible_at_narrow_widths() {
             assert_eq!(app.group_hits.len(), 3);
             for hit in &app.group_hits {
                 let text = rows[usize::from(hit.area.y)].trim_end();
-                if width >= 6 {
-                    assert!(text.ends_with("(2)"), "{mode:?}/{width}: {text}");
+                if width >= 7 {
+                    // Reserve the scrollbar cell and drop summaries before the count.
+                    assert!(text.contains("(2)"), "{mode:?}/{width}: {text}");
+                    if width < 32 {
+                        assert!(text.ends_with("(2)"), "{mode:?}/{width}: {text}");
+                    }
                 } else {
                     assert_eq!(text, "2");
                 }
             }
         }
+    }
+}
+
+#[test]
+fn overflowing_group_headers_leave_the_scrollbar_cell_clear() {
+    for mode in [GroupBy::Agent, GroupBy::Cwd, GroupBy::Session] {
+        let entries = (0..12)
+            .map(|index| {
+                let mut entry = entry(index, Status::Working);
+                let label = format!("{}-{index}", "long-label/".repeat(20));
+                entry.id.agent = label.clone();
+                entry.working_dir = Some(format!("/{label}"));
+                entry.location.session = label.into();
+                entry
+            })
+            .collect();
+        let mut app = grouped_app(entries, mode);
+        for group in app.current_groups() {
+            app.collapsed.insert(group.key);
+        }
+        for width in [8, 16, 32] {
+            let mut terminal = terminal(width, 10);
+            let rows = render(&mut app, &mut terminal);
+            assert_eq!(app.scrollbar, Some(width - 1));
+            for hit in &app.group_hits {
+                let text: String = rows[usize::from(hit.area.y)]
+                    .chars()
+                    .take(usize::from(width - 1))
+                    .collect();
+                let suffix = if width < 32 { "(1)" } else { "●1" };
+                assert!(
+                    text.trim_end().ends_with(suffix),
+                    "{mode:?}/{width}: {text:?}"
+                );
+            }
+            let selected = app.selected_row().unwrap() - app.scroll;
+            let y = app.viewport.y + selected as u16;
+            assert!((0..width).all(|x| terminal.backend().buffer()[(x, y)].bg == SELECTED_BG));
+        }
+    }
+}
+
+#[test]
+fn details_preserve_significant_spaces() {
+    let mut agent = entry(0, Status::Working);
+    agent.name = "  agent  name  ".into();
+    agent.working_dir = Some("/work/my  project/ tail  ".into());
+    agent.location.session = "  session  name  ".into();
+    let mut app = app(vec![agent.clone()]);
+    app.diagnostic = "  navigation  failed  ".into();
+    app.handle_event(key(KeyCode::Char('w')));
+    let rows = render(&mut app, &mut terminal(120, 60));
+    let text = rows.join("\n");
+    for value in [
+        agent.name.as_str(),
+        agent.working_dir.as_deref().unwrap(),
+        agent.location.session.as_ref(),
+        app.diagnostic.as_str(),
+    ] {
+        assert!(text.contains(value), "missing {value:?}: {text}");
     }
 }
 
@@ -2863,15 +3156,17 @@ fn navigation_diagnostics_are_complete_in_details_but_do_not_create_footer_notic
     ] {
         assert!(!rows[9].contains(value));
     }
-    assert_eq!(app.footer(100).1, Color::Green);
+    assert_eq!(app.footer(100).spans[0].style.fg, Some(Color::Green));
     app.handle_event(key(KeyCode::Char('w')));
     let text = overlay_text(&mut app, &mut terminal);
-    assert!(text.contains(&display_text(&format!("Last navigation: {diagnostic}"))));
+    assert!(compact(&text).contains(&compact(&display_text(&format!(
+        "Last navigation {diagnostic}"
+    )))));
     assert!(text.contains(app.client.as_deref().unwrap()));
     assert_eq!(app.diagnostic, diagnostic);
     app.handle_event(key(KeyCode::Char('q')));
     assert!(!app.details);
-    assert_eq!(app.footer(100).1, Color::Green);
+    assert_eq!(app.footer(100).spans[0].style.fg, Some(Color::Green));
 }
 
 #[test]
@@ -2892,12 +3187,6 @@ fn details_scroll_preserves_all_sanitized_unicode_values_without_changing_exact_
     app.handle_event(key(KeyCode::Char('w')));
     let mut terminal = terminal(80, 8);
     let text = overlay_text(&mut app, &mut terminal);
-    let compact = |value: &str| {
-        value
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect::<String>()
-    };
     for (label, value) in [
         ("Agent", expected.name.as_str()),
         ("Session", expected.location.session.as_ref()),
@@ -2911,7 +3200,7 @@ fn details_scroll_preserves_all_sanitized_unicode_values_without_changing_exact_
         ("Tab ID", expected.target.window.as_str()),
         ("Pane ID", expected.target.block.as_str()),
     ] {
-        let sanitized = display_text(&format!("{label}: {value}"));
+        let sanitized = display_text(&format!("{label} {value}"));
         assert!(
             compact(&text).contains(&compact(&sanitized)),
             "missing full {label}"
@@ -2948,12 +3237,12 @@ fn quit_keys_work_while_offline_or_navigating_and_releases_are_ignored() {
     };
     for event in [
         key(KeyCode::Char('q')),
-        key(KeyCode::Esc),
         Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
         Event::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL)),
     ] {
         assert!(matches!(app.handle_event(event), Some(Action::Quit)));
     }
+    assert!(app.handle_event(key(KeyCode::Esc)).is_none());
     assert!(app.handle_event(key(KeyCode::Char('c'))).is_none());
     assert!(
         app.handle_event(Event::Key(KeyEvent::new_with_kind(
@@ -2962,5 +3251,201 @@ fn quit_keys_work_while_offline_or_navigating_and_releases_are_ignored() {
             KeyEventKind::Release,
         )))
         .is_none()
+    );
+}
+
+#[test]
+fn page_and_edge_keys_move_the_selection_by_viewport_rows() {
+    let mut app = many(30);
+    let mut terminal = terminal(80, 12);
+    render(&mut app, &mut terminal);
+    let page = usize::from(app.viewport.height);
+    assert_eq!(page, 7);
+    app.handle_event(key(KeyCode::PageDown));
+    assert_eq!(app.selected_index(), Some(page));
+    render(&mut app, &mut terminal);
+    assert!(
+        app.hits
+            .iter()
+            .any(|hit| hit.entry.id == entry(page, Status::Working).id)
+    );
+    app.handle_event(key(KeyCode::End));
+    assert_eq!(app.selected_index(), Some(29));
+    app.handle_event(key(KeyCode::PageDown));
+    assert_eq!(app.selected_index(), Some(29));
+    app.handle_event(key(KeyCode::PageUp));
+    assert_eq!(app.selected_index(), Some(29 - page));
+    app.handle_event(key(KeyCode::Home));
+    assert_eq!(app.selected_index(), Some(0));
+    app.handle_event(key(KeyCode::PageUp));
+    assert_eq!(app.selected_index(), Some(0));
+    assert!(!app.navigating);
+    // Paging counts header rows and keeps a collapsed group's retained member.
+    let mut grouped = grouped_app(grouping_entries(), GroupBy::Agent);
+    grouped.select_index(5);
+    let retained = grouped.selected.clone();
+    grouped.handle_event(key(KeyCode::Left));
+    grouped.handle_event(key(KeyCode::End));
+    assert_eq!(grouped.selected, retained);
+    grouped.handle_event(key(KeyCode::Home));
+    assert_eq!(grouped.selected_row(), Some(1));
+}
+
+#[test]
+fn overflowing_lists_draw_a_scrollbar_in_the_reserved_column() {
+    let mut app = many(30);
+    let mut terminal = terminal(80, 12);
+    render(&mut app, &mut terminal);
+    let body = app.viewport;
+    let column = body.right() - 1;
+    let symbols = |terminal: &Terminal<TestBackend>| -> String {
+        (body.y..body.bottom())
+            .map(|y| terminal.backend().buffer()[(column, y)].symbol().to_owned())
+            .collect()
+    };
+    assert_eq!(symbols(&terminal), "┃┃│││││");
+    app.handle_event(key(KeyCode::End));
+    render(&mut app, &mut terminal);
+    assert_eq!(symbols(&terminal), "│││││┃┃");
+    // Columns never use the reserved cell, so folding or filtering cannot shift them.
+    for hit in &app.hits {
+        assert!(
+            app_columns(&app, hit.area)
+                .areas
+                .iter()
+                .all(|area| area.right() <= column)
+        );
+    }
+    // A list that fits has no scrollbar.
+    let mut short = many(3);
+    render(&mut short, &mut terminal);
+    assert!(
+        (body.y..body.bottom()).all(|y| terminal.backend().buffer()[(column, y)].symbol() == " ")
+    );
+}
+
+#[test]
+fn group_headers_are_outdented_and_summarize_only_collapsed_or_mixed_groups() {
+    let mut entries: Vec<_> = (0..4).map(|index| entry(index, Status::Working)).collect();
+    entries[2].id.agent = "codex".into();
+    entries[3].id.agent = "codex".into();
+    entries[3].status = Status::Blocked;
+    let mut app = grouped_app(entries, GroupBy::Agent);
+    let mut terminal = terminal(100, 12);
+    let rows = render(&mut app, &mut terminal);
+    let header = |app: &App, rows: &[String], agent: &str| {
+        let key = GroupKey::Agent(agent.into());
+        let hit = app.group_hits.iter().find(|hit| hit.key == key).unwrap();
+        rows[usize::from(hit.area.y)].trim_end().to_owned()
+    };
+    // Headers start one column left of agent rows, so groups read as a hierarchy.
+    assert_eq!(header(&app, &rows, "codex"), "▾ codex (2)  !1 ●1");
+    assert_eq!(header(&app, &rows, "pi"), "▾ pi (2)");
+    for hit in &app.hits {
+        assert!(
+            rows[usize::from(hit.area.y)].starts_with("  ")
+                || rows[usize::from(hit.area.y)].starts_with("> ")
+        );
+    }
+    // Collapsing hides members, so even a single-status group shows its summary.
+    let pi = app
+        .snapshot
+        .entries
+        .iter()
+        .position(|entry| entry.id.agent == "pi")
+        .unwrap();
+    app.select_index(pi);
+    app.handle_event(key(KeyCode::Left));
+    let rows = render(&mut app, &mut terminal);
+    assert_eq!(header(&app, &rows, "pi"), "▸ pi (2)  ●2");
+    let hit = app
+        .group_hits
+        .iter()
+        .find(|hit| hit.key == GroupKey::Agent("pi".into()))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(hit.area.x, hit.area.y)].bg, Color::DarkGray);
+    let summary_x = hit.area.x + Line::raw("▸ pi (2)  ").width() as u16;
+    assert_eq!(buffer[(summary_x, hit.area.y)].fg, Color::White);
+    // Status grouping never repeats the status in a summary.
+    let mut status = grouped_app(grouping_entries(), GroupBy::Status);
+    for hit in status.current_groups() {
+        status.collapsed.insert(hit.key);
+    }
+    let rows = render(&mut status, &mut terminal);
+    for hit in &status.group_hits {
+        assert!(rows[usize::from(hit.area.y)].trim_end().ends_with(')'));
+    }
+}
+
+#[test]
+fn title_shows_counts_grouping_and_filter_and_drops_status_counts_first() {
+    let mut app = grouped_app(grouping_entries(), GroupBy::Session);
+    let summary = Line::from(status_summary(
+        app.snapshot.entries.iter().map(|entry| entry.status),
+        false,
+    ))
+    .to_string();
+    // Status counts sit beside the agent count instead of at the far right.
+    let rows = render(&mut app, &mut terminal(100, 12));
+    assert_eq!(
+        rows[0].trim_end(),
+        format!("brachio · 6 agents · {summary} · Group: Session")
+    );
+    let rows = render(&mut app, &mut terminal(40, 12));
+    assert_eq!(rows[0].trim_end(), "brachio · 6 agents · Group: Session");
+    apply_filter(&mut app, "agent:pi");
+    let rows = render(&mut app, &mut terminal(100, 12));
+    assert_eq!(
+        rows[0].trim_end(),
+        "brachio · 2/6 agents · !1 ○1 · Group: Session · Filter: agent:pi"
+    );
+    // When the line is short, the filter outranks the grouping mode.
+    let rows = render(&mut app, &mut terminal(40, 12));
+    assert_eq!(
+        rows[0].trim_end(),
+        "brachio · 2/6 agents · Filter: agent:pi"
+    );
+    let rows = render(&mut app, &mut terminal(34, 12));
+    assert_eq!(rows[0].trim_end(), "brachio · 2/6 agents · Filter: ag…");
+    let rows = render(&mut app, &mut terminal(30, 12));
+    assert_eq!(rows[0].trim_end(), "brachio · 2/6 agents");
+    // While editing, the filter line shows the query instead of the title.
+    app.handle_event(key(KeyCode::Char('/')));
+    let rows = render(&mut app, &mut terminal(100, 12));
+    assert!(!rows[0].contains("Filter:"));
+}
+
+#[test]
+fn clipped_directory_headings_use_cwd() {
+    let mut app = many(3);
+    let mut terminal = terminal(34, 10);
+    let rows = render(&mut app, &mut terminal);
+    let layout = app_columns(&app, app.hits[0].area);
+    assert!(
+        layout.areas[3].width < 17 && layout.areas[3].width >= 3,
+        "{layout:?}"
+    );
+    assert!(rows[1].contains("CWD"));
+    assert!(!rows[1].contains("Working direc"));
+    assert_independent_fields(&app, &terminal);
+}
+
+#[test]
+fn scrollbar_cells_are_not_click_targets() {
+    let mut app = many(30);
+    let mut terminal = terminal(80, 12);
+    render(&mut app, &mut terminal);
+    let selected = app.selected.clone();
+    let row = app.hits[3].area;
+    let expected = app.hits[3].entry.clone();
+    assert_eq!(app.scrollbar, Some(row.right() - 1));
+    assert!(app.handle_event(click(row.right() - 1, row.y)).is_none());
+    assert_eq!(app.selected, selected);
+    assert!(!app.navigating);
+    render(&mut app, &mut terminal);
+    assert_eq!(
+        navigation(app.handle_event(click(row.right() - 2, row.y))),
+        expected
     );
 }
