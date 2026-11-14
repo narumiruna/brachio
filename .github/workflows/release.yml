@@ -2,7 +2,7 @@ name: Release
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened]
   push:
     branches: [main]
   workflow_dispatch:
@@ -39,7 +39,6 @@ jobs:
         shell: bash
         env:
           BASE_BRANCH: ${{ github.base_ref }}
-          SKIP_RELEASE: ${{ contains(github.event.pull_request.labels.*.name, 'skip-changenote') }}
         run: bash .github/scripts/check-pr-notes.sh
 
   release:

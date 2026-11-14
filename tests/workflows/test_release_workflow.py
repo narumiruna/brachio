@@ -33,15 +33,15 @@ class ReleaseWorkflow(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.step("notes", "Check PR notes")["env"], {
             "BASE_BRANCH": "${{ github.base_ref }}",
-            "SKIP_RELEASE": "${{ contains(github.event.pull_request.labels.*.name, 'skip-changenote') }}",
         })
+        self.assertNotIn("labels", json.dumps(self.jobs["notes"]))
 
     def test_event_routing_and_manual_default(self):
         events = self.workflow["on"]
         self.assertEqual(set(events), {"pull_request", "push", "workflow_dispatch"})
         self.assertEqual(events["push"], {"branches": ["main"]})
         self.assertEqual(events["pull_request"]["types"],
-                         ["opened", "synchronize", "reopened", "labeled", "unlabeled"])
+                         ["opened", "synchronize", "reopened"])
         operation = events["workflow_dispatch"]["inputs"]["operation"]
         self.assertEqual(operation["default"], "manage-pr")
         self.assertEqual(operation["options"], ["manage-pr", "retry-publication"])
@@ -129,22 +129,73 @@ class ReleaseWorkflow(unittest.TestCase):
                 else:
                     self.assertIn("Set the PAT_TOKEN repository secret", result.stdout)
 
-    def run_note_check(self, base, skip="false"):
+    def run_note_check(self, base="main", changes=None, event=None, ref="main",
+                       cli_exit=0, real_cli=False):
         step = self.step("notes", "Check PR notes")
         self.assertNotIn("${{", step["run"])
         with tempfile.TemporaryDirectory() as temporary:
             top = Path(temporary)
+            repo = top / "repo"
+            repo.mkdir()
+            env = dict(os.environ, GIT_AUTHOR_NAME="Workflow fixture",
+                       GIT_AUTHOR_EMAIL="fixture@example.invalid",
+                       GIT_COMMITTER_NAME="Workflow fixture",
+                       GIT_COMMITTER_EMAIL="fixture@example.invalid",
+                       GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+
+            def git(*args):
+                subprocess.run(["git", *args], cwd=repo, env=env, check=True,
+                               text=True, capture_output=True, timeout=10)
+
+            files = {
+                "src/main.rs": "fn main() {}\n",
+                "Cargo.toml": '[package]\nname = "brachio"\nversion = "0.1.0"\n',
+                "Cargo.lock": 'version = 4\n[[package]]\nname = "brachio"\nversion = "0.1.0"\n',
+                "CHANGELOG.md": "# Changelog\n",
+                ".changenote/config.json": (ROOT / ".changenote/config.json").read_text(),
+                ".changenote/entry.md": "---\nbrachio: patch\n---\n\nFix an issue.\n",
+                ".changenote/releases.json": "[]\n",
+            }
+            for path, content in files.items():
+                target = repo / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content)
+            git("init", "-q", "-b", "main")
+            git("add", "--", *files)
+            git("commit", "-q", "-m", "fixture: base")
+            git("update-ref", "refs/remotes/origin/" + ref, "HEAD")
+            if changes is None:
+                changes = {"src/main.rs": "fn main() { println!(\"changed\"); }\n"}
+            for path, content in changes.items():
+                target = repo / path
+                if content is None:
+                    target.unlink()
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(content)
+            if changes:
+                git("add", "--", *changes)
+                git("commit", "-q", "-m", "fixture: change")
             calls = top / "calls"
             uvx = top / "uvx"
-            uvx.write_text('#!/usr/bin/env bash\nprintf "%s\\0" "$@" > "$CALLS"\n')
+            uvx.write_text('#!/usr/bin/env bash\nprintf "%s\\0" "$@" > "$CALLS"\nexit "$CLI_EXIT"\n')
             uvx.chmod(0o755)
-            env = dict(os.environ, PATH=str(top) + os.pathsep + os.environ["PATH"],
-                       CALLS=str(calls), BASE_BRANCH=base, SKIP_RELEASE=skip)
+            if not real_cli:
+                env["PATH"] = str(top) + os.pathsep + os.environ["PATH"]
+            # The legacy variable must not control automatic classification.
+            env.update(CALLS=str(calls), BASE_BRANCH=base, CLI_EXIT=str(cli_exit),
+                       SKIP_RELEASE="true")
+            env.pop("GITHUB_EVENT_PATH", None)
+            env.pop("GITHUB_REPOSITORY", None)
+            if event is not None:
+                event_path = top / "event.json"
+                event_path.write_text(json.dumps(event))
+                env.update(GITHUB_EVENT_PATH=str(event_path), GITHUB_REPOSITORY="narumiruna/brachio")
             script = ROOT / ".github/scripts/check-pr-notes.sh"
-            result = subprocess.run(["bash", str(script)], cwd=top, env=env,
-                                    text=True, capture_output=True, timeout=10)
+            result = subprocess.run(["bash", str(script)], cwd=repo, env=env,
+                                    text=True, capture_output=True, timeout=30)
             args = calls.read_bytes().decode().split("\0")[:-1] if calls.exists() else []
-            self.assertFalse((top / "injected").exists())
+            self.assertFalse((repo / "injected").exists())
             return result, args
 
     def test_pr_arguments_keep_package_coverage(self):
@@ -152,16 +203,55 @@ class ReleaseWorkflow(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(args, ["changenote==0.9.2", "check", "--since=refs/remotes/origin/main", "--coverage=package"])
 
-    def test_pr_exemption_keeps_coverage_and_reason(self):
-        result, args = self.run_note_check("main", "true")
+    def test_non_release_paths_automatically_exempt_missing_entries(self):
+        for path in (".github/workflows/release.yml", ".github/scripts/helper.sh",
+                     "docs/guide.md", "tests/test.py", "README.md", "AGENTS.md",
+                     ".changenote/README.md", "docs/line\nname with spaces.md"):
+            with self.subTest(path=path):
+                result, args = self.run_note_check(changes={path: "updated\n"})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("--coverage=package", args)
+                self.assertEqual(args[-3:-1], ["--skip-release", "--reason"])
+                self.assertTrue(args[-1].startswith("Only documentation"))
+
+    def test_source_manifests_and_unknown_paths_keep_normal_coverage(self):
+        for path in ("src/main.rs", "Cargo.toml", "Cargo.lock", "pyproject.toml",
+                     "uv.lock", "unknown/path", "runtime\nfile.rs"):
+            with self.subTest(path=path):
+                result, args = self.run_note_check(changes={path: "updated\n"})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("--skip-release", args)
+
+    def test_mixed_source_and_ci_changes_keep_normal_coverage(self):
+        result, args = self.run_note_check(changes={"src/main.rs": "updated\n",
+                                                    ".github/workflows/release.yml": "updated\n"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("--coverage=package", args)
-        self.assertEqual(args[-3:], ["--skip-release", "--reason",
-                                    "Maintainer approved a note exemption; see the PR description."])
+        self.assertNotIn("--skip-release", args)
+
+    def test_source_renamed_into_docs_keeps_normal_coverage(self):
+        result, args = self.run_note_check(changes={"src/main.rs": None,
+                                                    "docs/main.rs": "fn main() {}\n"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--skip-release", args)
+
+    def test_empty_diff_uses_normal_coverage(self):
+        result, args = self.run_note_check(changes={})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--skip-release", args)
+
+    def test_cli_failure_is_not_hidden_by_automatic_exemption(self):
+        result, args = self.run_note_check(changes={"docs/guide.md": "updated\n"}, cli_exit=42)
+        self.assertEqual(result.returncode, 42, result.stderr)
+        self.assertIn("--skip-release", args)
+
+    def test_unknown_base_fails_before_cli(self):
+        result, args = self.run_note_check(base="missing")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(args, [])
 
     def test_pr_branch_is_data_not_shell_syntax(self):
-        base = "topic/odd; $(touch injected)"
-        result, args = self.run_note_check(base)
+        base = "topic/odd;$(touch${IFS}injected)"
+        result, args = self.run_note_check(base=base, ref=base)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--since=refs/remotes/origin/" + base, args)
 
@@ -170,6 +260,78 @@ class ReleaseWorkflow(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("PR base branch is required", result.stderr)
         self.assertEqual(args, [])
+
+    def release_changes(self):
+        return {
+            ".changenote/releases.json": json.dumps([{
+                "package": "brachio", "old_version": "0.1.0", "version": "0.1.1",
+                "bump": "patch", "tag": "v0.1.1",
+            }]),
+            ".changenote/entry.md": None,
+            "Cargo.toml": '[package]\nname = "brachio"\nversion = "0.1.1"\n',
+            "Cargo.lock": 'version = 4\n[[package]]\nname = "brachio"\nversion = "0.1.1"\n',
+            "CHANGELOG.md": "# Changelog\n\n## 0.1.1\n\nFix an issue.\n",
+        }
+
+    def managed_release_event(self):
+        return {"pull_request": {
+            "base": {"ref": "main", "repo": {"full_name": "narumiruna/brachio"}},
+            "head": {"ref": "narumi/chore/changenote-release-main",
+                     "repo": {"full_name": "narumiruna/brachio"}},
+            "body": "<!-- changenote-release-pr -->\n\nRelease details.",
+        }}
+
+    def test_managed_release_outputs_automatically_exempt_missing_entries(self):
+        result, args = self.run_note_check(changes=self.release_changes(),
+                                          event=self.managed_release_event())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--skip-release", args)
+        self.assertTrue(args[-1].startswith("Managed Release PR"))
+
+    def test_release_outputs_without_managed_event_keep_normal_coverage(self):
+        result, args = self.run_note_check(changes=self.release_changes())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--skip-release", args)
+
+    def test_unrecognized_release_prs_keep_normal_coverage(self):
+        for field in ("fork", "branch", "body", "base", "base_repo"):
+            with self.subTest(field=field):
+                event = self.managed_release_event()
+                pr = event["pull_request"]
+                if field == "fork":
+                    pr["head"]["repo"]["full_name"] = "other/brachio"
+                elif field == "branch":
+                    pr["head"]["ref"] = "feature"
+                elif field == "body":
+                    pr["body"] = "Unmarked release"
+                elif field == "base":
+                    pr["base"]["ref"] = "other"
+                else:
+                    pr["base"]["repo"]["full_name"] = "other/brachio"
+                result, args = self.run_note_check(changes=self.release_changes(), event=event)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("--skip-release", args)
+
+    def test_managed_release_with_source_changes_keeps_normal_coverage(self):
+        changes = self.release_changes()
+        changes["src/main.rs"] = "updated\n"
+        result, args = self.run_note_check(changes=changes, event=self.managed_release_event())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--skip-release", args)
+
+    def test_managed_release_without_updated_batch_keeps_normal_coverage(self):
+        changes = self.release_changes()
+        del changes[".changenote/releases.json"]
+        result, args = self.run_note_check(changes=changes, event=self.managed_release_event())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--skip-release", args)
+
+    def test_managed_release_with_deleted_batch_keeps_normal_coverage(self):
+        changes = self.release_changes()
+        changes[".changenote/releases.json"] = None
+        result, args = self.run_note_check(changes=changes, event=self.managed_release_event())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--skip-release", args)
 
     def run_wheel_check(self, expected="0.1.0", actual="brachio 0.1.0",
                         version_exit=0, help_exit=0):

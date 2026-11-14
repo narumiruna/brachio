@@ -33,7 +33,7 @@ The `notes` job in the Release workflow runs only on pull requests, with read-on
 
 Manual Release runs skip PR note comparison because `github.base_ref` is unavailable outside PR events. They run the selected release operation instead.
 
-The configured check paths are `src/**`, `Cargo.toml`, `Cargo.lock`, `pyproject.toml`, `uv.lock`, and `.github/workflows/release.yml`. Changes to these paths require a new or updated note for `brachio`. Review release effects outside these paths manually. An unchanged old note does not satisfy a PR check.
+The configured check paths are `src/**`, `Cargo.toml`, `Cargo.lock`, `pyproject.toml`, `uv.lock`, and `.github/workflows/release.yml`. Changes to these paths normally require a new or updated changenote entry for `brachio`, subject to the automatic rules below. Review release effects outside these paths manually. An unchanged old note does not satisfy a PR check.
 
 For a clean, committed local comparison:
 
@@ -43,11 +43,20 @@ changenote check --since origin/main --coverage package
 
 Fetch the base ref before checking if it is unavailable. The configured default base is `origin/main`; CI uses the actual PR base branch. Uncommitted changes are not checked.
 
-A maintainer can apply the `skip-changenote` label when a change in the checked paths needs no new note. Record the reason in the PR description. This includes internal refactors without release impact and generated release PRs that consume existing notes. Adding or removing the label reruns the check. The exemption removes only the missing-note requirement; configuration, version, and pending-note validation still run.
+The script automatically selects the missing-entry policy from the committed changes since the merge base:
+
+- Changes only under `docs/`, `tests/`, or `.github/`, plus `.changenote/*.md`, `.changenote/config.json`, `README.md`, and `AGENTS.md`, automatically waive the missing-entry requirement.
+- A managed Release PR needs no new entry when all these conditions hold:
+  - Its head and base repositories match the current repository, and its base branch matches the comparison branch.
+  - Its head branch is `narumi/chore/changenote-release-<base>`, and its body starts with `<!-- changenote-release-pr -->`.
+  - It changes a regular `.changenote/releases.json` file and changes only that file, `.changenote/*.md`, `Cargo.toml`, `Cargo.lock`, or `CHANGELOG.md`.
+- All other changes use normal package coverage, including source files, manifests, mixed changes, and unknown paths.
+
+The script supplies `--skip-release --reason` automatically for the first two cases. It does not use PR labels or commit messages. Renames include both old and new paths. Configuration, versions, and pending entries are still validated; the release Action remains responsible for batch and generated-tree validation before publication.
 
 ## Local verification
 
-Install Rust stable, Cargo, uv, and Python 3.12. Run from the repository root:
+Install Bash, Git, jq, Rust stable, Cargo, uv, and Python 3.12. Run from the repository root:
 
 ```sh
 bash -n .github/scripts/check-pr-notes.sh
@@ -73,7 +82,7 @@ The Checks workflow runs release-workflow regression tests, plus Rust tests and 
 
 The `.github/workflows/release.yml` workflow contains PR note checks, Release PR management, GitHub publication, validation, wheel builds, and registry uploads. It replaces the separate Changenotes and Publish workflows.
 
-The PR note check uses `.github/scripts/check-pr-notes.sh`, with inputs supplied through environment variables. The token guard stays inline because it runs before checkout. The installed-wheel check stays inline because a retried release can use an older commit without the script. Simple build and publish commands also stay inline.
+The PR note check uses `.github/scripts/check-pr-notes.sh` to inspect the merge-base diff and, for managed releases, the GitHub PR event. The token guard stays inline because it runs before checkout. The installed-wheel check stays inline because a retried release can use an older commit without the script. Simple build and publish commands also stay inline.
 
 The release job uses the pinned `narumiruna/changenote/release` Action. The Action builds and caches a compatible CLI from its own source, not from Brachio. It prepares the Cargo cache before offline version updates. The PR notes job still runs its CLI through `uvx`.
 
@@ -94,7 +103,7 @@ Registry jobs depend on the release job in the same run. The workflow does not l
 Reserve `narumi/chore/changenote-release-main` for the Action. It creates or updates one Release PR from pending notes and never merges it. Before merging that PR:
 
 1. Review the version, consumed notes, changelog, and lockfile changes. Do not edit the generated release tree by hand.
-2. Apply `skip-changenote` and explain in the PR description that this PR consumes existing notes instead of adding a new note.
+2. Confirm that the script recognizes the managed Release PR automatically and that only generated outputs and consumed entries changed.
 3. Wait for the PR checks and complete the registry setup below. Merging the Release PR starts GitHub publication, release validation, wheel builds, and registry uploads in the same run.
 
 ## Registry setup
@@ -174,7 +183,7 @@ To prepare an authorized version change:
 3. Run `changenote version` only with explicit versioning authorization. It updates `Cargo.toml` and `Cargo.lock`, writes `CHANGELOG.md` and `.changenote/releases.json`, and removes consumed notes. Do not edit the generated release tree by hand.
 4. Run `uv lock --offline` separately to refresh Python dependency metadata. The dynamic Python version is not a configured changenote output and need not appear in `uv.lock`. Inspect the diff for unrelated changes.
 5. Run `changenote status` again and confirm that the consumed notes are no longer pending. Run the local verification commands and review the Linux and macOS Checks jobs and the [Rex compatibility limits](rex-compatibility.md#external-handoff).
-6. Commit only the intended release files, including note deletions, the saved batch, changelog, manifests, and changed lockfiles. If using a release PR, have a maintainer apply `skip-changenote` and explain that existing notes were consumed.
+6. Commit only the intended release files, including entry deletions, the saved batch, changelog, manifests, and changed lockfiles. PRs outside the managed Release PR rules use normal package coverage.
 
 After the release commit is merged and the checkout is clean, create local tags only with separate tag authorization:
 
@@ -208,9 +217,9 @@ Disable Release to stop automatic PR updates, GitHub publication, and registry u
 
 ## Verification handoff
 
-A maintainer must configure `PAT_TOKEN`, create and control the `skip-changenote` label, and review required branch checks for the `notes` job in Release. Update the crates.io Trusted Publisher workflow filename to `release.yml` and allow `main` in both registry environments before merging a Release PR.
+A maintainer must configure `PAT_TOKEN` and review required branch checks for the `notes` job in Release. Update the crates.io Trusted Publisher workflow filename to `release.yml` and allow `main` in both registry environments before merging a Release PR.
 
-Verify that a PAT-created Release PR starts Checks and only the notes job in Release. During an authorized release, verify that validation and uploads follow the verified release commit within the same run, with no second tag-triggered run. Local tests do not establish token permissions, GitHub label permissions, branch rules, deployment approvals, hosted Action behavior, or event delivery.
+Verify that a PAT-created Release PR starts Checks and only the notes job in Release. During an authorized release, verify that validation and uploads follow the verified release commit within the same run, with no second tag-triggered run. Local tests do not establish token permissions, branch rules, deployment approvals, hosted Action behavior, or event delivery.
 
 Supply the PAT and registry prerequisites before using automation. Implementation and local verification do not authorize a Release dispatch or a publication.
 
