@@ -60,11 +60,27 @@ jobs:
       - name: Manage release
         uses: changenote/action@992cb488a3c7c8470bdbe904007fc33419b1cb00
         id: release
+        continue-on-error: true
         with:
           github-token: ${{ secrets.PAT_TOKEN }}
           base-branch: main
           push-git-tags: 'true'
           create-github-releases: 'true'
+      - name: Check release result
+        if: steps.release.outcome == 'failure'
+        shell: bash
+        env:
+          RELEASE_READY: ${{ steps.release.outputs.ready }}
+          PUBLICATION_NEEDED: ${{ steps.release.outputs.publication-needed }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.release-commit }}
+        run: |
+          if [[ "$RELEASE_READY" == true && "$PUBLICATION_NEEDED" == true &&
+                "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::warning::Release PR management failed. GitHub publication is complete; registry jobs will continue.'
+          else
+            echo '::error::Changenote did not complete the requested release operation.'
+            exit 1
+          fi
 
   validate:
     needs: release

@@ -88,6 +88,10 @@ The release job uses one `changenote/action` call pinned to a full commit SHA. I
 
 The Action SHA and configuration schema remain pinned to reviewed snapshots; neither pins the installed CLI. The PR notes job also uses an unpinned CLI through `uvx`. Separate jobs and runs can resolve different stable CLI versions.
 
+The unpinned CLI is an executable in a job with repository-write credentials. A future upstream release can change privileged release behavior without a workflow change. The Action SHA does not remove this supply-chain risk.
+
+The Action can fail after verified GitHub publication if PR management fails. The result check accepts this case only when `ready` and `publication-needed` are `true` and `release-commit` is a lowercase 40-hex commit. It reports the PR management failure as a warning. All other Action failures still fail the release job.
+
 A repository maintainer must add an Actions secret named `PAT_TOKEN` before enabling Release runs:
 
 1. Use a fine-grained personal access token with access to this repository and `Contents: read and write` and `Pull requests: read and write` permissions.
@@ -205,6 +209,8 @@ Feature-branch pushes and ordinary PRs do not publish. Tag pushes alone do not s
 The two registry uploads are not a transaction. One can succeed while the other fails.
 
 For a failed job, use GitHub Actions **Re-run failed jobs** on the same Release run. This retains successful release-job outputs and wheel artifacts and does not repeat a successful registry job.
+
+If PR management fails after verified GitHub publication, the result check keeps the release job successful and preserves its verified outputs. Failed validation or registry jobs can then be retried without running the release job again. Use manual dispatch later to retry PR management.
 
 Do not use manual dispatch or **Re-run all jobs** to retry registry publication. The root Action can find GitHub publication already complete and skip the downstream jobs. If the original successful release-job outputs or wheel artifacts are unavailable, stop and arrange a separately reviewed recovery procedure for the exact release commit. Hosted writes still require explicit authorization.
 

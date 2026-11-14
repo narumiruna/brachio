@@ -66,7 +66,7 @@ class ReleaseWorkflow(unittest.TestCase):
         steps = self.jobs["release"]["steps"]
         self.assertEqual(steps[1]["with"]["ref"], "${{ github.sha }}")
         self.assertEqual(steps[1]["with"]["fetch-depth"], "0")
-        self.assertEqual(len(steps), 3)
+        self.assertEqual(len(steps), 4)
         action = self.step("release", "Manage release")
         self.assertEqual(action["uses"],
                          "changenote/action@992cb488a3c7c8470bdbe904007fc33419b1cb00")
@@ -78,6 +78,49 @@ class ReleaseWorkflow(unittest.TestCase):
             "create-github-releases": "true",
         })
         self.assertNotIn("if", action)
+        self.assertEqual(action["continue-on-error"], "true")
+
+    def test_release_result_checks_only_failed_actions(self):
+        step = self.step("release", "Check release result")
+        self.assertEqual(step["if"], "steps.release.outcome == 'failure'")
+        self.assertEqual(step["shell"], "bash")
+        self.assertEqual(step["env"], {
+            "RELEASE_READY": "${{ steps.release.outputs.ready }}",
+            "PUBLICATION_NEEDED": "${{ steps.release.outputs.publication-needed }}",
+            "RELEASE_COMMIT": "${{ steps.release.outputs.release-commit }}",
+        })
+
+    def run_release_result(self, ready="true", needed="true", commit="a" * 40):
+        env = dict(os.environ, RELEASE_READY=ready, PUBLICATION_NEEDED=needed,
+                   RELEASE_COMMIT=commit)
+        script = self.step("release", "Check release result")["run"]
+        self.assertNotIn("${{", script)
+        return subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script],
+                              env=env, text=True, capture_output=True, timeout=10)
+
+    def test_completed_publication_keeps_pr_failure_from_blocking_registry_retries(self):
+        result = self.run_release_result()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("::warning::Release PR management failed.", result.stdout)
+        self.assertIn("registry jobs will continue", result.stdout)
+
+    def test_other_action_failures_still_fail_the_release_job(self):
+        cases = [
+            {"ready": "false"},
+            {"ready": ""},
+            {"needed": "false"},
+            {"needed": ""},
+            {"commit": ""},
+            {"commit": "a" * 39},
+            {"commit": "A" * 40},
+            {"commit": "a" * 40 + "\ninjected"},
+        ]
+        for values in cases:
+            with self.subTest(values=values):
+                result = self.run_release_result(**values)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("::error::Changenote did not complete", result.stdout)
+                self.assertNotIn("::warning::", result.stdout)
 
     def test_pr_checks_use_unpinned_cli(self):
         self.assertEqual(self.step("notes", "Show pending releases")["run"],
