@@ -36,15 +36,13 @@ class ReleaseWorkflow(unittest.TestCase):
         })
         self.assertNotIn("labels", json.dumps(self.jobs["notes"]))
 
-    def test_event_routing_and_manual_default(self):
+    def test_event_routing_and_manual_pr_management(self):
         events = self.workflow["on"]
         self.assertEqual(set(events), {"pull_request", "push", "workflow_dispatch"})
         self.assertEqual(events["push"], {"branches": ["main"]})
         self.assertEqual(events["pull_request"]["types"],
                          ["opened", "synchronize", "reopened"])
-        operation = events["workflow_dispatch"]["inputs"]["operation"]
-        self.assertEqual(operation["default"], "manage-pr")
-        self.assertEqual(operation["options"], ["manage-pr", "retry-publication"])
+        self.assertEqual(events["workflow_dispatch"], "")
         self.assertEqual(self.jobs["notes"]["if"], "github.event_name == 'pull_request'")
         self.assertEqual(self.jobs["release"]["if"],
                          "github.ref == 'refs/heads/main' && github.event_name != 'pull_request'")
@@ -63,22 +61,82 @@ class ReleaseWorkflow(unittest.TestCase):
                 for step in job["steps"]:
                     if step.get("uses", "").startswith("actions/checkout@"):
                         self.assertEqual(step["with"]["persist-credentials"], "false")
-        action = self.jobs["release"]["steps"][-1]
+
+    def test_release_uses_one_root_action(self):
+        steps = self.jobs["release"]["steps"]
+        self.assertEqual(steps[1]["with"]["ref"], "${{ github.sha }}")
+        self.assertEqual(steps[1]["with"]["fetch-depth"], "0")
+        self.assertEqual(len(steps), 4)
+        action = self.step("release", "Manage release")
         self.assertEqual(action["uses"],
-                         "changenote/changenote/release@f4423760122463bf03a8d161c6f0bc4173afb6e0")
+                         "changenote/action@992cb488a3c7c8470bdbe904007fc33419b1cb00")
+        self.assertEqual(action["id"], "release")
         self.assertEqual(action["with"], {
-            "github-token": "${{ secrets.PAT_TOKEN }}", "base-branch": "main",
-            "operation": "${{ inputs.operation || 'auto' }}",
+            "github-token": "${{ secrets.PAT_TOKEN }}",
+            "base-branch": "main",
+            "push-git-tags": "true",
+            "create-github-releases": "true",
         })
+        self.assertNotIn("if", action)
+        self.assertEqual(action["continue-on-error"], "true")
+
+    def test_release_result_checks_only_failed_actions(self):
+        step = self.step("release", "Check release result")
+        self.assertEqual(step["if"], "steps.release.outcome == 'failure'")
+        self.assertEqual(step["shell"], "bash")
+        self.assertEqual(step["env"], {
+            "RELEASE_READY": "${{ steps.release.outputs.ready }}",
+            "PUBLICATION_NEEDED": "${{ steps.release.outputs.publication-needed }}",
+            "RELEASE_COMMIT": "${{ steps.release.outputs.release-commit }}",
+        })
+
+    def run_release_result(self, ready="true", needed="true", commit="a" * 40):
+        env = dict(os.environ, RELEASE_READY=ready, PUBLICATION_NEEDED=needed,
+                   RELEASE_COMMIT=commit)
+        script = self.step("release", "Check release result")["run"]
+        self.assertNotIn("${{", script)
+        return subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script],
+                              env=env, text=True, capture_output=True, timeout=10)
+
+    def test_completed_publication_keeps_pr_failure_from_blocking_registry_retries(self):
+        result = self.run_release_result()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("::warning::Release PR management failed.", result.stdout)
+        self.assertIn("registry jobs will continue", result.stdout)
+
+    def test_other_action_failures_still_fail_the_release_job(self):
+        cases = [
+            {"ready": "false"},
+            {"ready": ""},
+            {"needed": "false"},
+            {"needed": ""},
+            {"commit": ""},
+            {"commit": "a" * 39},
+            {"commit": "A" * 40},
+            {"commit": "a" * 40 + "\ninjected"},
+        ]
+        for values in cases:
+            with self.subTest(values=values):
+                result = self.run_release_result(**values)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("::error::Changenote did not complete", result.stdout)
+                self.assertNotIn("::warning::", result.stdout)
+
+    def test_pr_checks_use_unpinned_cli(self):
+        self.assertEqual(self.step("notes", "Show pending releases")["run"],
+                         "uvx changenote status --include-note-paths")
+
+    def test_root_outputs_preserve_publication_state(self):
         self.assertEqual(self.jobs["release"]["outputs"], {
+            "publication-needed": "${{ steps.release.outputs.publication-needed }}",
             "release-commit": "${{ steps.release.outputs.release-commit }}",
             "version": "${{ steps.release.outputs.release-commit != '' && fromJSON(steps.release.outputs.releases)[0].version || '' }}",
         })
-        self.assertEqual(action["id"], "release")
 
     def test_registry_jobs_use_verified_commit_and_build_gates(self):
         self.assertEqual(self.jobs["validate"]["needs"], "release")
-        self.assertEqual(self.jobs["validate"]["if"], "needs.release.outputs.release-commit != ''")
+        self.assertEqual(self.jobs["validate"]["if"],
+                         "needs.release.outputs.publication-needed == 'true' && needs.release.outputs.release-commit != ''")
         self.assertEqual(self.jobs["wheels"]["needs"], ["release", "validate"])
         self.assertEqual(self.jobs["crates-io"]["needs"], ["release", "validate", "wheels"])
         self.assertEqual(self.jobs["pypi"]["needs"], ["validate", "wheels"])
@@ -201,7 +259,7 @@ class ReleaseWorkflow(unittest.TestCase):
     def test_pr_arguments_keep_package_coverage(self):
         result, args = self.run_note_check("main")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(args, ["changenote==0.9.2", "check", "--since=refs/remotes/origin/main", "--coverage=package"])
+        self.assertEqual(args, ["changenote", "check", "--since=refs/remotes/origin/main", "--coverage=package"])
 
     def test_non_release_paths_automatically_exempt_missing_entries(self):
         for path in (".github/workflows/release.yml", ".github/scripts/helper.sh",

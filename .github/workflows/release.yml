@@ -6,12 +6,6 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      operation:
-        description: Manage the release PR or retry publication
-        type: choice
-        default: manage-pr
-        options: [manage-pr, retry-publication]
 
 permissions:
   contents: read
@@ -34,7 +28,7 @@ jobs:
           python-version: "3.12"
           enable-cache: false
       - name: Show pending releases
-        run: uvx changenote==0.9.2 status --include-note-paths
+        run: uvx changenote status --include-note-paths
       - name: Check PR notes
         shell: bash
         env:
@@ -45,6 +39,7 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     outputs:
+      publication-needed: ${{ steps.release.outputs.publication-needed }}
       release-commit: ${{ steps.release.outputs.release-commit }}
       version: ${{ steps.release.outputs.release-commit != '' && fromJSON(steps.release.outputs.releases)[0].version || '' }}
     steps:
@@ -59,19 +54,37 @@ jobs:
           fi
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: changenote/changenote/release@f4423760122463bf03a8d161c6f0bc4173afb6e0
+      - name: Manage release
+        uses: changenote/action@992cb488a3c7c8470bdbe904007fc33419b1cb00
         id: release
+        continue-on-error: true
         with:
           github-token: ${{ secrets.PAT_TOKEN }}
           base-branch: main
-          operation: ${{ inputs.operation || 'auto' }}
+          push-git-tags: 'true'
+          create-github-releases: 'true'
+      - name: Check release result
+        if: steps.release.outcome == 'failure'
+        shell: bash
+        env:
+          RELEASE_READY: ${{ steps.release.outputs.ready }}
+          PUBLICATION_NEEDED: ${{ steps.release.outputs.publication-needed }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.release-commit }}
+        run: |
+          if [[ "$RELEASE_READY" == true && "$PUBLICATION_NEEDED" == true &&
+                "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::warning::Release PR management failed. GitHub publication is complete; registry jobs will continue.'
+          else
+            echo '::error::Changenote did not complete the requested release operation.'
+            exit 1
+          fi
 
   validate:
     needs: release
-    if: needs.release.outputs.release-commit != ''
+    if: needs.release.outputs.publication-needed == 'true' && needs.release.outputs.release-commit != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

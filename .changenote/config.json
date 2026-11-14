@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/changenote/changenote/f4423760122463bf03a8d161c6f0bc4173afb6e0/schema.json",
+  "$schema": "https://raw.githubusercontent.com/changenote/changenote/40f4d2b49b942bfec25472f38a29fa41ff47db70/schema.json",
   "base_branch": "origin/main",
   "changed_file_patterns": [
     "src/**",

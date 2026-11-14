@@ -40,4 +40,4 @@ elif [[ "$release_outputs_only" == true && "$batch_changed" == true &&
   ' "$GITHUB_EVENT_PATH" > /dev/null; then
   args+=(--skip-release --reason "Managed Release PR updates only release outputs and consumes existing changenote entries.")
 fi
-uvx changenote==0.9.2 "${args[@]}"
+uvx changenote "${args[@]}"
