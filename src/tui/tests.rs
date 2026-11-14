@@ -275,7 +275,7 @@ fn grouping_entries() -> Vec<Entry> {
         ("codex", Status::Error, Some("/work/a"), "Alpha", "alpha-1"),
         ("pi", Status::Blocked, Some("/work/b"), "Alpha", "alpha-2"),
         ("claude-code", Status::Done, Some("/work/a"), "Beta", "beta"),
-        ("codex", Status::Unknown, None, "Alpha", "alpha-2"),
+        ("codex", Status::Idle, None, "Alpha", "alpha-2"),
     ]
     .into_iter()
     .enumerate()
@@ -348,7 +348,7 @@ fn headers_precede_each_group_and_have_separate_toggle_only_targets() {
     for (mode, separators) in [
         (GroupBy::None, vec![]),
         (GroupBy::Agent, vec![0, 3, 6]),
-        (GroupBy::Status, vec![0, 2, 4, 6, 8, 10]),
+        (GroupBy::Status, vec![0, 2, 4, 6, 8]),
         (GroupBy::Cwd, vec![0, 3, 6]),
         (GroupBy::Session, vec![0, 3, 6]),
     ] {
@@ -495,10 +495,10 @@ fn header_only_view_has_no_agent_target_and_click_only_toggles() {
 fn every_grouping_mode_has_deterministic_groups_and_status_priority_within_groups() {
     let entries = grouping_entries();
     for (mode, order) in [
-        (GroupBy::None, [3, 2, 4, 5, 1, 0]),
+        (GroupBy::None, [3, 2, 4, 1, 5, 0]),
         (GroupBy::Agent, [4, 1, 2, 5, 3, 0]),
-        (GroupBy::Status, [3, 2, 4, 5, 1, 0]),
-        (GroupBy::Cwd, [2, 4, 3, 0, 5, 1]),
+        (GroupBy::Status, [3, 2, 4, 1, 5, 0]),
+        (GroupBy::Cwd, [2, 4, 3, 0, 1, 5]),
         (GroupBy::Session, [2, 1, 3, 5, 4, 0]),
     ] {
         let expected: Vec<_> = order.map(|index| entries[index].clone()).into();
@@ -564,8 +564,8 @@ fn tab_and_backtab_jump_to_group_starts_and_wrap_in_every_mode() {
     let entries = grouping_entries();
     for (mode, starts) in [
         (GroupBy::Agent, vec![4, 2, 3]),
-        (GroupBy::Status, vec![3, 2, 4, 5, 1, 0]),
-        (GroupBy::Cwd, vec![2, 3, 5]),
+        (GroupBy::Status, vec![3, 2, 4, 1, 5]),
+        (GroupBy::Cwd, vec![2, 3, 1]),
         (GroupBy::Session, vec![2, 3, 4]),
     ] {
         let mut app = grouped_app(entries.clone(), mode);
@@ -723,7 +723,7 @@ fn mode_changes_do_not_restore_a_removed_selection_but_group_jumps_can_select() 
         let expected = if code == KeyCode::Tab {
             0
         } else {
-            app.snapshot.entries.len() - 1
+            app.current_groups().last().unwrap().entries[0]
         };
         assert_eq!(app.selected_index(), Some(expected));
         assert!(!app.selection_missing);
@@ -832,7 +832,6 @@ fn rows_are_grouped_by_model_priority_with_name_status_and_location() {
     let statuses = [
         Status::Idle,
         Status::Working,
-        Status::Unknown,
         Status::Done,
         Status::Error,
         Status::Blocked,
@@ -856,7 +855,7 @@ fn rows_are_grouped_by_model_priority_with_name_status_and_location() {
         }
     }
     assert_eq!(app.snapshot.entries[0].status, Status::Blocked);
-    assert_eq!(app.snapshot.entries[5].status, Status::Idle);
+    assert_eq!(app.snapshot.entries[4].status, Status::Idle);
     assert_eq!(app.selected, Some(app.snapshot.entries[0].id.clone()));
 }
 
@@ -2089,7 +2088,7 @@ fn filter_fields_use_case_insensitive_and_matching_and_unknown_prefixes_stay_lit
     first.location.session = "Production".into();
     first.location.tab = "branch:Feature".into();
     first.location.pane = "Review Pane".into();
-    let mut app = app(vec![first.clone(), entry(1, Status::Unknown)]);
+    let mut app = app(vec![first.clone(), entry(1, Status::Idle)]);
     for query in [
         "agent:ÉCHO cwd:PROJECT session:PRODUCTION status:BLOCKED review branch:FEATURE",
         "assistant session-0",
@@ -2294,7 +2293,9 @@ fn help_scrolls_to_all_filter_fold_attention_and_status_safety_rules() {
         "Enter applies without navigation",
         "restores the previous filter",
         "Blocked or Error",
-        "Unknown, not Working or Idle",
+        "Unrecognized states use Idle",
+        "Idle fallback",
+        "no-report source",
         "Blocked is not proof",
         "not whole-session completion",
     ] {
@@ -2426,14 +2427,14 @@ fn selected_idle_status_contrasts_with_full_row_highlight_at_full_and_compact_wi
 }
 
 #[test]
-fn unknown_status_is_neutral_and_details_identify_foreground_only_sources() {
-    let mut agent = entry(0, Status::Unknown);
+fn idle_fallback_and_details_identify_foreground_only_sources() {
+    let mut agent = entry(0, Status::Idle);
     agent.records = 0;
     let mut app = app(vec![agent]);
     let mut terminal = terminal(100, 10);
     let rows = render(&mut app, &mut terminal);
     let status = app_columns(&app, app.hits[0].area).areas[1];
-    assert!(rows[usize::from(status.y)].contains("? Unknown"));
+    assert!(rows[usize::from(status.y)].contains("○ Idle"));
     assert_eq!(
         terminal.backend().buffer()[(status.x, status.y)].fg,
         Color::Gray

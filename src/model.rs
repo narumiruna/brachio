@@ -6,7 +6,6 @@ pub enum Status {
     Blocked,
     Error,
     Done,
-    Unknown,
     Working,
     Idle,
 }
@@ -18,8 +17,7 @@ impl Status {
             "error" => Self::Error,
             "done" => Self::Done,
             "working" => Self::Working,
-            "idle" => Self::Idle,
-            _ => Self::Unknown,
+            _ => Self::Idle,
         }
     }
 
@@ -28,7 +26,6 @@ impl Status {
             Self::Blocked => "Blocked",
             Self::Error => "Error",
             Self::Done => "Done",
-            Self::Unknown => "Unknown",
             Self::Working => "Working",
             Self::Idle => "Idle",
         }
@@ -204,15 +201,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_and_future_states_are_unknown_not_working_or_idle() {
+    fn missing_and_future_states_use_the_schema_idle_fallback() {
         let result = aggregate(&json!({"records": [
             {"app":"pi"},
             {"app":"codex","state":"sleeping"},
             {"state":"working"}
         ]}))
         .unwrap();
-        assert_eq!(result["pi"].0, Status::Unknown);
-        assert_eq!(result["codex"].0, Status::Unknown);
+        assert_eq!(result["pi"].0, Status::Idle);
+        assert_eq!(result["codex"].0, Status::Idle);
         assert!(aggregate(&json!({})).is_err());
         assert!(aggregate(&json!({"records":[]})).unwrap().is_empty());
     }
@@ -225,7 +222,9 @@ mod tests {
             ("done", Status::Done),
             ("working", Status::Working),
             ("idle", Status::Idle),
-            ("future", Status::Unknown),
+            ("future", Status::Idle),
+            ("unknown", Status::Idle),
+            ("", Status::Idle),
         ] {
             assert_eq!(Status::parse(value), status);
         }
@@ -241,6 +240,19 @@ mod tests {
         assert!(
             aggregate(&json!({"records": vec![json!({"app":"pi","state":"idle"}); 257]})).is_err()
         );
+    }
+
+    #[test]
+    fn idle_fallback_does_not_override_a_working_report() {
+        let mut records = vec![
+            json!({"app":"pi","state":"future"}),
+            json!({"app":"pi","state":"working"}),
+        ];
+        for _ in 0..2 {
+            let result = aggregate(&json!({"records": records})).unwrap();
+            assert_eq!(result["pi"], (Status::Working, 2));
+            records.reverse();
+        }
     }
 
     #[test]

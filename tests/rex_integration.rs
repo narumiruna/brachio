@@ -133,14 +133,16 @@ fn multi_session_snapshot_preserves_exact_locations_and_record_rules() {
             .entries
             .iter()
             .any(|entry| entry.id.agent == "claude-code"
-                && entry.status == Status::Unknown
+                && entry.status == Status::Idle
                 && entry.records == 0)
     );
     assert!(
         snapshot
             .entries
             .iter()
-            .any(|entry| entry.id.agent == "codex" && entry.status == Status::Unknown)
+            .any(|entry| entry.id.agent == "codex"
+                && entry.status == Status::Idle
+                && entry.records == 1)
     );
     assert!(
         snapshot
@@ -271,7 +273,7 @@ fn long_location_names_are_preserved_and_shared_between_pane_entries() {
 }
 
 #[test]
-fn status_not_supported_is_explicit_and_process_presence_never_means_working() {
+fn status_not_supported_warns_and_uses_idle_without_fabricating_reports() {
     let fixture = Fixture::new();
     fixture.mode("no-status");
     let snapshot = fixture.rex.snapshot().unwrap();
@@ -280,7 +282,7 @@ fn status_not_supported_is_explicit_and_process_presence_never_means_working() {
         snapshot
             .entries
             .iter()
-            .all(|entry| entry.status == Status::Unknown)
+            .all(|entry| entry.status == Status::Idle && entry.records == 0)
     );
     assert!(
         snapshot
