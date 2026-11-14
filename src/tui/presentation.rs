@@ -48,41 +48,32 @@ fn text_width(value: &str) -> usize {
     Line::raw(value).width()
 }
 
-/// Greedy word wrapping in terminal cells. Words wider than the line are split
-/// between graphemes, so no text is lost and no grapheme is divided.
+/// Wrap words in terminal cells and preserve all spaces. Split long words only
+/// between graphemes. Joining the lines restores the exact input.
 pub(super) fn wrap_words(value: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
     let mut line = String::new();
     let mut used = 0;
-    for word in value.split(' ').filter(|word| !word.is_empty()) {
-        let size = text_width(word);
-        if used > 0 && used + 1 + size <= width {
-            line.push(' ');
-            line.push_str(word);
-            used += 1 + size;
-            continue;
-        }
-        if used > 0 {
-            lines.push(std::mem::take(&mut line));
-            used = 0;
-        }
-        if size <= width {
-            line.push_str(word);
-            used = size;
-            continue;
-        }
-        for grapheme in Span::raw(word).styled_graphemes(Style::default()) {
-            let size = text_width(grapheme.symbol);
-            if used + size > width && used > 0 {
+    for (index, word) in value.split(' ').enumerate() {
+        for part in [if index == 0 { "" } else { " " }, word] {
+            let size = text_width(part);
+            if used + size > width && !line.is_empty() {
                 lines.push(std::mem::take(&mut line));
                 used = 0;
             }
-            line.push_str(grapheme.symbol);
-            used += size;
+            for grapheme in Span::raw(part).styled_graphemes(Style::default()) {
+                let size = text_width(grapheme.symbol);
+                if used + size > width && !line.is_empty() {
+                    lines.push(std::mem::take(&mut line));
+                    used = 0;
+                }
+                line.push_str(grapheme.symbol);
+                used += size;
+            }
         }
     }
-    if used > 0 || lines.is_empty() {
+    if !line.is_empty() || lines.is_empty() {
         lines.push(line);
     }
     lines
@@ -752,11 +743,12 @@ mod tests {
 
     #[test]
     fn word_wrap_keeps_words_and_graphemes_and_never_loses_text() {
-        assert_eq!(wrap_words("one two three", 7), vec!["one two", "three"]);
+        assert_eq!(wrap_words("one two three", 7), vec!["one two", " three"]);
+        assert_eq!(wrap_words("a abcdefg", 7), vec!["a ", "abcdefg"]);
         assert_eq!(wrap_words("界e\u{301}abc", 3), vec!["界e\u{301}", "abc"]);
         assert_eq!(wrap_words("", 5), vec![""]);
         assert_eq!(wrap_words("界a", 1), vec!["界", "a"]);
-        assert_eq!(wrap_words("a  b", 0), vec!["a", "b"]);
+        assert_eq!(wrap_words("a  b", 0), vec!["a", " ", " ", "b"]);
         let value = "session:12345678-1234 界e\u{301}/👩🏽/project tail";
         for width in 1..=40 {
             let lines = wrap_words(value, width);
@@ -764,9 +756,38 @@ mod tests {
                 // A single grapheme wider than the line is the only allowed overflow.
                 assert!(text_width(line) <= width.max(2), "{width}: {line:?}");
             }
-            let joined: String = lines.concat().split_whitespace().collect();
-            let expected: String = value.split_whitespace().collect();
-            assert_eq!(joined, expected, "{width}");
+            assert_eq!(lines.concat(), value, "{width}");
+        }
+    }
+
+    #[test]
+    fn word_wrap_preserves_significant_spaces() {
+        for value in [
+            "",
+            " ",
+            "  leading",
+            "trailing  ",
+            "/work/my  project",
+            "  界e\u{301}/👩🏽  tail  ",
+        ] {
+            for width in 0..=60 {
+                let lines = wrap_words(value, width);
+                assert_eq!(lines.concat(), value, "{width}: {lines:?}");
+                assert!(lines.iter().all(|line| text_width(line) <= width.max(2)));
+                let fields = field_lines(
+                    "",
+                    value,
+                    0,
+                    width as u16,
+                    Style::default(),
+                    Style::default(),
+                );
+                let text: String = fields
+                    .iter()
+                    .map(|line| line.spans.last().unwrap().content.as_ref())
+                    .collect();
+                assert_eq!(text, value, "{width}: {fields:?}");
+            }
         }
     }
 
@@ -787,7 +808,7 @@ mod tests {
                 plain,
                 plain
             )),
-            vec!["  Tab    one two", "         three four"]
+            vec!["  Tab    one two ", "         three four"]
         );
         assert_eq!(
             text(field_lines("", "note text", 0, 30, plain, plain)),

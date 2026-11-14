@@ -1550,6 +1550,34 @@ fn action_feedback_lasts_until_the_next_list_input_but_survives_overlays() {
 }
 
 #[test]
+fn missing_selection_refreshes_preserve_navigation_feedback() {
+    for result in [Ok(()), Err("Rex.app is not accepting actions".into())] {
+        let mut app = many(3);
+        let target = navigation(app.handle_event(key(KeyCode::Enter)));
+        let mut snapshot = app.snapshot.clone();
+        snapshot.entries.retain(|entry| entry.id != target.id);
+        app.replace_snapshot(snapshot.clone());
+        assert_eq!(app.notice(), SELECTION_REMOVED);
+        app.navigation_finished(result);
+        let feedback = app.feedback.clone();
+        assert!(feedback.is_some());
+        assert_ne!(app.notice(), SELECTION_REMOVED);
+        for _ in 0..2 {
+            app.replace_snapshot(snapshot.clone());
+            assert_eq!(app.feedback, feedback);
+            assert!(app.selected.is_none());
+            assert!(app.selection_missing);
+        }
+        app.handle_event(key(KeyCode::Char('x')));
+        assert!(app.feedback.is_none());
+        assert_eq!(app.notice(), SELECTION_REMOVED);
+        app.replace_snapshot(snapshot);
+        assert!(app.feedback.is_none());
+        assert_eq!(app.notice(), SELECTION_REMOVED);
+    }
+}
+
+#[test]
 fn details_scroll_exposes_the_full_sanitized_message_and_every_warning() {
     let mut app = many(2);
     app.message = format!(
@@ -2208,6 +2236,71 @@ fn filter_cancel_restores_the_previous_query_and_escape_clears_before_quitting()
     app.handle_event(key(KeyCode::Char('/')));
     assert!(app.handle_event(key(KeyCode::Esc)).is_none());
     assert!(app.filter_edit.is_none());
+}
+
+#[test]
+fn filter_cancel_restores_an_absent_selection() {
+    for missing in [false, true] {
+        for edited in [false, true] {
+            let mut view = if missing { many(3) } else { app(Vec::new()) };
+            view.replace_snapshot(Snapshot {
+                entries: vec![entry(1, Status::Working), entry(2, Status::Working)],
+                warnings: Vec::new(),
+            });
+            assert!(view.selected.is_none());
+            assert_eq!(view.selection_missing, missing);
+            view.handle_event(key(KeyCode::Char('/')));
+            if edited {
+                view.handle_event(Event::Paste("agent:agent-01".into()));
+                assert!(view.selected.is_some());
+            }
+            view.handle_event(key(KeyCode::Esc));
+            assert!(view.query.is_empty());
+            assert!(
+                view.selected.is_none(),
+                "missing={missing}, edited={edited}"
+            );
+            assert_eq!(view.selection_missing, missing);
+            assert!(view.handle_event(key(KeyCode::Enter)).is_none());
+            assert!(!view.navigating);
+        }
+    }
+}
+
+#[test]
+fn filter_cancel_restores_a_hidden_selection() {
+    let mut app = many(3);
+    let selected = app.selected.clone();
+    apply_filter(&mut app, "status:working");
+    let mut snapshot = app.snapshot.clone();
+    snapshot.entries[0].status = Status::Idle;
+    app.replace_snapshot(snapshot);
+    assert!(app.selected_row().is_none());
+    app.handle_event(key(KeyCode::Char('/')));
+    app.handle_event(key(KeyCode::Esc));
+    assert_eq!(app.query, "status:working");
+    assert_eq!(app.selected, selected);
+    assert!(app.selected_row().is_none());
+    assert!(app.handle_event(key(KeyCode::Enter)).is_none());
+    assert!(!app.navigating);
+}
+
+#[test]
+fn filter_cancel_keeps_a_removed_original_selection_missing() {
+    let mut app = many(3);
+    let original = app.selected.clone().unwrap();
+    app.handle_event(key(KeyCode::Char('/')));
+    app.handle_event(Event::Paste("agent:agent-01".into()));
+    assert_ne!(app.selected.as_ref(), Some(&original));
+    let mut snapshot = app.snapshot.clone();
+    snapshot.entries.retain(|entry| entry.id != original);
+    app.replace_snapshot(snapshot);
+    app.handle_event(key(KeyCode::Esc));
+    assert!(app.query.is_empty());
+    assert!(app.selected.is_none());
+    assert!(app.selection_missing);
+    assert!(app.handle_event(key(KeyCode::Enter)).is_none());
+    assert!(!app.navigating);
 }
 
 #[test]
@@ -2968,8 +3061,8 @@ fn long_header_labels_keep_matching_counts_visible_at_narrow_widths() {
             assert_eq!(app.group_hits.len(), 3);
             for hit in &app.group_hits {
                 let text = rows[usize::from(hit.area.y)].trim_end();
-                if width >= 6 {
-                    // Status summaries drop out before the count when space is short.
+                if width >= 7 {
+                    // Reserve the scrollbar cell and drop summaries before the count.
                     assert!(text.contains("(2)"), "{mode:?}/{width}: {text}");
                     if width < 32 {
                         assert!(text.ends_with("(2)"), "{mode:?}/{width}: {text}");
@@ -2979,6 +3072,66 @@ fn long_header_labels_keep_matching_counts_visible_at_narrow_widths() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn overflowing_group_headers_leave_the_scrollbar_cell_clear() {
+    for mode in [GroupBy::Agent, GroupBy::Cwd, GroupBy::Session] {
+        let entries = (0..12)
+            .map(|index| {
+                let mut entry = entry(index, Status::Working);
+                let label = format!("{}-{index}", "long-label/".repeat(20));
+                entry.id.agent = label.clone();
+                entry.working_dir = Some(format!("/{label}"));
+                entry.location.session = label.into();
+                entry
+            })
+            .collect();
+        let mut app = grouped_app(entries, mode);
+        for group in app.current_groups() {
+            app.collapsed.insert(group.key);
+        }
+        for width in [8, 16, 32] {
+            let mut terminal = terminal(width, 10);
+            let rows = render(&mut app, &mut terminal);
+            assert_eq!(app.scrollbar, Some(width - 1));
+            for hit in &app.group_hits {
+                let text: String = rows[usize::from(hit.area.y)]
+                    .chars()
+                    .take(usize::from(width - 1))
+                    .collect();
+                let suffix = if width < 32 { "(1)" } else { "●1" };
+                assert!(
+                    text.trim_end().ends_with(suffix),
+                    "{mode:?}/{width}: {text:?}"
+                );
+            }
+            let selected = app.selected_row().unwrap() - app.scroll;
+            let y = app.viewport.y + selected as u16;
+            assert!((0..width).all(|x| terminal.backend().buffer()[(x, y)].bg == SELECTED_BG));
+        }
+    }
+}
+
+#[test]
+fn details_preserve_significant_spaces() {
+    let mut agent = entry(0, Status::Working);
+    agent.name = "  agent  name  ".into();
+    agent.working_dir = Some("/work/my  project/ tail  ".into());
+    agent.location.session = "  session  name  ".into();
+    let mut app = app(vec![agent.clone()]);
+    app.diagnostic = "  navigation  failed  ".into();
+    app.handle_event(key(KeyCode::Char('w')));
+    let rows = render(&mut app, &mut terminal(120, 60));
+    let text = rows.join("\n");
+    for value in [
+        agent.name.as_str(),
+        agent.working_dir.as_deref().unwrap(),
+        agent.location.session.as_ref(),
+        app.diagnostic.as_str(),
+    ] {
+        assert!(text.contains(value), "missing {value:?}: {text}");
     }
 }
 

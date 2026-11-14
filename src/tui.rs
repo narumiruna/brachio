@@ -87,6 +87,7 @@ pub struct App {
     query: String,
     filter_edit: Option<String>,
     filter_edit_selection: Option<EntryId>,
+    filter_edit_selection_missing: bool,
     selected: Option<EntryId>,
     selection_missing: bool,
     received_snapshot: bool,
@@ -253,13 +254,14 @@ impl App {
                 match key.code {
                     KeyCode::Esc => {
                         self.query = self.filter_edit.take().unwrap_or_default();
-                        if let Some(previous) = self.filter_edit_selection.take()
-                            && self.snapshot.entries.iter().any(|e| e.id == previous)
-                        {
-                            self.selected = Some(previous);
-                            self.selection_missing = false;
+                        self.selected = self.filter_edit_selection.take();
+                        self.selection_missing = self.filter_edit_selection_missing;
+                        if self.selected.is_some() && self.selected_index().is_none() {
+                            self.selection_removed();
                         }
-                        self.filter_changed();
+                        self.clear_hits();
+                        self.scroll = 0;
+                        self.reveal_selection = true;
                     }
                     KeyCode::Enter => {
                         self.filter_edit = None;
@@ -382,6 +384,7 @@ impl App {
                 KeyCode::Char('/') => {
                     self.filter_edit = Some(self.query.clone());
                     self.filter_edit_selection = self.selected.clone();
+                    self.filter_edit_selection_missing = self.selection_missing;
                     None
                 }
                 KeyCode::Char('?') => {
@@ -591,8 +594,10 @@ impl App {
 
     fn selection_removed(&mut self) {
         self.selected = None;
+        if !self.selection_missing {
+            self.set_feedback(SELECTION_REMOVED, true);
+        }
         self.selection_missing = true;
-        self.set_feedback(SELECTION_REMOVED, true);
     }
 
     fn move_selection(&mut self, motion: Motion) {
@@ -869,8 +874,13 @@ impl App {
                         .iter()
                         .find(|group| &group.key == key)
                         .map_or(&[][..], |group| group.entries.as_slice());
-                    let line =
-                        self.header_line(row, members, selected, row_area.width, home.as_deref());
+                    let line = self.header_line(
+                        row,
+                        members,
+                        selected,
+                        column_area(row_area).width,
+                        home.as_deref(),
+                    );
                     let style = if selected {
                         Style::default().bg(SELECTED_BG).fg(Color::White)
                     } else {
