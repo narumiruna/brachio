@@ -1,3 +1,9 @@
+## 0.1.1
+
+### Patch Changes
+
+- Follow the Rex status schema: use Idle for unrecognized states and foreground-only agents, remove Unknown status, and retain no-report source details.
+
 ## 0.1.0
 
 ### Minor Changes
