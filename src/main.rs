@@ -77,7 +77,7 @@ fn run() -> Result<(), String> {
         match arg.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "brachio — Rex coding agent status\n\nUsage: brachio [--client client:<uuid>]\n\nSelects the only connected app by default; refuses ambiguous clients.\nKeys: Up/Down or j/k select, g/G cycle grouping (None/Agent/Status/CWD/Session; default None),\nTab/Shift+Tab select groups, Left/Right collapse/expand, / filter, ? help,\na/A select Blocked/Error agents, Enter or left click navigate, w details.\nq/Esc close the current view; Ctrl-C quits. Enter on a collapsed group expands it.\nNavigation requires Rex app Remote Control. It can change shared session focus.\nRex CLI: PATH first, then the app-managed installation on macOS."
+                    "brachio — Rex coding agent status\n\nUsage: brachio [--client client:<uuid>]\n\nSelects the only connected app by default; refuses ambiguous clients.\nKeys: Up/Down or j/k select, PgUp/PgDn/Home/End move by page or to either end,\ng/G cycle grouping (None/Agent/Status/CWD/Session; default None),\nTab/Shift+Tab select groups, Left/Right collapse/expand, / filter, ? help,\na/A select Blocked/Error agents, Enter or left click jump to the agent, w details.\nEsc closes Details/Help or clears the filter; q quits; Ctrl-C quits from any view.\nEnter on a collapsed group expands it.\nNavigation requires Rex app Remote Control. It can change shared session focus.\nRex CLI: PATH first, then the app-managed installation on macOS."
                 );
                 return Ok(());
             }
@@ -132,10 +132,9 @@ fn run() -> Result<(), String> {
     }));
     let mut terminal =
         Terminal::new(CrosstermBackend::new(io::stdout())).map_err(|error| error.to_string())?;
+    // Before the first snapshot, the view itself shows that Brachio is connecting.
     let mut app = App::default();
-    app.message = "Connecting to Rex…".into();
     let mut client_error: Option<String> = None;
-    let mut notice = String::new();
     terminal
         .draw(|frame| app.draw(frame))
         .map_err(|error| error.to_string())?;
@@ -168,35 +167,19 @@ fn run() -> Result<(), String> {
             };
             match update {
                 Update::Snapshot(Ok(snapshot)) => {
-                    app.message = client_error.as_ref().unwrap_or(&notice).clone();
+                    // The message holds persistent conditions only; navigation
+                    // results are action feedback and stay in Details afterward.
+                    app.message = client_error.clone().unwrap_or_default();
                     app.replace_snapshot(snapshot);
                     app.connected = true;
                 }
-                Update::Snapshot(Err(error)) => {
-                    app.connected = false;
-                    app.message = format!(
-                        "Rex disconnected; entries are stale; navigation disabled: {error}"
-                    );
-                }
-                Update::Navigation(result) => {
-                    app.navigating = false;
-                    notice = match result {
-                        Ok(()) => {
-                            app.diagnostic = "Rex accepted app selection; native display is not verified by Brachio".into();
-                            String::new()
-                        }
-                        Err(error) => {
-                            app.diagnostic = error.clone();
-                            error
-                        }
-                    };
-                    app.message = notice.clone();
-                }
+                Update::Snapshot(Err(error)) => app.refresh_failed(&error),
+                Update::Navigation(result) => app.navigation_finished(result),
                 Update::Client(result) => match result {
                     Ok(id) => {
                         client_error = None;
                         app.client = Some(id);
-                        app.message = notice.clone();
+                        app.message.clear();
                     }
                     Err(error) => {
                         app.message = error.clone();
@@ -272,11 +255,9 @@ fn process_input(
             Some(Action::Quit) => return Ok(InputState::Quit),
             Some(Action::Navigate(entry)) => {
                 if let Some(error) = client_error {
-                    app.navigating = false;
-                    app.message = error.clone();
+                    app.navigation_finished(Err(error.clone()));
                 } else if let Err(error) = worker.navigate(*entry) {
-                    app.navigating = false;
-                    app.message = error;
+                    app.navigation_finished(Err(error));
                 }
             }
             None => {}
@@ -343,7 +324,7 @@ mod tests {
         // A queued coordinate crossing this redraw must not acquire the new row.
         assert!(route_input(&mut app, click, true).is_none());
         assert_eq!(
-            app.message,
+            app.notice(),
             "List redrawn; click again to select the displayed row"
         );
         assert!(!app.navigating);
@@ -394,7 +375,7 @@ mod tests {
                         .iter()
                         .map(|cell| cell.symbol())
                         .collect();
-                    assert!(text.contains("brachio | Details"));
+                    assert!(text.contains("brachio · Details"));
                     assert!(text.contains(message));
                 }
             }

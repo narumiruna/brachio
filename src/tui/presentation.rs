@@ -2,7 +2,7 @@
 
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
 };
 
@@ -44,21 +44,102 @@ pub(super) fn clip_text(value: &str, width: u16, keep_end: bool) -> String {
     }
 }
 
-pub(super) fn wrap_details(value: &str, width: u16) -> Vec<Line<'static>> {
-    let text = Span::raw(value);
+fn text_width(value: &str) -> usize {
+    Line::raw(value).width()
+}
+
+/// Greedy word wrapping in terminal cells. Words wider than the line are split
+/// between graphemes, so no text is lost and no grapheme is divided.
+pub(super) fn wrap_words(value: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
     let mut lines = Vec::new();
     let mut line = String::new();
     let mut used = 0;
-    for grapheme in text.styled_graphemes(Style::default()) {
-        let size = Span::raw(grapheme.symbol).width();
-        if used + size > usize::from(width) && !line.is_empty() {
-            lines.push(Line::raw(std::mem::take(&mut line)));
+    for word in value.split(' ').filter(|word| !word.is_empty()) {
+        let size = text_width(word);
+        if used > 0 && used + 1 + size <= width {
+            line.push(' ');
+            line.push_str(word);
+            used += 1 + size;
+            continue;
+        }
+        if used > 0 {
+            lines.push(std::mem::take(&mut line));
             used = 0;
         }
-        line.push_str(grapheme.symbol);
-        used += size;
+        if size <= width {
+            line.push_str(word);
+            used = size;
+            continue;
+        }
+        for grapheme in Span::raw(word).styled_graphemes(Style::default()) {
+            let size = text_width(grapheme.symbol);
+            if used + size > width && used > 0 {
+                lines.push(std::mem::take(&mut line));
+                used = 0;
+            }
+            line.push_str(grapheme.symbol);
+            used += size;
+        }
     }
-    lines.push(Line::raw(line));
+    if used > 0 || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// An indented label/value row with a hanging indent for wrapped values.
+/// Narrow views put the label on its own line instead of squeezing the value.
+pub(super) fn field_lines(
+    label: &str,
+    value: &str,
+    label_width: usize,
+    width: u16,
+    label_style: Style,
+    value_style: Style,
+) -> Vec<Line<'static>> {
+    let width = usize::from(width);
+    let label = display_text(label);
+    let value = display_text(value);
+    let indent = if width >= 8 { 2 } else { 0 };
+    // Unlabeled rows align with the indent; labeled rows add a two-cell gap.
+    let column = indent + if label_width == 0 { 0 } else { label_width + 2 };
+    if width >= column + 12 {
+        return wrap_words(&value, width - column)
+            .into_iter()
+            .enumerate()
+            .map(|(index, part)| {
+                let lead = if index == 0 {
+                    label.clone()
+                } else {
+                    String::new()
+                };
+                let pad = (column - indent).saturating_sub(text_width(&lead));
+                Line::from(vec![
+                    Span::raw(" ".repeat(indent)),
+                    Span::styled(lead, label_style),
+                    Span::raw(" ".repeat(pad)),
+                    Span::styled(part, value_style),
+                ])
+            })
+            .collect();
+    }
+    let mut lines = Vec::new();
+    if !label.is_empty() {
+        for part in wrap_words(&label, width.saturating_sub(indent)) {
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(indent)),
+                Span::styled(part, label_style),
+            ]));
+        }
+    }
+    let nested = if width >= 12 { indent + 2 } else { indent };
+    for part in wrap_words(&value, width.saturating_sub(nested)) {
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(nested)),
+            Span::styled(part, value_style),
+        ]));
+    }
     lines
 }
 
@@ -92,6 +173,16 @@ pub(super) const COLUMN_LABELS: [&str; 6] = [
     "Tab",
     "Pane",
 ];
+
+/// The heading for a data column. A clipped "Working directory" becomes "CWD".
+pub(super) fn column_label(index: usize, width: u16) -> &'static str {
+    let label = COLUMN_LABELS[index];
+    if index == 2 && text_width(label) > usize::from(width) && width >= 3 {
+        "CWD"
+    } else {
+        label
+    }
+}
 
 /// Measure display cells independently of the terminal width.
 pub(super) fn measure_columns<'a>(
@@ -222,6 +313,53 @@ pub(super) fn status_color(status: Status) -> Color {
     }
 }
 
+/// Status foreground for a row. Status colors are hard to read on the selection
+/// background, so the selected row uses white and the symbol identifies the status.
+pub(super) fn status_fg(status: Status, selected: bool) -> Color {
+    if selected {
+        Color::White
+    } else {
+        status_color(status)
+    }
+}
+
+pub(super) const STATUSES: [Status; 5] = [
+    Status::Blocked,
+    Status::Error,
+    Status::Done,
+    Status::Working,
+    Status::Idle,
+];
+
+/// Nonzero per-status counts in priority order, such as `!1 ●2`.
+pub(super) fn status_summary(
+    statuses: impl IntoIterator<Item = Status>,
+    selected: bool,
+) -> Vec<Span<'static>> {
+    let mut counts = [0usize; 5];
+    for status in statuses {
+        counts[status as usize] += 1;
+    }
+    let mut spans = Vec::new();
+    for (status, count) in STATUSES.into_iter().zip(counts) {
+        if count == 0 {
+            continue;
+        }
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(
+            format!("{}{count}", status_text(status, true)),
+            Style::default().fg(status_fg(status, selected)),
+        ));
+    }
+    spans
+}
+
+pub(super) fn spans_width(spans: &[Span]) -> usize {
+    spans.iter().map(Span::width).sum()
+}
+
 /// Skip empty or unfit parts. Only the first nonempty part can be clipped.
 pub(super) fn compact_line(parts: &[&str], width: u16) -> String {
     let mut line = String::new();
@@ -248,20 +386,58 @@ pub(super) fn compact_line(parts: &[&str], width: u16) -> String {
     line
 }
 
-pub(super) fn shortcuts(width: u16, grouped: bool) -> String {
-    let mut parts = vec![
-        "↑↓ Select",
-        "Enter Jump",
-        "g/G Group",
-        "/ Filter",
-        "? Help",
-        "q Quit",
-    ];
-    if grouped {
-        parts.extend(["Tab Groups", "←/→ Fold"]);
+/// Styled form of [`compact_line`]: skip unfit parts and only clip the first one.
+pub(super) fn compact_spans(parts: &[Span<'static>], width: u16) -> Line<'static> {
+    let limit = usize::from(width);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+    for part in parts {
+        let content = display_text(&part.content);
+        if content.is_empty() {
+            continue;
+        }
+        let size = text_width(&content);
+        if spans.is_empty() {
+            if size > limit {
+                return Line::from(Span::styled(clip_text(&content, width, false), part.style));
+            }
+            spans.push(Span::styled(content, part.style));
+            used = size;
+        } else if used + 3 + size <= limit {
+            spans.push(Span::raw(" · "));
+            spans.push(Span::styled(content, part.style));
+            used += 3 + size;
+        }
     }
-    parts.push("w Details");
-    compact_line(&parts, width)
+    Line::from(spans)
+}
+
+pub(super) fn plural(count: usize, singular: &str, plural: &str) -> String {
+    format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
+/// Footer hints. A nonzero attention count advertises the `a` jump.
+pub(super) fn shortcuts(width: u16, grouped: bool, attention: usize) -> Line<'static> {
+    let mut parts = vec![Span::raw("↑↓ Select"), Span::raw("Enter Jump")];
+    if attention > 0 {
+        parts.push(Span::styled(
+            format!("a Attention ({attention})"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    parts.extend([
+        Span::raw("/ Filter"),
+        Span::raw("g/G Group"),
+        Span::raw("? Help"),
+        Span::raw("q Quit"),
+    ]);
+    if grouped {
+        parts.extend([Span::raw("Tab Groups"), Span::raw("←/→ Fold")]);
+    }
+    parts.push(Span::raw("w Details"));
+    compact_spans(&parts, width)
 }
 
 #[cfg(test)]
@@ -575,15 +751,100 @@ mod tests {
     }
 
     #[test]
-    fn details_wrap_without_splitting_graphemes_or_losing_text() {
-        let lines = wrap_details("界e\u{301}abc", 3);
-        assert_eq!(lines, vec![Line::raw("界e\u{301}"), Line::raw("abc")]);
-        assert_eq!(wrap_details("", 5), vec![Line::raw("")]);
-        // Preserve the existing behavior for indivisible, over-width graphemes.
+    fn word_wrap_keeps_words_and_graphemes_and_never_loses_text() {
+        assert_eq!(wrap_words("one two three", 7), vec!["one two", "three"]);
+        assert_eq!(wrap_words("界e\u{301}abc", 3), vec!["界e\u{301}", "abc"]);
+        assert_eq!(wrap_words("", 5), vec![""]);
+        assert_eq!(wrap_words("界a", 1), vec!["界", "a"]);
+        assert_eq!(wrap_words("a  b", 0), vec!["a", "b"]);
+        let value = "session:12345678-1234 界e\u{301}/👩🏽/project tail";
+        for width in 1..=40 {
+            let lines = wrap_words(value, width);
+            for line in &lines {
+                // A single grapheme wider than the line is the only allowed overflow.
+                assert!(text_width(line) <= width.max(2), "{width}: {line:?}");
+            }
+            let joined: String = lines.concat().split_whitespace().collect();
+            let expected: String = value.split_whitespace().collect();
+            assert_eq!(joined, expected, "{width}");
+        }
+    }
+
+    #[test]
+    fn fields_align_values_and_fall_back_to_stacked_labels_when_narrow() {
+        let plain = Style::default();
+        let text = |lines: Vec<Line>| lines.iter().map(Line::to_string).collect::<Vec<_>>();
         assert_eq!(
-            wrap_details("界a", 1),
-            vec![Line::raw("界"), Line::raw("a")]
+            text(field_lines("Agent", "pi", 8, 40, plain, plain)),
+            vec!["  Agent     pi"]
         );
+        assert_eq!(
+            text(field_lines(
+                "Tab",
+                "one two three four",
+                5,
+                21,
+                plain,
+                plain
+            )),
+            vec!["  Tab    one two", "         three four"]
+        );
+        assert_eq!(
+            text(field_lines("", "note text", 0, 30, plain, plain)),
+            vec!["  note text"]
+        );
+        assert_eq!(
+            text(field_lines(
+                "Working directory",
+                "/a/b",
+                17,
+                20,
+                plain,
+                plain
+            )),
+            vec!["  Working directory", "    /a/b"]
+        );
+        for width in 0..=60 {
+            for line in field_lines(
+                "Label",
+                "界e\u{301} value with words",
+                9,
+                width,
+                plain,
+                plain,
+            ) {
+                assert!(line.width() <= usize::from(width).max(2), "{width}: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn clipped_working_directory_heading_uses_cwd() {
+        assert_eq!(column_label(2, 17), "Working directory");
+        assert_eq!(column_label(2, 16), "CWD");
+        assert_eq!(column_label(2, 3), "CWD");
+        assert_eq!(column_label(2, 2), "Working directory");
+        assert_eq!(column_label(1, 3), "Agent");
+    }
+
+    #[test]
+    fn status_summaries_count_nonzero_statuses_in_priority_order() {
+        let summary = status_summary(
+            [Status::Idle, Status::Blocked, Status::Idle, Status::Working],
+            false,
+        );
+        assert_eq!(Line::from(summary.clone()).to_string(), "!1 ●1 ○2");
+        assert_eq!(spans_width(&summary), 8);
+        assert_eq!(summary[0].style.fg, Some(Color::Yellow));
+        assert_eq!(summary[4].style.fg, Some(Color::Gray));
+        let selected = status_summary([Status::Idle, Status::Blocked, Status::Done], true);
+        assert!(
+            selected
+                .iter()
+                .filter(|span| span.content != " ")
+                .all(|span| span.style.fg == Some(Color::White))
+        );
+        assert!(status_summary([], false).is_empty());
     }
 
     #[test]
@@ -645,31 +906,56 @@ mod tests {
     #[test]
     fn footer_hints_fit_all_widths_and_keep_the_requested_order() {
         for grouped in [false, true] {
-            for width in 0..=160 {
-                let line = shortcuts(width, grouped);
-                assert!(text_width(&line) <= usize::from(width), "{width}: {line}");
-                if width >= 9 {
-                    assert!(line.starts_with("↑↓ Select"));
-                    for part in line.split(" · ") {
-                        assert!(
-                            shortcuts(160, grouped)
-                                .split(" · ")
-                                .any(|hint| hint == part)
-                        );
+            for attention in [0, 3] {
+                let full = shortcuts(200, grouped, attention).to_string();
+                for width in 0..=160 {
+                    let line = shortcuts(width, grouped, attention).to_string();
+                    assert!(text_width(&line) <= usize::from(width), "{width}: {line}");
+                    if width >= 9 {
+                        assert!(line.starts_with("↑↓ Select"));
+                        for part in line.split(" · ") {
+                            assert!(full.split(" · ").any(|hint| hint == part));
+                        }
                     }
                 }
             }
         }
-        assert_eq!(shortcuts(0, true), "");
-        assert_eq!(shortcuts(9, false), "↑↓ Select");
-        assert_eq!(shortcuts(22, false), "↑↓ Select · Enter Jump");
+        assert_eq!(shortcuts(0, true, 0).to_string(), "");
+        assert_eq!(shortcuts(9, false, 0).to_string(), "↑↓ Select");
         assert_eq!(
-            shortcuts(160, false),
-            "↑↓ Select · Enter Jump · g/G Group · / Filter · ? Help · q Quit · w Details"
+            shortcuts(22, false, 0).to_string(),
+            "↑↓ Select · Enter Jump"
         );
         assert_eq!(
-            shortcuts(160, true),
-            "↑↓ Select · Enter Jump · g/G Group · / Filter · ? Help · q Quit · Tab Groups · ←/→ Fold · w Details"
+            shortcuts(160, false, 0).to_string(),
+            "↑↓ Select · Enter Jump · / Filter · g/G Group · ? Help · q Quit · w Details"
         );
+        assert_eq!(
+            shortcuts(160, true, 0).to_string(),
+            "↑↓ Select · Enter Jump · / Filter · g/G Group · ? Help · q Quit · Tab Groups · ←/→ Fold · w Details"
+        );
+        // The attention jump is advertised third and still fits a 40-cell view.
+        let line = shortcuts(40, false, 3);
+        assert_eq!(line.to_string(), "↑↓ Select · Enter Jump · a Attention (3)");
+        let hint = line
+            .spans
+            .iter()
+            .find(|span| span.content.starts_with("a "))
+            .unwrap();
+        assert_eq!(hint.style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn styled_compact_lines_match_plain_compact_lines() {
+        for width in 0..=40 {
+            let parts = ["界e\u{301}", "👩🏽", "longer text", "x"];
+            let spans: Vec<_> = parts.iter().map(|part| Span::raw(*part)).collect();
+            assert_eq!(
+                compact_spans(&spans, width).to_string(),
+                compact_line(&parts, width)
+            );
+        }
+        assert_eq!(plural(1, "warning", "warnings"), "1 warning");
+        assert_eq!(plural(2, "warning", "warnings"), "2 warnings");
     }
 }

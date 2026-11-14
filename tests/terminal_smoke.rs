@@ -494,13 +494,14 @@ fn help_without_a_terminal() {
     assert!(help.contains("Usage: brachio"));
     for controls in [
         "Up/Down or j/k select",
+        "PgUp/PgDn/Home/End move by page or to either end",
         "g/G cycle grouping (None/Agent/Status/CWD/Session; default None)",
         "Tab/Shift+Tab select groups",
         "Left/Right collapse/expand",
         "/ filter, ? help",
         "a/A select Blocked/Error agents",
-        "Enter or left click navigate, w details",
-        "q/Esc close the current view; Ctrl-C quits",
+        "Enter or left click jump to the agent, w details",
+        "Esc closes Details/Help or clears the filter; q quits; Ctrl-C quits from any view",
         "Enter on a collapsed group expands it",
     ] {
         assert!(help.contains(controls), "missing CLI help: {controls}");

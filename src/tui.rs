@@ -5,7 +5,7 @@ use ratatui::{
     Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Paragraph},
 };
 
@@ -15,8 +15,9 @@ mod list;
 mod presentation;
 use list::{Group, GroupBy, GroupKey, groups, matching_indices};
 use presentation::{
-    COLUMN_LABELS, clip_text, columns, compact_line, home_path, measure_columns, shortcuts,
-    status_color, status_text, wrap_details,
+    STATUSES, clip_text, column_label, columns, compact_line, compact_spans, field_lines,
+    home_path, measure_columns, plural, shortcuts, spans_width, status_fg, status_summary,
+    status_text,
 };
 
 #[derive(Debug)]
@@ -47,19 +48,45 @@ enum ListRow {
     },
 }
 
+/// A short-lived response to the latest action. The next list input clears it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Feedback {
+    text: String,
+    warning: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Motion {
+    Previous,
+    Next,
+    PageUp,
+    PageDown,
+    First,
+    Last,
+}
+
+const SELECTED_BG: Color = Color::DarkGray;
+const SELECTION_REMOVED: &str =
+    "Selected agent is no longer available. Use ↑/↓ or click to select another.";
+
 /// View and input state only. The caller supplies snapshots and runs navigation.
 #[derive(Default)]
 pub struct App {
     pub snapshot: Snapshot,
+    /// A persistent condition reported by the caller, such as a connection or
+    /// client error. Empty while healthy. Feedback for user actions is separate.
     pub message: String,
     pub connected: bool,
     pub navigating: bool,
     pub client: Option<String>,
     pub diagnostic: String,
+    feedback: Option<Feedback>,
+    jump_target: Option<String>,
     group_by: GroupBy,
     collapsed: BTreeSet<GroupKey>,
     query: String,
     filter_edit: Option<String>,
+    filter_edit_selection: Option<EntryId>,
     selected: Option<EntryId>,
     selection_missing: bool,
     received_snapshot: bool,
@@ -70,6 +97,9 @@ pub struct App {
     details_scroll: usize,
     details_limit: usize,
     viewport: Rect,
+    page: usize,
+    /// The drawn scrollbar column. Clicks there select nothing.
+    scrollbar: Option<u16>,
     hits: Vec<HitRegion>,
     group_hits: Vec<GroupHit>,
 }
@@ -105,18 +135,111 @@ impl App {
         self.received_snapshot = true;
     }
 
+    /// Record a failed refresh. Before the first snapshot, Brachio is still connecting.
+    pub fn refresh_failed(&mut self, error: &str) {
+        self.connected = false;
+        self.message = if self.received_snapshot {
+            format!("Rex disconnected; showing the last known agents; navigation disabled: {error}")
+        } else {
+            format!("Cannot reach Rex; retrying: {error}")
+        };
+    }
+
+    /// Record the outcome of a navigation request, or a request that could not be sent.
+    pub fn navigation_finished(&mut self, result: Result<(), String>) {
+        self.navigating = false;
+        let target = self.jump_target.take();
+        match result {
+            Ok(()) => {
+                self.diagnostic =
+                    "Rex accepted app selection; native display is not verified by Brachio".into();
+                if let Some(target) = target {
+                    self.set_feedback(format!("Rex accepted the jump to {target}."), false);
+                }
+            }
+            Err(error) => {
+                self.diagnostic = error.clone();
+                self.set_feedback(error, true);
+            }
+        }
+    }
+
+    /// The text the footer shows: action feedback, then the persistent message,
+    /// then a reminder that the selected agent disappeared.
+    pub fn notice(&self) -> &str {
+        if let Some(feedback) = &self.feedback {
+            &feedback.text
+        } else if !self.message.is_empty() || !self.selection_missing {
+            &self.message
+        } else {
+            SELECTION_REMOVED
+        }
+    }
+
+    fn set_feedback(&mut self, text: impl Into<String>, warning: bool) {
+        self.feedback = Some(Feedback {
+            text: text.into(),
+            warning,
+        });
+    }
+
     fn clear_hits(&mut self) {
         self.hits.clear();
         self.group_hits.clear();
     }
 
+    fn agent_at(&self, x: u16, y: u16) -> Option<&Entry> {
+        if self.scrollbar == Some(x) {
+            return None;
+        }
+        self.hits
+            .iter()
+            .find(|hit| contains(hit.area, x, y))
+            .map(|hit| &hit.entry)
+    }
+
+    fn group_at(&self, x: u16, y: u16) -> Option<&GroupKey> {
+        if self.scrollbar == Some(x) {
+            return None;
+        }
+        self.group_hits
+            .iter()
+            .find(|hit| contains(hit.area, x, y))
+            .map(|hit| &hit.key)
+    }
+
     pub fn discard_redraw_click(&mut self) {
         if !self.details && !self.help {
-            self.message = "List redrawn; click again to select the displayed row".into();
+            self.set_feedback(
+                "List redrawn; click again to select the displayed row",
+                true,
+            );
         }
     }
 
     pub fn handle_event(&mut self, event: Event) -> Option<Action> {
+        // List input replaces the previous feedback. Opening an overlay keeps it so
+        // Details can show it, and overlays return to the same footer.
+        let overlay = self.details || self.help;
+        let clears = !overlay
+            && match &event {
+                Event::Key(key) => {
+                    key.kind != KeyEventKind::Release
+                        && (self.filter_edit.is_some()
+                            || !matches!(key.code, KeyCode::Char('w' | '?')))
+                }
+                // A click on empty space or a stale map does nothing, so it keeps feedback.
+                Event::Mouse(mouse) => {
+                    matches!(mouse.kind, MouseEventKind::Down(_))
+                        && (self.agent_at(mouse.column, mouse.row).is_some()
+                            || self.group_at(mouse.column, mouse.row).is_some())
+                }
+                Event::Paste(_) => self.filter_edit.is_some(),
+                _ => false,
+            };
+        if clears {
+            self.feedback = None;
+        }
         if let Event::Key(key) = &event {
             if key.kind == KeyEventKind::Release {
                 return None;
@@ -130,10 +253,17 @@ impl App {
                 match key.code {
                     KeyCode::Esc => {
                         self.query = self.filter_edit.take().unwrap_or_default();
+                        if let Some(previous) = self.filter_edit_selection.take()
+                            && self.snapshot.entries.iter().any(|e| e.id == previous)
+                        {
+                            self.selected = Some(previous);
+                            self.selection_missing = false;
+                        }
                         self.filter_changed();
                     }
                     KeyCode::Enter => {
                         self.filter_edit = None;
+                        self.filter_edit_selection = None;
                         self.clear_hits();
                     }
                     KeyCode::Backspace => {
@@ -156,7 +286,11 @@ impl App {
                     }
                     KeyCode::Up | KeyCode::Down => {
                         self.clear_hits();
-                        self.move_selection(key.code == KeyCode::Down);
+                        self.move_selection(if key.code == KeyCode::Down {
+                            Motion::Next
+                        } else {
+                            Motion::Previous
+                        });
                     }
                     _ => {}
                 }
@@ -174,6 +308,9 @@ impl App {
                         key.code == KeyCode::PageDown,
                         usize::from(self.viewport.height).max(1),
                     ),
+                    KeyCode::Home | KeyCode::End => {
+                        self.scroll_details(key.code == KeyCode::End, usize::MAX)
+                    }
                     _ => {}
                 }
                 return None;
@@ -184,12 +321,29 @@ impl App {
                     | KeyCode::Down
                     | KeyCode::Left
                     | KeyCode::Right
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
                     | KeyCode::Enter
                     | KeyCode::Char('j' | 'k' | 'g' | 'G' | 'a' | 'A' | '/' | '?' | 'w')
             ) || (self.group_by != GroupBy::None
                 && matches!(key.code, KeyCode::Tab | KeyCode::BackTab));
             if mutating {
                 self.clear_hits();
+            }
+            let motion = match key.code {
+                KeyCode::Up | KeyCode::Char('k') => Some(Motion::Previous),
+                KeyCode::Down | KeyCode::Char('j') => Some(Motion::Next),
+                KeyCode::PageUp => Some(Motion::PageUp),
+                KeyCode::PageDown => Some(Motion::PageDown),
+                KeyCode::Home => Some(Motion::First),
+                KeyCode::End => Some(Motion::Last),
+                _ => None,
+            };
+            if let Some(motion) = motion {
+                self.move_selection(motion);
+                return None;
             }
             return match key.code {
                 KeyCode::Char('q') => Some(Action::Quit),
@@ -198,13 +352,9 @@ impl App {
                     self.filter_changed();
                     None
                 }
-                KeyCode::Esc => Some(Action::Quit),
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.move_selection(false);
-                    None
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.move_selection(true);
+                KeyCode::Esc => {
+                    // Escape backs out of views; it never quits a long-running monitor.
+                    self.set_feedback("Press q to quit.", false);
                     None
                 }
                 KeyCode::Char('g' | 'G') => {
@@ -231,6 +381,7 @@ impl App {
                 }
                 KeyCode::Char('/') => {
                     self.filter_edit = Some(self.query.clone());
+                    self.filter_edit_selection = self.selected.clone();
                     None
                 }
                 KeyCode::Char('?') => {
@@ -273,16 +424,8 @@ impl App {
             }
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
-                    let group = self
-                        .group_hits
-                        .iter()
-                        .find(|hit| contains(hit.area, mouse.column, mouse.row))
-                        .map(|hit| hit.key.clone());
-                    let clicked = self
-                        .hits
-                        .iter()
-                        .find(|hit| contains(hit.area, mouse.column, mouse.row))
-                        .map(|hit| hit.entry.clone());
+                    let group = self.group_at(mouse.column, mouse.row).cloned();
+                    let clicked = self.agent_at(mouse.column, mouse.row).cloned();
                     self.clear_hits();
                     if let Some(key) = group {
                         if self.current_groups().iter().any(|group| group.key == key) {
@@ -292,14 +435,16 @@ impl App {
                     }
                     let entry = clicked?;
                     if !self.snapshot.entries.contains(&entry) {
-                        self.message =
-                            "The list changed. Draw the list again before clicking.".into();
+                        self.set_feedback(
+                            "The list changed. Draw the list again before clicking.",
+                            true,
+                        );
                         return None;
                     }
                     self.selected = Some(entry.id);
                     self.selection_missing = false;
                     self.filter_edit = None;
-                    self.message.clear();
+                    self.filter_edit_selection = None;
                     self.navigate_selected()
                 }
                 MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
@@ -332,10 +477,17 @@ impl App {
         }
     }
 
+    /// A deliberate filter change selects the first match when the current
+    /// selection is hidden, so Enter after filtering jumps to a visible agent.
     fn filter_changed(&mut self) {
         self.clear_hits();
         self.scroll = 0;
         self.reveal_selection = true;
+        if self.selected_row().is_none()
+            && let Some(&(_, index)) = self.selection_targets().first()
+        {
+            self.select_index(index);
+        }
     }
 
     fn current_groups(&self) -> Vec<Group> {
@@ -365,6 +517,23 @@ impl App {
             }
         }
         rows
+    }
+
+    /// Selectable rows as `(row, entry index)`: agents and collapsed headers.
+    fn selection_targets(&self) -> Vec<(usize, usize)> {
+        self.list_rows()
+            .iter()
+            .enumerate()
+            .filter_map(|(row, value)| match value {
+                ListRow::Agent(index)
+                | ListRow::Header {
+                    first: index,
+                    collapsed: true,
+                    ..
+                } => Some((row, *index)),
+                _ => None,
+            })
+            .collect()
     }
 
     fn selected_index(&self) -> Option<usize> {
@@ -423,39 +592,43 @@ impl App {
     fn selection_removed(&mut self) {
         self.selected = None;
         self.selection_missing = true;
-        self.message =
-            "Selected agent is no longer available. Use ↑/↓ or click to select another.".into();
+        self.set_feedback(SELECTION_REMOVED, true);
     }
 
-    fn move_selection(&mut self, down: bool) {
-        let rows = self.list_rows();
-        let targets: Vec<_> = rows
-            .iter()
-            .enumerate()
-            .filter_map(|(row, value)| match value {
-                ListRow::Agent(index)
-                | ListRow::Header {
-                    first: index,
-                    collapsed: true,
-                    ..
-                } => Some((row, *index)),
-                _ => None,
-            })
-            .collect();
+    fn move_selection(&mut self, motion: Motion) {
+        let targets = self.selection_targets();
         if targets.is_empty() {
             return;
         }
+        let last = targets.len() - 1;
         let current = self
             .selected_row()
             .and_then(|row| targets.iter().position(|target| target.0 == row));
-        let next = match current {
-            Some(index) if down => (index + 1).min(targets.len() - 1),
-            Some(index) => index.saturating_sub(1),
-            None if down => 0,
-            None => targets.len() - 1,
+        let page = self.page.max(1);
+        let next = match (motion, current) {
+            (Motion::First, _) => 0,
+            (Motion::Last, _) => last,
+            (Motion::Next, Some(index)) => (index + 1).min(last),
+            (Motion::Previous, Some(index)) => index.saturating_sub(1),
+            (Motion::PageDown, Some(index)) => {
+                let row = targets[index].0 + page;
+                targets
+                    .iter()
+                    .position(|target| target.0 >= row)
+                    .unwrap_or(last)
+            }
+            (Motion::PageUp, Some(index)) => {
+                let row = targets[index].0.saturating_sub(page);
+                targets
+                    .iter()
+                    .rposition(|target| target.0 <= row)
+                    .unwrap_or(0)
+            }
+            (Motion::Next | Motion::PageDown, None) => 0,
+            (Motion::Previous | Motion::PageUp, None) => last,
         };
         if current == Some(next) {
-            // A bounded arrow must not replace a collapsed group's retained member.
+            // A bounded move must not replace a collapsed group's retained member.
             self.reveal_selection = true;
             return;
         }
@@ -493,7 +666,7 @@ impl App {
             })
             .collect();
         if indices.is_empty() {
-            self.message = "No matching Blocked or Error agents.".into();
+            self.set_feedback("No matching Blocked or Error agents.", false);
             return;
         }
         let current = self.selected_index();
@@ -521,7 +694,7 @@ impl App {
         self.selected = Some(self.snapshot.entries[index].id.clone());
         self.selection_missing = false;
         self.reveal_selection = true;
-        self.message.clear();
+        self.feedback = None;
     }
 
     fn navigate_selected(&mut self) -> Option<Action> {
@@ -538,33 +711,44 @@ impl App {
                 return None;
             }
         } else if self.selected_index().is_some() {
-            self.message = "Selected agent is hidden by the filter. Clear the filter or select a visible agent.".into();
+            self.set_feedback(
+                "Selected agent is hidden by the filter. Clear the filter or select a visible agent.",
+                true,
+            );
             return None;
         }
         if !self.connected {
-            self.message = "Rex is disconnected; navigation is disabled.".into();
+            self.set_feedback("Rex is disconnected; navigation is disabled.", true);
             return None;
         }
         if self.navigating {
-            self.message = "Navigation is already in progress.".into();
+            self.set_feedback("Navigation is already in progress.", false);
             return None;
         }
         let Some(index) = self.selected_index() else {
             if self.selected.is_some() || self.selection_missing {
                 self.selection_removed();
             } else {
-                self.message = "No agent selected. Use ↑/↓ or click a row.".into();
+                self.set_feedback("No agent selected. Use ↑/↓ or click a row.", false);
             }
             return None;
         };
         let entry = self.snapshot.entries[index].clone();
         self.navigating = true;
-        self.message = format!("Switching to {}.", entry.location);
+        let target = entry.location.to_string();
+        self.set_feedback(format!("Jumping to {target}…"), false);
+        self.jump_target = Some(target);
         Some(Action::Navigate(Box::new(entry)))
+    }
+
+    /// Listed values are stale after a failed refresh that followed a snapshot.
+    fn stale(&self) -> bool {
+        !self.connected && self.received_snapshot
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
         self.clear_hits();
+        self.scrollbar = None;
         self.viewport = Rect::default();
         let area = frame.area();
         if area.width == 0 || area.height == 0 {
@@ -598,8 +782,10 @@ impl App {
         );
         self.viewport = body;
         let height = usize::from(body.height);
+        self.page = height.max(1);
         let rows = self.list_rows();
-        let headers = self.current_groups().len() >= 2;
+        let groups = self.current_groups();
+        let headers = groups.len() >= 2;
         let mut hidden = [false; 6];
         if headers {
             match self.group_by {
@@ -628,40 +814,26 @@ impl App {
             matching.iter().map(|&index| &self.snapshot.entries[index]),
             home.as_deref(),
         );
-        let layout = columns(Rect::new(area.x, body.y, area.width, 1), measured, hidden);
+        // The rightmost cell is reserved for the scrollbar whether or not the
+        // list overflows, so folding or filtering never shifts the columns.
+        let layout = columns(column_area(body), measured, hidden);
         if title_height > 0 {
-            let count = matching.len();
-            let total = self.snapshot.entries.len();
-            let count = if self.query.is_empty() {
-                count.to_string()
-            } else {
-                format!("{count}/{total}")
-            };
-            let grouping = if self.group_by == GroupBy::None {
-                String::new()
-            } else {
-                format!("Group: {} | ", self.group_by.label())
-            };
             frame.render_widget(
-                Paragraph::new(clip_text(
-                    &format!("brachio | {grouping}{count} agents"),
-                    area.width,
-                    false,
-                ))
-                .style(Style::default().add_modifier(Modifier::BOLD)),
+                Paragraph::new(self.title(area.width, &matching)),
                 Rect::new(area.x, area.y, area.width, 1),
             );
         }
         if header_height > 0 {
             let header = Rect::new(area.x, area.y + title_height, area.width, 1);
-            for (label, mut column) in COLUMN_LABELS
-                .into_iter()
-                .zip(layout.areas.into_iter().skip(1))
-            {
+            for (index, mut column) in layout.areas.into_iter().skip(1).enumerate() {
                 column.y = header.y;
                 frame.render_widget(
-                    Paragraph::new(clip_text(label, column.width, false))
-                        .style(Style::default().add_modifier(Modifier::BOLD)),
+                    Paragraph::new(clip_text(
+                        column_label(index, column.width),
+                        column.width,
+                        false,
+                    ))
+                    .style(Style::default().add_modifier(Modifier::BOLD)),
                     column,
                 );
             }
@@ -674,48 +846,38 @@ impl App {
             }
         }
         if rows.is_empty() {
-            let text = if self.snapshot.entries.is_empty() {
+            let text = if !self.received_snapshot {
+                "Connecting to Rex…"
+            } else if self.snapshot.entries.is_empty() {
                 "No agents with reported status."
             } else {
                 "No agents match the filter. Esc clears it."
             };
             frame.render_widget(Paragraph::new(text), body);
         }
+        let dim = if self.stale() {
+            Modifier::DIM
+        } else {
+            Modifier::empty()
+        };
         for (offset, row) in rows.iter().skip(self.scroll).take(height).enumerate() {
             let row_area = Rect::new(body.x, body.y + offset as u16, body.width, 1);
             match row {
-                ListRow::Header {
-                    key,
-                    label,
-                    count,
-                    collapsed,
-                    ..
-                } => {
+                ListRow::Header { key, collapsed, .. } => {
                     let selected = *collapsed && selected_row == Some(self.scroll + offset);
+                    let members = groups
+                        .iter()
+                        .find(|group| &group.key == key)
+                        .map_or(&[][..], |group| group.entries.as_slice());
+                    let line =
+                        self.header_line(row, members, selected, row_area.width, home.as_deref());
                     let style = if selected {
-                        Style::default().bg(Color::DarkGray).fg(Color::White)
+                        Style::default().bg(SELECTED_BG).fg(Color::White)
                     } else {
-                        Style::default().add_modifier(Modifier::BOLD)
-                    };
-                    let label = if self.group_by == GroupBy::Cwd {
-                        home_path(label, home.as_deref())
-                    } else {
-                        label.clone()
-                    };
-                    let marker = if *collapsed { "▸" } else { "▾" };
-                    let suffix = format!(" ({count})");
-                    let text = if row_area.width < suffix.len() as u16 + 2 {
-                        count.to_string()
-                    } else {
-                        let label = clip_text(
-                            &label,
-                            row_area.width - suffix.len() as u16 - 2,
-                            self.group_by == GroupBy::Cwd,
-                        );
-                        format!("{marker} {label}{suffix}")
+                        Style::default()
                     };
                     frame.render_widget(
-                        Paragraph::new(clip_text(&text, row_area.width, false)).style(style),
+                        Paragraph::new(line).style(style.add_modifier(dim)),
                         row_area,
                     );
                     self.group_hits.push(GroupHit {
@@ -727,10 +889,11 @@ impl App {
                     let entry = &self.snapshot.entries[*index];
                     let selected = self.selected.as_ref() == Some(&entry.id);
                     let style = if selected {
-                        Style::default().bg(Color::DarkGray).fg(Color::White)
+                        Style::default().bg(SELECTED_BG).fg(Color::White)
                     } else {
                         Style::default()
-                    };
+                    }
+                    .add_modifier(dim);
                     frame.render_widget(Block::default().style(style), row_area);
                     let [marker, status, agent, cwd, session, tab, pane] =
                         layout.areas.map(|mut column| {
@@ -747,7 +910,7 @@ impl App {
                             status.width,
                             false,
                         ))
-                        .style(style.fg(status_color(entry.status))),
+                        .style(style.fg(status_fg(entry.status, selected))),
                         status,
                     );
                     frame.render_widget(
@@ -779,82 +942,228 @@ impl App {
                 }
             }
         }
+        if rows.len() > height && height > 0 && body.width >= 3 {
+            draw_scrollbar(frame, body, self.scroll, rows.len());
+            self.scrollbar = Some(body.right() - 1);
+        }
         if footer_height == 2 {
-            let text = if self.filter_edit.is_some() {
-                clip_text(&format!("/ {}▏", self.query), area.width, true)
+            let line = if self.filter_edit.is_some() {
+                Line::raw(clip_text(&format!("/ {}▏", self.query), area.width, true))
             } else {
-                shortcuts(area.width, headers)
+                let attention = matching
+                    .iter()
+                    .filter(|&&index| {
+                        matches!(
+                            self.snapshot.entries[index].status,
+                            Status::Blocked | Status::Error
+                        )
+                    })
+                    .count();
+                shortcuts(area.width, headers, attention)
             };
             frame.render_widget(
-                Paragraph::new(text),
+                Paragraph::new(line),
                 Rect::new(area.x, area.bottom() - 2, area.width, 1),
             );
         }
-        let (text, color) = self.footer(area.width);
         frame.render_widget(
-            Paragraph::new(text).style(Style::default().fg(color)),
+            Paragraph::new(self.footer(area.width)),
             Rect::new(area.x, area.bottom() - 1, area.width, 1),
         );
     }
 
-    fn footer(&self, width: u16) -> (String, Color) {
-        let matching = matching_indices(&self.snapshot, &self.query);
-        if self.filter_edit.is_some() {
-            let count = format!("{}/{} agents", matching.len(), self.snapshot.entries.len());
-            return (
-                compact_line(&["Enter Apply", "Esc Cancel", &count], width),
-                Color::Cyan,
-            );
+    /// Group header: fold marker, label, count, and a status summary when it fits.
+    fn header_line(
+        &self,
+        row: &ListRow,
+        members: &[usize],
+        selected: bool,
+        width: u16,
+        home: Option<&str>,
+    ) -> Line<'static> {
+        let ListRow::Header {
+            label,
+            count,
+            collapsed,
+            ..
+        } = row
+        else {
+            return Line::default();
+        };
+        let (count, collapsed) = (*count, *collapsed);
+        // Headers start one marker column left of agent rows to keep the hierarchy.
+        // The full-row highlight marks a selected collapsed header.
+        let available = usize::from(width);
+        let suffix = format!(" ({count})");
+        if available < suffix.len() + 2 {
+            return Line::raw(clip_text(&count.to_string(), width, false));
         }
-        let (state, mut color) = if !self.connected {
-            ("Disconnected; navigation disabled", Color::Red)
+        let label = if self.group_by == GroupBy::Cwd {
+            home_path(label, home)
+        } else {
+            label.to_owned()
+        };
+        // A summary only adds information when members are hidden or differ;
+        // a single-status group's count already says everything.
+        let statuses: Vec<_> = members
+            .iter()
+            .map(|&index| self.snapshot.entries[index].status)
+            .collect();
+        let mixed = statuses.windows(2).any(|pair| pair[0] != pair[1]);
+        let summary = if self.group_by == GroupBy::Status || !(collapsed || mixed) {
+            Vec::new()
+        } else {
+            status_summary(statuses, selected)
+        };
+        let summary_width = spans_width(&summary);
+        let base = 2 + suffix.len();
+        let label_width = Line::raw(label.as_str()).width();
+        let show_summary =
+            summary_width > 0 && available >= base + label_width.min(8) + 2 + summary_width;
+        let room = available - base - if show_summary { 2 + summary_width } else { 0 };
+        let label = clip_text(&label, room as u16, self.group_by == GroupBy::Cwd);
+        let mut spans = vec![
+            Span::raw(if collapsed { "▸ " } else { "▾ " }),
+            Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(suffix),
+        ];
+        if show_summary {
+            spans.push(Span::raw("  "));
+            spans.extend(summary);
+        }
+        Line::from(spans)
+    }
+
+    /// Title: name, agent count, colored status counts, grouping, and active
+    /// filter. Status counts drop first when narrow, then grouping; the filter clips.
+    fn title(&self, width: u16, matching: &[usize]) -> Line<'static> {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let count = self.received_snapshot.then(|| {
+            let total = self.snapshot.entries.len();
+            if self.query.is_empty() {
+                plural(total, "agent", "agents")
+            } else {
+                format!("{}/{}", matching.len(), plural(total, "agent", "agents"))
+            }
+        });
+        let filter = (!self.query.is_empty() && self.filter_edit.is_none())
+            .then(|| format!("Filter: {}", display_text(&self.query)));
+        let group =
+            (self.group_by != GroupBy::None).then(|| format!("Group: {}", self.group_by.label()));
+        let summary = status_summary(
+            matching
+                .iter()
+                .map(|&index| self.snapshot.entries[index].status),
+            false,
+        );
+        let width = usize::from(width);
+        let joined = |parts: &[String]| {
+            parts.iter().fold(String::new(), |mut text, part| {
+                text.push_str(" · ");
+                text.push_str(part);
+                text
+            })
+        };
+        let cells = |text: &str| Line::raw(text).width();
+        let head = format!("brachio{}", joined(&Vec::from_iter(count)));
+        let mut rest: Vec<String> = group.iter().chain(&filter).cloned().collect();
+        let summary_width = spans_width(&summary);
+        let show_summary =
+            summary_width > 0 && cells(&head) + 3 + summary_width + cells(&joined(&rest)) <= width;
+        if show_summary {
+            // Everything fits, so nothing below needs clipping.
+            let mut spans = vec![
+                Span::styled("brachio", bold),
+                Span::raw(head["brachio".len()..].to_owned()),
+                Span::raw(" · "),
+            ];
+            spans.extend(summary);
+            spans.push(Span::raw(joined(&rest)));
+            return Line::from(spans);
+        }
+        if cells(&head) + cells(&joined(&rest)) > width {
+            rest = Vec::from_iter(filter.clone());
+        }
+        if let Some(filter) = &filter
+            && cells(&head) + cells(&joined(&rest)) > width
+        {
+            let room = width.saturating_sub(cells(&head) + 3);
+            rest = if room >= 8 {
+                vec![clip_text(filter, room as u16, false)]
+            } else {
+                Vec::new()
+            };
+        }
+        let text = clip_text(&(head + &joined(&rest)), width as u16, false);
+        match text.strip_prefix("brachio") {
+            Some(rest) => Line::from(vec![
+                Span::styled("brachio", bold),
+                Span::raw(rest.to_owned()),
+            ]),
+            None => Line::styled(text, bold),
+        }
+    }
+
+    fn connection_state(&self) -> (&'static str, Color) {
+        if !self.connected && !self.received_snapshot {
+            ("Connecting", Color::Yellow)
+        } else if !self.connected {
+            ("Disconnected", Color::Red)
         } else if self.navigating {
             ("Navigating", Color::Yellow)
         } else {
             ("Connected", Color::Green)
-        };
-        let count = if self.query.is_empty() {
-            format!("{} agents", matching.len())
-        } else {
-            format!("{}/{} agents", matching.len(), self.snapshot.entries.len())
-        };
-        let warnings = format!("{} warnings (w)", self.snapshot.warnings.len());
-        let attention_count = matching
-            .iter()
-            .filter(|&&index| {
-                matches!(
-                    self.snapshot.entries[index].status,
-                    Status::Blocked | Status::Error
-                )
-            })
-            .count();
-        let working_count = matching
-            .iter()
-            .filter(|&&index| self.snapshot.entries[index].status == Status::Working)
-            .count();
-        let attention = format!("{attention_count} attention");
-        let working = format!("{working_count} working");
-        let mut parts = vec![state];
-        if !self.snapshot.warnings.is_empty() {
-            parts.push(&warnings);
-            if self.connected {
-                color = Color::Yellow;
+        }
+    }
+
+    /// Status line: connection state, warning count, and the current notice.
+    /// A notice that does not fit is clipped and points to Details.
+    fn footer(&self, width: u16) -> Line<'static> {
+        let matching = matching_indices(&self.snapshot, &self.query);
+        if self.filter_edit.is_some() {
+            let count = format!("{}/{} agents", matching.len(), self.snapshot.entries.len());
+            return Line::styled(
+                compact_line(&["Enter Apply", "Esc Cancel", "↑↓ Select", &count], width),
+                Style::default().fg(Color::Cyan),
+            );
+        }
+        let (state, color) = self.connection_state();
+        let mut parts = vec![Span::styled(state, Style::default().fg(color))];
+        let warnings = self.snapshot.warnings.len();
+        if warnings > 0 {
+            parts.push(Span::styled(
+                format!("{} (w)", plural(warnings, "warning", "warnings")),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        let mut line = compact_spans(&parts, width);
+        let notice = display_text(self.notice());
+        let used = line.width();
+        let room = usize::from(width).saturating_sub(used + 3);
+        if !notice.is_empty() && room > 0 && used > 0 {
+            let style = match &self.feedback {
+                Some(Feedback { warning: true, .. }) => Style::default().fg(Color::Yellow),
+                Some(_) => Style::default(),
+                None if !self.connected => Style::default().fg(Color::Red),
+                None => Style::default().fg(Color::Yellow),
+            };
+            let size = Line::raw(notice.as_str()).width();
+            let text = if size <= room {
+                Some(notice)
+            } else if room >= 8 {
+                Some(format!(
+                    "{} (w)",
+                    clip_text(&notice, room as u16 - 4, false)
+                ))
+            } else {
+                None
+            };
+            if let Some(text) = text {
+                line.push_span(Span::raw(" · "));
+                line.push_span(Span::styled(text, style));
             }
         }
-        if !self.message.is_empty() && !self.navigating {
-            parts.push("Notice (w)");
-            if self.connected {
-                color = Color::Yellow;
-            }
-        }
-        parts.push(&count);
-        if attention_count > 0 {
-            parts.push(&attention);
-        }
-        if working_count > 0 {
-            parts.push(&working);
-        }
-        (compact_line(&parts, width), color)
+        line
     }
 
     fn toggle_details(&mut self) {
@@ -883,35 +1192,23 @@ impl App {
     }
 
     fn draw_details(&mut self, frame: &mut Frame) {
-        let mut values = vec![
-            format!(
-                "Message: {}",
-                if self.message.is_empty() {
-                    "No current message."
-                } else {
-                    &self.message
-                }
-            ),
-            format!(
-                "Client ID: {}",
-                self.client.as_deref().unwrap_or("Not pinned")
-            ),
-            format!("Last navigation: {}", self.diagnostic),
-            "Session focus is shared with other connected clients.".into(),
-            format!("Grouping: {}", self.group_by.label()),
-            format!("Filter: {}", self.query),
-            format!("Warnings: {}", self.snapshot.warnings.len()),
-        ];
-        if self.snapshot.warnings.is_empty() {
-            values.push("No snapshot warnings.".into());
-        }
-        for (index, warning) in self.snapshot.warnings.iter().enumerate() {
-            values.push(format!("{}. {}", index + 1, warning));
-        }
+        let width = frame.area().width;
+        let heading = Style::default().add_modifier(Modifier::BOLD);
+        let label = Style::default().fg(Color::Gray);
+        let none = |value: &str| {
+            if value.is_empty() {
+                "None".to_owned()
+            } else {
+                value.to_owned()
+            }
+        };
+        let mut lines = vec![Line::styled("Selected agent", heading)];
+        let field = |lines: &mut Vec<Line<'static>>, name: &str, value: &str| {
+            lines.extend(field_lines(name, value, 17, width, label, Style::default()));
+        };
         if let Some(index) = self.selected_index() {
             let entry = &self.snapshot.entries[index];
-            values.push(String::new());
-            for (label, value) in [
+            for (name, value) in [
                 ("Agent", entry.name.as_str()),
                 ("Status", entry.status.label()),
                 (
@@ -933,37 +1230,206 @@ impl App {
                 ("Tab ID", entry.target.window.as_str()),
                 ("Pane ID", entry.target.block.as_str()),
             ] {
-                values.push(format!("{label}: {value}"));
+                field(&mut lines, name, value);
             }
+        } else {
+            lines.extend(field_lines(
+                "",
+                "No agent selected.",
+                0,
+                width,
+                label,
+                Style::default(),
+            ));
         }
-        self.draw_overlay(frame, "Details", values);
+        lines.push(Line::default());
+        lines.push(Line::styled("Activity", heading));
+        let latest = self
+            .feedback
+            .as_ref()
+            .map_or_else(String::new, |feedback| feedback.text.clone());
+        field(&mut lines, "Latest", &none(&latest));
+        field(&mut lines, "Connection", &none(&self.message));
+        field(&mut lines, "Last navigation", &none(&self.diagnostic));
+        lines.push(Line::default());
+        lines.push(Line::styled("Rex", heading));
+        field(&mut lines, "State", self.connection_state().0);
+        field(
+            &mut lines,
+            "Client ID",
+            self.client.as_deref().unwrap_or("Not pinned"),
+        );
+        field(
+            &mut lines,
+            "Shared focus",
+            "Session focus is shared with other connected clients.",
+        );
+        lines.push(Line::default());
+        lines.push(Line::styled("View", heading));
+        field(&mut lines, "Grouping", self.group_by.label());
+        field(&mut lines, "Filter", &none(&self.query));
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            format!("Warnings ({})", self.snapshot.warnings.len()),
+            heading,
+        ));
+        if self.snapshot.warnings.is_empty() {
+            lines.extend(field_lines(
+                "",
+                "No snapshot warnings.",
+                0,
+                width,
+                label,
+                Style::default(),
+            ));
+        }
+        let number_width = format!("{}.", self.snapshot.warnings.len()).len();
+        for (index, warning) in self.snapshot.warnings.iter().enumerate() {
+            let number = format!("{}.", index + 1);
+            lines.extend(field_lines(
+                &number,
+                warning,
+                number_width,
+                width,
+                label,
+                Style::default(),
+            ));
+        }
+        self.draw_overlay(frame, "Details", lines);
     }
 
     fn draw_help(&mut self, frame: &mut Frame) {
-        let values = [
-            "↑ / ↓ or k / j: Select previous / next visible agent. Collapsed headers are selectable.",
-            "Enter: Navigate to the selected visible agent. On a collapsed header, expand only.",
-            "g / G (Shift+g): Cycle None, Agent, Status, CWD, Session forward / backward.",
-            "Tab / Shift+Tab: Next / previous group, with wraparound. No effect in None.",
-            "← / →: Collapse / expand the selected group. Headers appear only for two or more groups.",
-            "Mouse: Click a group header to toggle it; click an agent to select and navigate. Wheel scrolls.",
-            "/: Edit a case-insensitive filter. All space-separated terms must match.",
-            "Filter fields: agent:codex cwd:project session:work status:blocked. Unqualified terms also match Tab and Pane.",
-            "Filter editing: Type or paste text, Backspace deletes, Enter applies without navigation, Esc restores the previous filter.",
-            "Esc on the list: Clear an active filter, otherwise quit. q quits the list.",
-            "a / A: Next / previous matching Blocked or Error agent; expand its group.",
-            "w: Full selected-agent values, status source, exact IDs, client diagnostics, messages, and warnings.",
-            "?: Keyboard help. q / Esc closes details or help. Ctrl-C always quits.",
-            "Details / help: ↑ / ↓, PageUp / PageDown, or wheel scrolls.",
-            "Statuses: ! Blocked, × Error, ✓ Done, ● Working, ○ Idle.",
-            "Unrecognized states use Idle, as the Rex schema requires.",
-            "Foreground identity without reports uses an Idle fallback. Details identifies the no-report source.",
-            "Blocked is not proof that input is needed. Done is a reported state, not whole-session completion.",
-        ].into_iter().map(String::from).collect();
-        self.draw_overlay(frame, "Help", values);
+        const SECTIONS: &[(&str, &[(&str, &str)])] = &[
+            (
+                "Move",
+                &[
+                    (
+                        "↑ ↓  k j",
+                        "Select the previous or next row. Collapsed group headers are selectable.",
+                    ),
+                    ("PgUp PgDn", "Move the selection one page."),
+                    ("Home End", "Select the first or last row."),
+                    (
+                        "a  A",
+                        "Select the next or previous matching Blocked or Error agent and expand its group.",
+                    ),
+                    ("Wheel", "Scroll the list without changing the selection."),
+                ],
+            ),
+            (
+                "Jump",
+                &[
+                    (
+                        "Enter",
+                        "Jump to the selected agent in Rex. On a collapsed group, expand only.",
+                    ),
+                    (
+                        "Click",
+                        "Jump to an agent. Clicking a group header only collapses or expands it.",
+                    ),
+                ],
+            ),
+            (
+                "Group",
+                &[
+                    (
+                        "g  G",
+                        "Cycle grouping forward or backward: None, Agent, Status, CWD, Session.",
+                    ),
+                    (
+                        "Tab  Shift+Tab",
+                        "Select the next or previous group, with wraparound.",
+                    ),
+                    ("←  →", "Collapse or expand the selected group."),
+                ],
+            ),
+            (
+                "Filter",
+                &[
+                    (
+                        "/",
+                        "Edit the filter. The first match is selected when the selection is hidden.",
+                    ),
+                    (
+                        "Enter  Esc",
+                        "While editing: apply without jumping, or restore the previous filter.",
+                    ),
+                    ("Esc", "Clear the active filter."),
+                    (
+                        "Terms",
+                        "Case-insensitive; every space-separated term must match. Prefixes: agent: cwd: session: status:. Other terms also match Tab and Pane.",
+                    ),
+                ],
+            ),
+            (
+                "Views",
+                &[
+                    (
+                        "w",
+                        "Details: selected agent, exact IDs, messages, and warnings.",
+                    ),
+                    ("?", "This help."),
+                    ("Esc  q", "Close Details or Help."),
+                    ("q", "Quit from the list. Ctrl-C quits from any view."),
+                ],
+            ),
+        ];
+        let width = frame.area().width;
+        let heading = Style::default().add_modifier(Modifier::BOLD);
+        let key = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let mut lines = Vec::new();
+        for (title, rows) in SECTIONS {
+            if !lines.is_empty() {
+                lines.push(Line::default());
+            }
+            lines.push(Line::styled(*title, heading));
+            for (keys, description) in *rows {
+                lines.extend(field_lines(
+                    keys,
+                    description,
+                    14,
+                    width,
+                    key,
+                    Style::default(),
+                ));
+            }
+        }
+        lines.push(Line::default());
+        lines.push(Line::styled("Statuses", heading));
+        let mut legend = vec![Span::raw(if width >= 8 { "  " } else { "" })];
+        for status in STATUSES {
+            if legend.len() > 1 {
+                legend.push(Span::raw("  "));
+            }
+            legend.push(Span::styled(
+                status_text(status, false),
+                Style::default().fg(status_fg(status, false)),
+            ));
+        }
+        if Line::from(legend.clone()).width() <= usize::from(width) {
+            lines.push(Line::from(legend));
+        } else {
+            for status in STATUSES {
+                lines.push(Line::styled(
+                    status_text(status, false),
+                    Style::default().fg(status_fg(status, false)),
+                ));
+            }
+        }
+        lines.extend(field_lines(
+            "",
+            "Unrecognized states and agents without a status report use Idle, as the Rex schema requires. Details shows the status source.",
+            0,
+            width,
+            key,
+            Style::default(),
+        ));
+        self.draw_overlay(frame, "Help", lines);
     }
 
-    fn draw_overlay(&mut self, frame: &mut Frame, title: &str, values: Vec<String>) {
+    fn draw_overlay(&mut self, frame: &mut Frame, title: &str, lines: Vec<Line<'static>>) {
         let area = frame.area();
         let title_height = u16::from(area.height >= 3);
         let body = Rect::new(
@@ -973,25 +1439,32 @@ impl App {
             area.height - title_height - 1,
         );
         self.viewport = body;
-        let lines: Vec<Line<'static>> = values
-            .iter()
-            .flat_map(|value| wrap_details(&display_text(value), body.width))
-            .collect();
         let count = lines.len();
         let height = usize::from(body.height);
         self.details_limit = count.saturating_sub(height);
         self.details_scroll = self.details_scroll.min(self.details_limit);
+        let scrollable = self.details_limit > 0;
         if title_height > 0 {
+            let text = clip_text(&format!("brachio · {title}"), area.width, false);
+            let mut spans = vec![Span::styled(
+                text.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )];
+            if scrollable {
+                let position = format!(
+                    "lines {}–{} of {count}",
+                    self.details_scroll + 1,
+                    (self.details_scroll + height).min(count)
+                );
+                let used = Line::raw(text.as_str()).width();
+                let size = Line::raw(position.as_str()).width();
+                if used + 2 + size <= usize::from(area.width) {
+                    spans.push(Span::raw(" ".repeat(usize::from(area.width) - used - size)));
+                    spans.push(Span::styled(position, Style::default().fg(Color::Gray)));
+                }
+            }
             frame.render_widget(
-                Paragraph::new(clip_text(
-                    &format!(
-                        "brachio | {title} | lines {}/{count}",
-                        self.details_scroll + 1
-                    ),
-                    area.width,
-                    false,
-                ))
-                .style(Style::default().add_modifier(Modifier::BOLD)),
+                Paragraph::new(Line::from(spans)),
                 Rect::new(area.x, area.y, area.width, 1),
             );
         }
@@ -1005,14 +1478,39 @@ impl App {
             ),
             body,
         );
+        let hints: &[&str] = if scrollable {
+            &["↑↓/PgUp/PgDn Scroll", "Esc/q Back", "Ctrl-C Quit"]
+        } else {
+            &["Esc/q Back", "Ctrl-C Quit"]
+        };
         frame.render_widget(
-            Paragraph::new(clip_text(
-                "↑↓/Wheel Scroll · Esc/q Back · Ctrl-C Quit",
-                area.width,
-                false,
-            )),
+            Paragraph::new(compact_line(hints, area.width)),
             Rect::new(area.x, area.bottom() - 1, area.width, 1),
         );
+    }
+}
+
+/// Columns use the list width minus one reserved scrollbar cell.
+fn column_area(body: Rect) -> Rect {
+    let reserve = u16::from(body.width >= 3);
+    Rect::new(body.x, body.y, body.width - reserve, 1)
+}
+
+/// A proportional thumb in the reserved rightmost column.
+fn draw_scrollbar(frame: &mut Frame, body: Rect, scroll: usize, rows: usize) {
+    let height = usize::from(body.height);
+    let max_scroll = rows - height;
+    let thumb = ((height * height + rows / 2) / rows).clamp(1, height);
+    let start = (scroll * (height - thumb) * 2 + max_scroll) / (2 * max_scroll);
+    let x = body.right() - 1;
+    let buffer = frame.buffer_mut();
+    for offset in 0..height {
+        let cell = &mut buffer[(x, body.y + offset as u16)];
+        if (start..start + thumb).contains(&offset) {
+            cell.set_symbol("┃").set_fg(Color::Gray);
+        } else {
+            cell.set_symbol("│").set_fg(Color::DarkGray);
+        }
     }
 }
 

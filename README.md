@@ -14,7 +14,7 @@ Brachio does not send prompts, keys, or commands to agents. It is not a native s
 - An open Rex app. Brachio uses the `session.select` app action to show a session or tab. This action requires **Remote Control**.
   - In Rex, open **Settings → Rex Server** and enable **Remote Control**. It is off by default.
   - Enable this only if you accept remote app control. Brachio does not change it.
-  - If disabled, Rex rejects app selection with `Rex.app is not accepting actions`. Press `w` in Brachio to read the full error. After enabling the permission, press Enter on the target agent to retry.
+  - If disabled, Rex rejects app selection with `Rex.app is not accepting actions`. Brachio shows the error in its status line until your next action; press `w` to read the full text. After enabling the permission, press Enter on the target agent to retry.
 
 After publication, install from either registry:
 
@@ -65,33 +65,35 @@ Brachio uses the CLI's normal server connection. Check `rex whoami --json` befor
 | Input | Operation |
 | --- | --- |
 | Up / Down or k / j | Select the previous / next visible agent; collapsed headers are selectable |
+| PageUp / PageDown | Move the selection by one page of rows |
+| Home / End | Select the first / last row |
 | g / G | Cycle grouping forward / backward: None → Agent → Status → CWD → Session |
 | Tab / Shift+Tab | Select the first matching agent in the next / previous group; wrap at either end |
 | Left / Right | Collapse / expand the selected group |
-| Enter | Navigate to the selected visible agent; on a collapsed group, expand only |
-| Left click | Select and navigate to an agent row; a group-header click only toggles its fold |
+| Enter | Jump to the selected visible agent in Rex; on a collapsed group, expand only |
+| Left click | Select and jump to an agent row; a group-header click only toggles its fold |
 | Mouse wheel | Scroll without changing the selected agent |
-| / | Edit the filter incrementally |
+| / | Edit the filter incrementally; a hidden selection moves to the first match |
 | a / A | Select the next / previous matching Blocked or Error agent; wrap and expand its group |
-| w | Open Details with diagnostics, messages, warnings, status source, and full selected-agent values |
-| ? | Open keyboard help |
-| Up / Down, PageUp / PageDown, or wheel in overlays | Scroll Details or Help |
-| q / Escape in overlays | Close Details or Help first; w also closes Details and ? closes Help |
-| q / Escape on the list | q exits; Escape clears a query first, otherwise exits |
+| w | Open Details: full selected-agent values and IDs, status source, latest messages, client, view, and warnings |
+| ? | Open keyboard help, grouped by task |
+| Up / Down, PageUp / PageDown, Home / End, or wheel in overlays | Scroll Details or Help |
+| q / Escape in overlays | Close Details or Help; w also closes Details and ? closes Help |
+| q / Escape on the list | q exits; Escape clears an active filter and never exits |
 | Ctrl-C | Quit from any view, including filter editing |
 | Terminal resize | Recalculate the layout and visible rows |
 
 The list has six independent columns: **Status**, **Agent**, **Working directory** (CWD), **Session**, **Tab**, and **Pane**. Session, Tab, and Pane use readable names, never a combined Location field or ID suffixes. Unnamed locations use display positions; generated tab names become `Tab N`.
 
-Column widths use the terminal-cell width of matching agent values and headings, including agents in collapsed groups. Two spaces separate visible columns. Extra terminal width stays on the right rather than spreading columns apart. Natural widths are capped at 9, 20, 48, 24, 20, and 24 cells respectively. The selected-row highlight still spans the whole terminal width.
+Column widths use the terminal-cell width of matching agent values and headings, including agents in collapsed groups. Two spaces separate visible columns. Extra terminal width stays on the right rather than spreading columns apart. Natural widths are capped at 9, 20, 48, 24, 20, and 24 cells respectively. The rightmost cell is reserved for a scrollbar that appears when rows overflow the view. Columns never use that cell, so folding, filtering, and scrolling do not shift them. The selected-row highlight still spans the whole terminal width, and status labels on that row turn white for contrast; the status symbol still identifies the state.
 
-When space is limited, values shorten before lower-priority columns disappear. Pane, Tab, and Session are hidden in that order when their minimum widths no longer fit. Very small views use status symbols and shorter Agent/CWD values before hiding essential fields. Visibility follows measured content, not fixed terminal-width breakpoints. Hidden values remain available in Details.
+When space is limited, values shorten before lower-priority columns disappear. Pane, Tab, and Session are hidden in that order when their minimum widths no longer fit. Very small views use status symbols and shorter Agent/CWD values before hiding essential fields. A **Working directory** heading that no longer fits becomes **CWD**. Visibility follows measured content, not fixed terminal-width breakpoints. Hidden values remain available in Details.
 
 Long names end with `…`; long directories keep the path end visible. An absolute path under `HOME` is displayed with `~` at a path-component boundary. Abbreviation and clipping change display only: Details retains the original full path and exact navigation IDs.
 
 The default **None** view keeps the original ungrouped list and its status, location, and exact identity order. It has no grouping title or group headers. Keyboard hints appear only below the list. When space permits, a solid line appears below the column headings.
 
-Grouped views show the mode in the title. Foldable headers with matching-agent counts appear only when at least two nonempty groups remain after filtering. With zero or one group, there are no group headers or folds. Under actual multiple headers, Status, Agent, CWD, or Session grouping hides its matching data column without leaving an empty gap. With one group, that column returns. Tab and Pane remain independent in every mode. Equal group values appear together:
+Grouped views show the mode in the title. Foldable headers with matching-agent counts appear only when at least two nonempty groups remain after filtering. Headers start one column left of agent rows. Except in Status grouping, a header also summarizes its members' statuses, such as `!1 ●2`, when the group is collapsed or mixes statuses, so a collapsed group still shows Blocked or Error members. The summary drops out before the label and count when space is short. A selected collapsed header uses the full-row highlight. With zero or one group, there are no group headers or folds. Under actual multiple headers, Status, Agent, CWD, or Session grouping hides its matching data column without leaving an empty gap. With one group, that column returns. Tab and Pane remain independent in every mode. Equal group values appear together:
 
 - **Agent** uses canonical agent names.
 - **Status** uses this priority: **Blocked, Error, Done, Working, Idle**.
@@ -105,11 +107,15 @@ Press `g` or `G` to change the grouping mode without changing the selected agent
 
 Left / Right folds the selected group only when multiple group headers exist. A header click toggles that group without changing the selected agent or navigating. Collapsing the selected agent's group retains its exact ID; Enter expands the group without navigation. Press Enter again to navigate to that agent.
 
-Press `/` to edit a case-insensitive substring filter. Every whitespace-separated term must match (AND). Use `agent:`, `cwd:`, `session:`, or `status:` to restrict a term to that field. Unqualified terms also search tab and pane names; unknown prefixes are literal text. For example, `agent:pi cwd:project status:blocked` requires all three matches. Filtering updates while you type or paste. Enter applies the query without navigation; Escape cancels editing and restores the previous query. Outside editing, Escape clears a query before it can exit. Filtering retains the selected ID, but a hidden selection cannot navigate. Use arrows, a group jump, an attention jump, or a click to select a matching target.
+Press `/` to edit a case-insensitive substring filter. Every whitespace-separated term must match (AND). Use `agent:`, `cwd:`, `session:`, or `status:` to restrict a term to that field. Unqualified terms also search tab and pane names; unknown prefixes are literal text. For example, `agent:pi cwd:project status:blocked` requires all three matches. Filtering updates while you type or paste. A filter edit keeps the selected ID while it still matches; otherwise it selects the first match, so Enter after filtering jumps to a visible agent. Enter applies the query without navigation; Escape cancels editing and restores the previous query and, if that agent still exists, the previous selection. Outside editing, Escape clears the query. The title shows the active filter.
 
-The bounded footer shows connection state, compact agent counts, and nonzero attention (Blocked/Error) and working counts when space permits. It omits zero-warning text, UUIDs, and full diagnostics. A warning count or `Notice (w)` points to Details; `?` shows all controls even when footer hints do not fit.
+A refresh that hides the selected agent, for example after a status change, does not select another agent. A hidden selection cannot navigate. Use arrows, a group jump, an attention jump, or a click to select a matching target.
 
-Selection uses the session ID, block ID, and canonical agent name, not a row number. If the selected entry disappears, navigation stops until you deliberately select another row with arrows, a group jump, or a click. Snapshot changes invalidate old mouse hit regions. Queued input is read before list redraws; mouse-down events that arrive during a redraw are discarded with a retry message rather than mapped to a replacement row. Terminal events do not carry a display-generation token, so this is not a guarantee about delayed physical input.
+The title shows the agent count followed by colored nonzero status counts, such as `!2 ×1 ●3`, then the grouping mode and active filter. When space is short, status counts drop first, then the grouping mode, and then the filter is clipped. Keyboard hints below the list include `a Attention (N)` when matching agents are Blocked or Error.
+
+The status line shows the connection state (**Connecting** before the first snapshot, then **Connected**, **Navigating**, or **Disconnected**), a nonzero warning count, and the latest notice. A notice is either feedback for your last action, such as a navigation error, or a persistent connection or client problem. Feedback lasts until your next list input; refreshes and opening Details or Help do not clear it. A notice that does not fit ends with `… (w)`, and Details shows the full text. `?` shows all controls even when footer hints do not fit.
+
+Selection uses the session ID, block ID, and canonical agent name, not a row number. If the selected entry disappears, navigation stops until you deliberately select another row with arrows, a group jump, a filter edit, or a click. Snapshot changes invalidate old mouse hit regions. Queued input is read before list redraws; mouse-down events that arrive during a redraw are discarded with a retry message rather than mapped to a replacement row. Terminal events do not carry a display-generation token, so this is not a guarantee about delayed physical input.
 
 **Working directory** means the current directory (CWD) reported by Rex for the recognized foreground agent. It is not an inferred workspace or repository root. Missing directories, exited agents, and unrelated foreground processes show `Unknown`. Brachio uses the existing process query; it does not send commands to the agent or inspect local project files.
 
@@ -135,7 +141,7 @@ Recognized status `app` / `effective_app` values are `pi`, `claude-code` (alias 
 
 A background worker obtains the initial snapshot. The CLI event stream invalidates snapshots; event bursts are coalesced. Full reconciliation also runs two seconds after each completed refresh, so missed or unknown events cannot permanently leave old state. Commands run outside the input/render loop. One dedicated navigation thread performs focus and app selection; read-only snapshot and event workers cannot change focus. A slow full-session scan does not delay navigation to a healthy target pane.
 
-A failed server snapshot retains the old list as stale, shows a disconnected status, and disables navigation. Per-session or per-pane failures produce a partial list and warnings. Event-stream loss is shown as a warning while periodic snapshots continue; the listener reconnects. A silent recovered listener remains marked uncertain until it delivers an event.
+Until the first snapshot arrives, the list shows `Connecting to Rex…` and failed attempts are retried. A later failed server snapshot retains the old list, dimmed as stale, shows a disconnected status, and disables navigation. Per-session or per-pane failures produce a partial list and warnings. Event-stream loss is shown as a warning while periodic snapshots continue; the listener reconnects. A silent recovered listener remains marked uncertain until it delivers an event.
 
 Navigation rechecks the pinned client, action schema, pane location, and agent identity. It then issues exact-ID `focus`, verifies the resulting server focus, and sends `session.select` with both session and window IDs to that client. It does not retry a failed mutation or select a nearby pane.
 
