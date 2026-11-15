@@ -16,6 +16,7 @@ concurrency:
 
 jobs:
   notes:
+    name: notes
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
@@ -36,6 +37,7 @@ jobs:
         run: bash .github/scripts/check-pr-notes.sh
 
   release:
+    name: release
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     outputs:
@@ -83,6 +85,7 @@ jobs:
           fi
 
   validate:
+    name: validate
     needs: release
     if: needs.release.outputs.publication-needed == 'true' && needs.release.outputs.release-commit != ''
     runs-on: ubuntu-latest
@@ -95,7 +98,7 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: false
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # zizmor: ignore[superfluous-actions] -- Select stable independently of the runner default.
         with:
           components: rustfmt, clippy
       - run: uv lock --check
@@ -106,6 +109,7 @@ jobs:
       - run: cargo publish --locked --dry-run
 
   wheels:
+    name: wheels (${{ matrix.runner }}, ${{ matrix.target }})
     needs: [release, validate]
     strategy:
       fail-fast: false
@@ -158,6 +162,7 @@ jobs:
           if-no-files-found: error
 
   crates-io:
+    name: crates-io
     needs: [release, validate, wheels]
     runs-on: ubuntu-latest
     environment:
@@ -165,13 +170,13 @@ jobs:
       url: https://crates.io/crates/brachio
     permissions:
       contents: read
-      id-token: write
+      id-token: write # Request a short-lived crates.io publishing token.
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.release.outputs.release-commit }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # zizmor: ignore[superfluous-actions] -- Select stable independently of the runner default.
       - name: Authenticate with crates.io
         id: auth
         uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
@@ -181,6 +186,7 @@ jobs:
         run: cargo publish --locked
 
   pypi:
+    name: pypi
     needs: [validate, wheels]
     runs-on: ubuntu-latest
     environment:
@@ -198,4 +204,5 @@ jobs:
       - name: Publish to PyPI
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
-        run: uv publish --trusted-publishing never --check-url https://pypi.org/simple/ dist/*
+        # PyPI uses its configured environment token; Trusted Publishing is not configured.
+        run: uv publish --trusted-publishing never --check-url https://pypi.org/simple/ dist/* # zizmor: ignore[use-trusted-publishing]

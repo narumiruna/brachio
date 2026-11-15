@@ -263,7 +263,7 @@ class ReleaseWorkflow(unittest.TestCase):
 
     def test_non_release_paths_automatically_exempt_missing_entries(self):
         for path in (".github/workflows/release.yml", ".github/scripts/helper.sh",
-                     "docs/guide.md", "tests/test.py", "README.md", "AGENTS.md",
+                     "docs/guide.md", "tests/test.py", "README.md", "AGENTS.md", "prek.toml",
                      ".changenote/README.md", "docs/line\nname with spaces.md"):
             with self.subTest(path=path):
                 result, args = self.run_note_check(changes={path: "updated\n"})
@@ -283,6 +283,12 @@ class ReleaseWorkflow(unittest.TestCase):
     def test_mixed_source_and_ci_changes_keep_normal_coverage(self):
         result, args = self.run_note_check(changes={"src/main.rs": "updated\n",
                                                     ".github/workflows/release.yml": "updated\n"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--skip-release", args)
+
+    def test_mixed_source_and_prek_changes_keep_normal_coverage(self):
+        result, args = self.run_note_check(changes={"src/main.rs": "updated\n",
+                                                    "prek.toml": "updated\n"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("--skip-release", args)
 
