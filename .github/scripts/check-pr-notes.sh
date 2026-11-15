@@ -15,7 +15,7 @@ batch_changed=false
 while IFS= read -r -d '' path; do
   has_changes=true
   case "$path" in
-    docs/*|tests/*|.github/*|.changenote/*.md|.changenote/config.json|README.md|AGENTS.md) ;;
+    docs/*|tests/*|.github/*|.changenote/*.md|.changenote/config.json|README.md|AGENTS.md|prek.toml) ;;
     *) non_release_only=false ;;
   esac
   case "$path" in

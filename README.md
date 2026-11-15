@@ -168,16 +168,33 @@ Rex labels and reports are untrusted display text. Control characters and direct
 
 ## Verification
 
+Install [prek](https://prek.j178.dev/) and the Rust components, then enable the Git hooks:
+
 ```sh
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
+uv tool install prek==0.5.10
+rustup component add rustfmt clippy
+prek install
+```
+
+`prek.toml` checks YAML, file endings, whitespace, and GitHub Actions security with zizmor. It also runs formatting and Clippy when Rust source files change. Run all hooks and the tests:
+
+```sh
+prek run --all-files
+cargo test --locked --all-targets
 cargo build --release
 uv lock --check
 uv build
 uvx --isolated --no-index --find-links dist brachio --version
 uvx --isolated --no-index --find-links dist brachio --help
 ```
+
+Apply Clippy fixes with the manual hook:
+
+```sh
+prek run clippy-fix --all-files --stage manual
+```
+
+The `clippy-fix` hook can change Rust source files with staged or unstaged changes. Review the diff after it runs. Normal Git hooks and CI do not run this hook.
 
 `uv build` builds a source distribution, then builds the local platform wheel from it. The CLI smoke tests do not start the TUI or contact Rex.
 

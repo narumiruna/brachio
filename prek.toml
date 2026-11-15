@@ -1,0 +1,58 @@
+#:schema https://www.schemastore.org/prek.json
+
+# Changenote owns the exact format of the generated changelog.
+exclude = '^CHANGELOG\.md$'
+
+[[repos]]
+repo = "https://github.com/pre-commit/pre-commit-hooks"
+rev = "v6.0.0"
+
+[[repos.hooks]]
+id = "check-yaml"
+
+[[repos.hooks]]
+id = "end-of-file-fixer"
+
+[[repos.hooks]]
+id = "mixed-line-ending"
+args = ["--fix=lf"]
+
+[[repos.hooks]]
+id = "trailing-whitespace"
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "rustfmt"
+name = "Rust format"
+entry = "cargo fmt --check"
+language = "system"
+pass_filenames = false
+types = ["rust"]
+
+[[repos.hooks]]
+id = "clippy"
+name = "Rust lint"
+entry = "cargo clippy --locked --all-targets -- -D warnings"
+language = "system"
+pass_filenames = false
+types = ["rust"]
+
+[[repos.hooks]]
+id = "clippy-fix"
+name = "Rust lint fix"
+entry = "cargo clippy --fix --allow-dirty --locked --all-targets -- -D warnings"
+language = "system"
+pass_filenames = false
+types = ["rust"]
+stages = ["manual"]
+
+[[repos]]
+repo = "https://github.com/zizmorcore/zizmor-pre-commit"
+rev = "v1.30.1"
+
+[[repos.hooks]]
+id = "zizmor"
+args = ["--pedantic", "."]
+pass_filenames = false

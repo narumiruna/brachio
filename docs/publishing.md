@@ -45,7 +45,7 @@ Fetch the base ref before checking if it is unavailable. The configured default 
 
 The script automatically selects the missing-entry policy from the committed changes since the merge base:
 
-- Changes only under `docs/`, `tests/`, or `.github/`, plus `.changenote/*.md`, `.changenote/config.json`, `README.md`, and `AGENTS.md`, automatically waive the missing-entry requirement.
+- Changes only under `docs/`, `tests/`, or `.github/`, plus `.changenote/*.md`, `.changenote/config.json`, `README.md`, `AGENTS.md`, and `prek.toml`, automatically waive the missing-entry requirement.
 - A managed Release PR needs no new entry when all these conditions hold:
   - Its head and base repositories match the current repository, and its base branch matches the comparison branch.
   - Its head branch is `narumi/chore/changenote-release-<base>`, and its body starts with `<!-- changenote-release-pr -->`.
