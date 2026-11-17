@@ -184,12 +184,12 @@ Use this procedure only when preparing a release outside the automatic Release P
 
 To prepare an authorized version change:
 
-1. Start from a clean checkout with committed notes. Run `changenote status` and review the package, bump, summaries, and target version.
+1. Start from a clean checkout with committed notes. Run `uv lock --offline` before versioning. If it changes `uv.lock`, review and commit that change separately. Continue only from a clean checkout. Run `changenote status` and review the package, bump, summaries, and target version.
 2. Populate the package caches with `cargo fetch --locked` and `uv build` before versioning. Changenote refreshes the existing `Cargo.lock` with `cargo update --workspace --offline`.
 3. Run `changenote version` only with explicit versioning authorization. It updates `Cargo.toml` and `Cargo.lock`, writes `CHANGELOG.md`, and removes consumed notes without creating `.changenote/releases.json`. The first nonempty release with the new CLI also removes an existing regular legacy batch file. Do not edit the generated release tree by hand.
-4. Run `uv lock --offline` separately to refresh Python dependency metadata. The dynamic Python version is not a configured changenote output and need not appear in `uv.lock`. Inspect the diff for unrelated changes.
+4. Run `uv lock --check`. If it fails, stop. Do not add a lockfile refresh to the release commit. This configuration does not generate `uv.lock`. The Action rejects release commits with changes outside the generated release tree.
 5. Run `changenote status` again and confirm that the consumed notes are no longer pending. Run the local verification commands and review the Linux and macOS Checks jobs and the [Rex compatibility limits](rex-compatibility.md#external-handoff).
-6. Commit only the intended release files, including entry deletions, any legacy batch deletion, changelog, manifests, and changed lockfiles. PRs outside the managed Release PR rules use normal package coverage.
+6. Commit only Changenote-generated changes: `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, consumed note deletions, and any legacy batch deletion. Do not include `uv.lock` or unrelated changes. PRs outside the managed Release PR rules use normal package coverage.
 
 After the release commit is merged and the checkout is clean, create local tags only with separate tag authorization:
 
