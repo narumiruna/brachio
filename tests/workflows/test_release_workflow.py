@@ -69,7 +69,7 @@ class ReleaseWorkflow(unittest.TestCase):
         self.assertEqual(len(steps), 4)
         action = self.step("release", "Manage release")
         self.assertEqual(action["uses"],
-                         "changenote/action@992cb488a3c7c8470bdbe904007fc33419b1cb00")
+                         "changenote/action@b5a808ce21642ccc01587dc66fd34ce522b74da9")
         self.assertEqual(action["id"], "release")
         self.assertEqual(action["with"], {
             "github-token": "${{ secrets.PAT_TOKEN }}",
