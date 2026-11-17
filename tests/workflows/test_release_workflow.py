@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import urllib.request
+
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -18,22 +20,40 @@ class ReleaseWorkflow(unittest.TestCase):
             Loader=yaml.BaseLoader,
         )
         cls.jobs = cls.workflow["jobs"]
+        cls.build_workflow = yaml.load(
+            (ROOT / ".github/workflows/build-release.yml").read_text(),
+            Loader=yaml.BaseLoader,
+        )
+        cls.build_jobs = cls.build_workflow["jobs"]
 
     def step(self, job, name):
-        return next(step for step in self.jobs[job]["steps"] if step.get("name") == name)
+        jobs = self.build_jobs if job in self.build_jobs else self.jobs
+        return next(step for step in jobs[job]["steps"] if step.get("name") == name)
 
-    def test_pr_note_script_is_wired_and_valid_bash(self):
-        step = self.step("notes", "Check PR notes")
-        self.assertEqual(step["shell"], "bash")
-        self.assertEqual(step["run"], "bash .github/scripts/check-pr-notes.sh")
-        script = ROOT / ".github/scripts/check-pr-notes.sh"
+    def test_pr_note_policy_and_check_action_are_wired(self):
+        policy = self.step("notes", "Select note policy")
+        self.assertEqual(policy["id"], "note-policy")
+        self.assertEqual(policy["shell"], "bash")
+        self.assertEqual(policy["run"], "bash .github/scripts/pr-note-policy.sh")
+        self.assertEqual(policy["env"], {"BASE_BRANCH": "${{ github.base_ref }}"})
+        script = ROOT / ".github/scripts/pr-note-policy.sh"
         self.assertNotIn("${{", script.read_text())
+        self.assertNotIn("uvx", script.read_text())
         result = subprocess.run(["bash", "-n", str(script)],
                                 text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.step("notes", "Check PR notes")["env"], {
-            "BASE_BRANCH": "${{ github.base_ref }}",
+        action = self.step("notes", "Check PR notes")
+        self.assertEqual(action["uses"],
+                         "changenote/action/check@b5a808ce21642ccc01587dc66fd34ce522b74da9")
+        self.assertEqual(action["with"], {
+            "since": "refs/remotes/origin/${{ github.base_ref }}",
+            "coverage": "package",
+            "skip-release": "${{ steps.note-policy.outputs.skip-release }}",
+            "reason": "${{ steps.note-policy.outputs.reason }}",
         })
+        self.assertNotIn("if", action)
+        self.assertNotIn("continue-on-error", action)
+        self.assertEqual(len(self.jobs["notes"]["steps"]), 3)
         self.assertNotIn("labels", json.dumps(self.jobs["notes"]))
 
     def test_event_routing_and_manual_pr_management(self):
@@ -51,22 +71,31 @@ class ReleaseWorkflow(unittest.TestCase):
 
     def test_secret_and_permission_boundaries(self):
         self.assertEqual(self.workflow["permissions"], {"contents": "read"})
-        for name, job in self.jobs.items():
-            with self.subTest(job=name):
-                permissions = job.get("permissions", self.workflow["permissions"])
-                self.assertEqual(permissions.get("id-token", "none"),
-                                 "write" if name == "crates-io" else "none")
-                if name != "release":
-                    self.assertNotIn("PAT_TOKEN", json.dumps(job))
-                for step in job["steps"]:
-                    if step.get("uses", "").startswith("actions/checkout@"):
-                        self.assertEqual(step["with"]["persist-credentials"], "false")
+        self.assertEqual(self.build_workflow["permissions"], {"contents": "read"})
+        for workflow in (self.workflow, self.build_workflow):
+            for name, job in workflow["jobs"].items():
+                with self.subTest(job=name):
+                    permissions = job.get("permissions", workflow["permissions"])
+                    self.assertEqual(permissions.get("id-token", "none"),
+                                     "write" if name == "crates-io" else "none")
+                    if name != "release":
+                        self.assertNotIn("PAT_TOKEN", json.dumps(job))
+                    for step in job.get("steps", []):
+                        if step.get("uses", "").startswith("actions/checkout@"):
+                            self.assertEqual(step["with"]["persist-credentials"], "false")
+        build = json.dumps(self.build_workflow)
+        for secret in ("PAT_TOKEN", "PYPI_TOKEN", "CARGO_REGISTRY_TOKEN"):
+            self.assertNotIn(secret, build)
+        self.assertNotIn("secrets", self.jobs["build"])
+        for job in self.build_jobs.values():
+            self.assertNotIn("environment", job)
+            self.assertNotIn("concurrency", job)
 
     def test_release_uses_one_root_action(self):
         steps = self.jobs["release"]["steps"]
         self.assertEqual(steps[1]["with"]["ref"], "${{ github.sha }}")
         self.assertEqual(steps[1]["with"]["fetch-depth"], "0")
-        self.assertEqual(len(steps), 4)
+        self.assertEqual(len(steps), 3)
         action = self.step("release", "Manage release")
         self.assertEqual(action["uses"],
                          "changenote/action@b5a808ce21642ccc01587dc66fd34ce522b74da9")
@@ -78,53 +107,25 @@ class ReleaseWorkflow(unittest.TestCase):
             "create-github-releases": "true",
         })
         self.assertNotIn("if", action)
-        self.assertEqual(action["continue-on-error"], "true")
+        self.assertNotIn("continue-on-error", action)
 
-    def test_release_result_checks_only_failed_actions(self):
-        step = self.step("release", "Check release result")
-        self.assertEqual(step["if"], "steps.release.outcome == 'failure'")
-        self.assertEqual(step["shell"], "bash")
-        self.assertEqual(step["env"], {
-            "RELEASE_READY": "${{ steps.release.outputs.ready }}",
-            "PUBLICATION_NEEDED": "${{ steps.release.outputs.publication-needed }}",
-            "RELEASE_COMMIT": "${{ steps.release.outputs.release-commit }}",
-        })
+    def test_release_action_failure_stops_downstream_work(self):
+        for job in self.jobs.values():
+            self.assertNotIn("continue-on-error", job)
+            self.assertNotIn("always()", job.get("if", ""))
+            for step in job.get("steps", []):
+                self.assertNotIn("continue-on-error", step)
+        self.assertNotIn("Check release result", json.dumps(self.workflow))
+        self.assertEqual(self.jobs["build"]["needs"], "release")
+        self.assertEqual(self.jobs["crates-io"]["needs"], ["release", "build"])
+        self.assertEqual(self.jobs["pypi"]["needs"], "build")
 
-    def run_release_result(self, ready="true", needed="true", commit="a" * 40):
-        env = dict(os.environ, RELEASE_READY=ready, PUBLICATION_NEEDED=needed,
-                   RELEASE_COMMIT=commit)
-        script = self.step("release", "Check release result")["run"]
-        self.assertNotIn("${{", script)
-        return subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script],
-                              env=env, text=True, capture_output=True, timeout=10)
-
-    def test_completed_publication_keeps_pr_failure_from_blocking_registry_retries(self):
-        result = self.run_release_result()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("::warning::Release PR management failed.", result.stdout)
-        self.assertIn("registry jobs will continue", result.stdout)
-
-    def test_other_action_failures_still_fail_the_release_job(self):
-        cases = [
-            {"ready": "false"},
-            {"ready": ""},
-            {"needed": "false"},
-            {"needed": ""},
-            {"commit": ""},
-            {"commit": "a" * 39},
-            {"commit": "A" * 40},
-            {"commit": "a" * 40 + "\ninjected"},
-        ]
-        for values in cases:
-            with self.subTest(values=values):
-                result = self.run_release_result(**values)
-                self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertIn("::error::Changenote did not complete", result.stdout)
-                self.assertNotIn("::warning::", result.stdout)
-
-    def test_pr_checks_use_unpinned_cli(self):
-        self.assertEqual(self.step("notes", "Show pending releases")["run"],
-                         "uvx changenote status --include-note-paths")
+    def test_actions_own_cli_setup_and_reports(self):
+        for job, name in (("notes", "Check PR notes"), ("release", "Manage release")):
+            action = self.step(job, name)
+            self.assertNotIn("version", action["with"])
+            self.assertNotIn("cli-path", action["with"])
+        self.assertNotIn("uvx", json.dumps(self.jobs["notes"]))
 
     def test_root_outputs_preserve_publication_state(self):
         self.assertEqual(self.jobs["release"]["outputs"], {
@@ -134,26 +135,57 @@ class ReleaseWorkflow(unittest.TestCase):
         })
 
     def test_registry_jobs_use_verified_commit_and_build_gates(self):
-        self.assertEqual(self.jobs["validate"]["needs"], "release")
-        self.assertEqual(self.jobs["validate"]["if"],
+        build = self.jobs["build"]
+        self.assertEqual(build["needs"], "release")
+        self.assertEqual(build["if"],
                          "needs.release.outputs.publication-needed == 'true' && needs.release.outputs.release-commit != ''")
-        self.assertEqual(self.jobs["wheels"]["needs"], ["release", "validate"])
-        self.assertEqual(self.jobs["crates-io"]["needs"], ["release", "validate", "wheels"])
-        self.assertEqual(self.jobs["pypi"]["needs"], ["validate", "wheels"])
+        self.assertEqual(build["uses"], "./.github/workflows/build-release.yml")
+        self.assertEqual(build["with"], {
+            "release-commit": "${{ needs.release.outputs.release-commit }}",
+            "version": "${{ needs.release.outputs.version }}",
+        })
+        self.assertEqual(set(self.build_workflow["on"]), {"workflow_call"})
+        inputs = self.build_workflow["on"]["workflow_call"]["inputs"]
+        self.assertEqual(set(inputs), {"release-commit", "version"})
+        for value in inputs.values():
+            self.assertEqual(value["type"], "string")
+            self.assertEqual(value["required"], "true")
+        self.assertEqual(set(self.build_jobs), {"validate", "wheels"})
+        self.assertNotIn("needs", self.build_jobs["validate"])
+        self.assertEqual(self.build_jobs["wheels"]["needs"], "validate")
+        self.assertEqual(self.build_jobs["wheels"]["strategy"]["fail-fast"], "false")
+        self.assertEqual(self.jobs["crates-io"]["needs"], ["release", "build"])
+        self.assertEqual(self.jobs["pypi"]["needs"], "build")
         self.assertEqual(self.step("wheels", "Check installed wheel")["env"],
-                         {"EXPECTED_VERSION": "${{ needs.release.outputs.version }}"})
-        self.assertNotIn("outputs", self.jobs["validate"])
-        for name in ("validate", "wheels", "crates-io"):
-            checkout = self.jobs[name]["steps"][0]
-            self.assertEqual(checkout["with"]["ref"], "${{ needs.release.outputs.release-commit }}")
+                         {"EXPECTED_VERSION": "${{ inputs.version }}"})
+        for job in self.build_jobs.values():
+            self.assertNotIn("outputs", job)
+            self.assertEqual(job["steps"][0]["with"]["ref"], "${{ inputs.release-commit }}")
+        checkout = self.jobs["crates-io"]["steps"][0]
+        self.assertEqual(checkout["with"]["ref"], "${{ needs.release.outputs.release-commit }}")
         self.assertEqual(self.step("wheels", "Build source distribution")["if"],
                          "matrix.target == 'x86_64-unknown-linux-gnu'")
         for name in ("crates-io", "pypi"):
             self.assertEqual(self.jobs[name]["environment"]["name"], name)
 
+    def test_artifacts_stay_in_the_current_workflow_run(self):
+        upload = self.build_jobs["wheels"]["steps"][-1]
+        self.assertEqual(upload["with"], {
+            "name": "python-${{ matrix.target }}",
+            "path": "dist/*",
+            "if-no-files-found": "error",
+        })
+        download = self.jobs["pypi"]["steps"][0]
+        self.assertTrue(download["uses"].startswith("actions/download-artifact@"))
+        self.assertEqual(download["with"], {
+            "pattern": "python-*",
+            "merge-multiple": "true",
+            "path": "dist",
+        })
+
     def test_wheel_matrix_uses_supported_native_runners(self):
-        self.assertEqual(self.jobs["wheels"]["runs-on"], "${{ matrix.runner }}")
-        matrix = self.jobs["wheels"]["strategy"]["matrix"]["include"]
+        self.assertEqual(self.build_jobs["wheels"]["runs-on"], "${{ matrix.runner }}")
+        matrix = self.build_jobs["wheels"]["strategy"]["matrix"]["include"]
         self.assertEqual(matrix, [
             {"runner": "ubuntu-latest", "target": "x86_64-unknown-linux-gnu"},
             {"runner": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-gnu"},
@@ -188,8 +220,8 @@ class ReleaseWorkflow(unittest.TestCase):
                     self.assertIn("Set the PAT_TOKEN repository secret", result.stdout)
 
     def run_note_check(self, base="main", changes=None, event=None, ref="main",
-                       cli_exit=0, real_cli=False, legacy_batch=True):
-        step = self.step("notes", "Check PR notes")
+                       cli_exit=0, real_cli=False, legacy_batch=True, check_script=None):
+        step = self.step("notes", "Select note policy")
         self.assertNotIn("${{", step["run"])
         with tempfile.TemporaryDirectory() as temporary:
             top = Path(temporary)
@@ -243,17 +275,58 @@ class ReleaseWorkflow(unittest.TestCase):
             if not real_cli:
                 env["PATH"] = str(top) + os.pathsep + os.environ["PATH"]
             # The legacy variable must not control automatic classification.
+            outputs = top / "outputs"
             env.update(CALLS=str(calls), BASE_BRANCH=base, CLI_EXIT=str(cli_exit),
-                       SKIP_RELEASE="true")
+                       GITHUB_OUTPUT=str(outputs), SKIP_RELEASE="true")
             env.pop("GITHUB_EVENT_PATH", None)
             env.pop("GITHUB_REPOSITORY", None)
             if event is not None:
                 event_path = top / "event.json"
                 event_path.write_text(json.dumps(event))
                 env.update(GITHUB_EVENT_PATH=str(event_path), GITHUB_REPOSITORY="narumiruna/brachio")
-            script = ROOT / ".github/scripts/check-pr-notes.sh"
+            script = ROOT / ".github/scripts/pr-note-policy.sh"
             result = subprocess.run(["bash", str(script)], cwd=repo, env=env,
                                     text=True, capture_output=True, timeout=30)
+            if result.returncode == 0:
+                policy = dict(line.split("=", 1) for line in outputs.read_text().splitlines())
+                self.assertEqual(set(policy), {"skip-release", "reason"})
+                self.assertIn(policy["skip-release"], ("true", "false"))
+                self.assertEqual(bool(policy["reason"]), policy["skip-release"] == "true")
+                # Exercise the check Action's CLI contract with the policy outputs.
+                args = ["changenote", "check", "--since=refs/remotes/origin/" + base,
+                        "--coverage=package"]
+                if policy["skip-release"] == "true":
+                    args += ["--skip-release", "--reason", policy["reason"]]
+                if check_script is not None:
+                    self.assertTrue(real_cli)
+                    tools = top / "action-tools"
+                    tools.mkdir()
+                    cli = tools / "changenote"
+                    cli.write_text('#!/usr/bin/env bash\nexec uvx changenote "$@"\n')
+                    cli.chmod(0o755)
+                    if os.uname().sysname != "Linux":
+                        # Only the platform precondition is mocked on macOS.
+                        # The pinned check script and CLI run without changes.
+                        uname = tools / "uname"
+                        uname.write_text('#!/bin/sh\nprintf "Linux\\n"\n')
+                        uname.chmod(0o755)
+                    action_outputs = top / "action-outputs"
+                    env.update(PATH=str(tools) + os.pathsep + env["PATH"],
+                               GITHUB_OUTPUT=str(action_outputs),
+                               GITHUB_STEP_SUMMARY=str(top / "summary"),
+                               INPUT_SINCE="refs/remotes/origin/" + base,
+                               INPUT_COVERAGE="package",
+                               INPUT_SKIP_RELEASE=policy["skip-release"],
+                               INPUT_REASON=policy["reason"])
+                    for key in ("GH_TOKEN", "GITHUB_TOKEN", "PAT_TOKEN"):
+                        env.pop(key, None)
+                    result = subprocess.run(["bash", str(check_script)], cwd=repo, env=env,
+                                            text=True, capture_output=True, timeout=60)
+                    report = dict(line.split("=", 1) for line in
+                                  action_outputs.read_text().splitlines()) if action_outputs.exists() else {}
+                    return result, report
+                result = subprocess.run(["uvx", *args], cwd=repo, env=env,
+                                        text=True, capture_output=True, timeout=30)
             args = calls.read_bytes().decode().split("\0")[:-1] if calls.exists() else []
             self.assertFalse((repo / "injected").exists())
             return result, args
@@ -309,6 +382,44 @@ class ReleaseWorkflow(unittest.TestCase):
         result, args = self.run_note_check(changes={"docs/guide.md": "updated\n"}, cli_exit=42)
         self.assertEqual(result.returncode, 42, result.stderr)
         self.assertIn("--skip-release", args)
+
+    def test_pinned_check_action_contract(self):
+        action = self.step("notes", "Check PR notes")["uses"]
+        revision = action.split("@", 1)[1]
+        url = ("https://raw.githubusercontent.com/changenote/action/"
+               + revision + "/scripts/action/check.sh")
+        with tempfile.TemporaryDirectory() as temporary:
+            script = Path(temporary) / "check.sh"
+            with urllib.request.urlopen(url, timeout=30) as response:
+                script.write_bytes(response.read())
+            cases = [
+                ("normal", {"changes": {
+                    "src/main.rs": "fn main() { println!(\"changed\"); }\n",
+                    ".changenote/entry.md": "---\nbrachio: patch\n---\n\nUpdated fix.\n",
+                }}, True),
+                ("exempt", {"changes": {"docs/guide.md": "Updated.\n"}}, True),
+                ("missing note", {}, False),
+                ("invalid note", {"changes": {
+                    ".changenote/entry.md": "---\nbrachio: invalid\n---\n\nInvalid.\n",
+                }}, None),
+            ]
+            for name, kwargs, passed in cases:
+                with self.subTest(case=name):
+                    result, outputs = self.run_note_check(
+                        real_cli=True, check_script=script, **kwargs
+                    )
+                    self.assertEqual(result.returncode == 0, passed is True,
+                                     result.stdout + result.stderr)
+                    if passed is None:
+                        self.assertEqual(outputs, {})
+                        self.assertIn("No report outputs are available", result.stdout)
+                    else:
+                        self.assertEqual(set(outputs), {"check-report", "release-plan", "passed"})
+                        self.assertEqual(outputs["passed"], str(passed).lower())
+                        self.assertEqual(json.loads(outputs["check-report"])["passed"], passed)
+                        plan = json.loads(outputs["release-plan"])
+                        self.assertEqual(plan[0]["package"], "brachio")
+                        self.assertEqual(plan[0]["note_paths"], [".changenote/entry.md"])
 
     def test_unknown_base_fails_before_cli(self):
         result, args = self.run_note_check(base="missing")
