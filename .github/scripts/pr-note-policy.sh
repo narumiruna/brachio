@@ -2,6 +2,7 @@
 set -euo pipefail
 
 : "${BASE_BRANCH:?PR base branch is required}"
+: "${GITHUB_OUTPUT:?Action output path is required}"
 since="refs/remotes/origin/$BASE_BRANCH"
 base=$(git merge-base "$since" HEAD)
 changes=$(mktemp)
@@ -23,9 +24,11 @@ while IFS= read -r -d '' path; do
   esac
 done < "$changes"
 
-args=(check "--since=$since" --coverage=package)
+skip_release=false
+reason=''
 if [[ "$has_changes" == true && "$non_release_only" == true ]]; then
-  args+=(--skip-release --reason "Only documentation, tests, CI, repository guidance, or changenote files changed.")
+  skip_release=true
+  reason="Only documentation, tests, CI, repository guidance, or changenote files changed."
 elif [[ "$has_changes" == true && "$release_outputs_only" == true &&
         -n "${GITHUB_EVENT_PATH:-}" && -n "${GITHUB_REPOSITORY:-}" ]] &&
   jq -e --arg base "$BASE_BRANCH" --arg repo "$GITHUB_REPOSITORY" '
@@ -36,6 +39,7 @@ elif [[ "$has_changes" == true && "$release_outputs_only" == true &&
     .pull_request.head.repo.full_name == $repo and
     ((.pull_request.body // "") | startswith("<!-- changenote-release-pr -->"))
   ' "$GITHUB_EVENT_PATH" > /dev/null; then
-  args+=(--skip-release --reason "Managed Release PR updates only release outputs and consumes existing changenote entries.")
+  skip_release=true
+  reason="Managed Release PR updates only release outputs and consumes existing changenote entries."
 fi
-uvx changenote "${args[@]}"
+printf 'skip-release=%s\nreason=%s\n' "$skip_release" "$reason" >> "$GITHUB_OUTPUT"
