@@ -1,3 +1,9 @@
+## 1.2.1
+
+### Patch Changes
+
+- Prevent CPU-spinning processes after terminal disconnects and keep signal shutdown responsive during incomplete input.
+
 ## 1.2.0
 
 ### Minor Changes
