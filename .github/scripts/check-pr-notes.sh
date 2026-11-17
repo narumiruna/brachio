@@ -11,7 +11,6 @@ git diff --no-ext-diff --no-textconv --no-renames --name-only -z "$base" HEAD --
 has_changes=false
 non_release_only=true
 release_outputs_only=true
-batch_changed=false
 while IFS= read -r -d '' path; do
   has_changes=true
   case "$path" in
@@ -19,8 +18,7 @@ while IFS= read -r -d '' path; do
     *) non_release_only=false ;;
   esac
   case "$path" in
-    .changenote/releases.json) batch_changed=true ;;
-    .changenote/*.md|Cargo.toml|Cargo.lock|CHANGELOG.md) ;;
+    .changenote/releases.json|.changenote/*.md|Cargo.toml|Cargo.lock|CHANGELOG.md) ;;
     *) release_outputs_only=false ;;
   esac
 done < "$changes"
@@ -28,13 +26,13 @@ done < "$changes"
 args=(check "--since=$since" --coverage=package)
 if [[ "$has_changes" == true && "$non_release_only" == true ]]; then
   args+=(--skip-release --reason "Only documentation, tests, CI, repository guidance, or changenote files changed.")
-elif [[ "$release_outputs_only" == true && "$batch_changed" == true &&
-        -f .changenote/releases.json && ! -L .changenote/releases.json &&
+elif [[ "$has_changes" == true && "$release_outputs_only" == true &&
         -n "${GITHUB_EVENT_PATH:-}" && -n "${GITHUB_REPOSITORY:-}" ]] &&
   jq -e --arg base "$BASE_BRANCH" --arg repo "$GITHUB_REPOSITORY" '
     .pull_request.base.ref == $base and
     .pull_request.base.repo.full_name == $repo and
-    .pull_request.head.ref == ("narumi/chore/changenote-release-" + $base) and
+    (.pull_request.head.ref == ("changenote-release/" + $base) or
+     .pull_request.head.ref == ("narumi/chore/changenote-release-" + $base)) and
     .pull_request.head.repo.full_name == $repo and
     ((.pull_request.body // "") | startswith("<!-- changenote-release-pr -->"))
   ' "$GITHUB_EVENT_PATH" > /dev/null; then

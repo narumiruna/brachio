@@ -188,7 +188,7 @@ class ReleaseWorkflow(unittest.TestCase):
                     self.assertIn("Set the PAT_TOKEN repository secret", result.stdout)
 
     def run_note_check(self, base="main", changes=None, event=None, ref="main",
-                       cli_exit=0, real_cli=False):
+                       cli_exit=0, real_cli=False, legacy_batch=True):
         step = self.step("notes", "Check PR notes")
         self.assertNotIn("${{", step["run"])
         with tempfile.TemporaryDirectory() as temporary:
@@ -214,6 +214,8 @@ class ReleaseWorkflow(unittest.TestCase):
                 ".changenote/entry.md": "---\nbrachio: patch\n---\n\nFix an issue.\n",
                 ".changenote/releases.json": "[]\n",
             }
+            if not legacy_batch:
+                del files[".changenote/releases.json"]
             for path, content in files.items():
                 target = repo / path
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -337,10 +339,10 @@ class ReleaseWorkflow(unittest.TestCase):
             "CHANGELOG.md": "# Changelog\n\n## 0.1.1\n\nFix an issue.\n",
         }
 
-    def managed_release_event(self):
+    def managed_release_event(self, base="main"):
         return {"pull_request": {
-            "base": {"ref": "main", "repo": {"full_name": "narumiruna/brachio"}},
-            "head": {"ref": "narumi/chore/changenote-release-main",
+            "base": {"ref": base, "repo": {"full_name": "narumiruna/brachio"}},
+            "head": {"ref": "changenote-release/" + base,
                      "repo": {"full_name": "narumiruna/brachio"}},
             "body": "<!-- changenote-release-pr -->\n\nRelease details.",
         }}
@@ -351,6 +353,27 @@ class ReleaseWorkflow(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--skip-release", args)
         self.assertTrue(args[-1].startswith("Managed Release PR"))
+
+    def test_legacy_release_branch_exempts_missing_entries(self):
+        event = self.managed_release_event()
+        event["pull_request"]["head"]["ref"] = (
+            "narumi/chore/changenote-release-main"
+        )
+        result, args = self.run_note_check(
+            changes=self.release_changes(), event=event
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--skip-release", args)
+
+    def test_managed_release_uses_selected_base(self):
+        base = "stable/1.x"
+        result, args = self.run_note_check(
+            base=base, ref=base, changes=self.release_changes(),
+            event=self.managed_release_event(base)
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--since=refs/remotes/origin/" + base, args)
+        self.assertIn("--skip-release", args)
 
     def test_release_outputs_without_managed_event_keep_normal_coverage(self):
         result, args = self.run_note_check(changes=self.release_changes())
@@ -383,19 +406,61 @@ class ReleaseWorkflow(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("--skip-release", args)
 
-    def test_managed_release_without_updated_batch_keeps_normal_coverage(self):
+    def test_managed_release_with_other_paths_keeps_normal_coverage(self):
+        for path in ("pyproject.toml", "uv.lock", ".github/workflows/release.yml",
+                     ".changenote/config.json", "unknown/path"):
+            with self.subTest(path=path):
+                changes = self.release_changes()
+                changes[path] = "updated\n"
+                result, args = self.run_note_check(
+                    changes=changes, event=self.managed_release_event()
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("--skip-release", args)
+
+    def test_managed_release_with_unchanged_batch_exempts_missing_entries(self):
         changes = self.release_changes()
         del changes[".changenote/releases.json"]
-        result, args = self.run_note_check(changes=changes, event=self.managed_release_event())
+        result, args = self.run_note_check(
+            changes=changes, event=self.managed_release_event()
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--skip-release", args)
+
+    def test_managed_release_with_deleted_batch_exempts_missing_entries(self):
+        changes = self.release_changes()
+        changes[".changenote/releases.json"] = None
+        result, args = self.run_note_check(
+            changes=changes, event=self.managed_release_event()
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--skip-release", args)
+
+    def test_managed_release_without_batch_exempts_missing_entries(self):
+        changes = self.release_changes()
+        del changes[".changenote/releases.json"]
+        result, args = self.run_note_check(
+            changes=changes, event=self.managed_release_event(),
+            legacy_batch=False
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--skip-release", args)
+
+    def test_managed_release_empty_diff_keeps_normal_coverage(self):
+        result, args = self.run_note_check(
+            changes={}, event=self.managed_release_event()
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("--skip-release", args)
 
-    def test_managed_release_with_deleted_batch_keeps_normal_coverage(self):
+    def test_managed_release_cli_failure_is_not_hidden(self):
         changes = self.release_changes()
         changes[".changenote/releases.json"] = None
-        result, args = self.run_note_check(changes=changes, event=self.managed_release_event())
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("--skip-release", args)
+        result, args = self.run_note_check(
+            changes=changes, event=self.managed_release_event(), cli_exit=42
+        )
+        self.assertEqual(result.returncode, 42, result.stderr)
+        self.assertIn("--skip-release", args)
 
     def run_wheel_check(self, expected="0.1.0", actual="brachio 0.1.0",
                         version_exit=0, help_exit=0):

@@ -48,11 +48,12 @@ The script automatically selects the missing-entry policy from the committed cha
 - Changes only under `docs/`, `tests/`, or `.github/`, plus `.changenote/*.md`, `.changenote/config.json`, `README.md`, `AGENTS.md`, and `prek.toml`, automatically waive the missing-entry requirement.
 - A managed Release PR needs no new entry when all these conditions hold:
   - Its head and base repositories match the current repository, and its base branch matches the comparison branch.
-  - Its head branch is `narumi/chore/changenote-release-<base>`, and its body starts with `<!-- changenote-release-pr -->`.
-  - It changes a regular `.changenote/releases.json` file and changes only that file, `.changenote/*.md`, `Cargo.toml`, `Cargo.lock`, or `CHANGELOG.md`.
+  - Its head branch is `changenote-release/<base>` or the legacy `narumi/chore/changenote-release-<base>`, and its body starts with `<!-- changenote-release-pr -->`.
+  - It has at least one change and changes only `.changenote/*.md`, `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, or the optional legacy `.changenote/releases.json`.
+    - The legacy file need not exist or change. Its deletion during migration is permitted.
 - All other changes use normal package coverage, including source files, manifests, mixed changes, and unknown paths.
 
-The script supplies `--skip-release --reason` automatically for the first two cases. It does not use PR labels or commit messages. Renames include both old and new paths. Configuration, versions, and pending entries are still validated; the release Action remains responsible for batch and generated-tree validation before publication.
+The script supplies `--skip-release --reason` automatically for the first two cases. It does not use PR labels or commit messages. Renames include both old and new paths. Configuration, versions, and pending entries are still validated; the release Action remains responsible for release identity and generated-tree validation before publication.
 
 ## Local verification
 
@@ -106,7 +107,7 @@ PAT-created PRs trigger Checks and the read-only notes job in Release. PR events
 
 Registry jobs depend on the release job in the same run. The workflow does not listen for tag pushes, so a PAT-created tag cannot start a duplicate publication run.
 
-Reserve `narumi/chore/changenote-release-main` for the Action. It creates or updates one Release PR from pending notes and never merges it. Before merging that PR:
+Reserve `changenote-release/main` for the Action. It creates or updates one Release PR from pending notes and never merges it. The script also recognizes the legacy `narumi/chore/changenote-release-main` branch for existing PRs. The Action does not rename or close those PRs. Do not merge duplicate Release PRs for the same notes. Before merging a Release PR:
 
 1. Review the version, consumed notes, changelog, and lockfile changes. Do not edit the generated release tree by hand.
 2. Confirm that the script recognizes the managed Release PR automatically and that only generated outputs and consumed entries changed.
@@ -137,7 +138,7 @@ PyPI uses the `PYPI_TOKEN` secret, not Trusted Publishing. Other jobs have only 
 
 ### Release PRs and GitHub publication
 
-On pushes to `main`, the root Action prepares the project tools and caches, manages the Release PR, and inspects the latest validated release batch. It creates missing annotated tags and GitHub Releases. The Action verifies the saved batch and generated tree, and stops if the selected batch changes before publication.
+On pushes to `main`, the root Action prepares the project tools and caches, manages the Release PR, and inspects the latest validated release. It creates missing annotated tags and GitHub Releases. For new releases, the Action finds the release commit from consumed notes and verifies its complete generated tree without a saved `.changenote/releases.json` file. Legacy batches remain supported. The Action stops if the selected release changes before publication.
 
 The Action returns the verified commit even when GitHub publication is already complete. Its `publication-needed` output records whether inspection found incomplete GitHub work before publication. Registry validation requires this output to be `true` and the verified commit to be nonempty. Completed batches do not start registry jobs on later pushes.
 
@@ -185,10 +186,10 @@ To prepare an authorized version change:
 
 1. Start from a clean checkout with committed notes. Run `changenote status` and review the package, bump, summaries, and target version.
 2. Populate the package caches with `cargo fetch --locked` and `uv build` before versioning. Changenote refreshes the existing `Cargo.lock` with `cargo update --workspace --offline`.
-3. Run `changenote version` only with explicit versioning authorization. It updates `Cargo.toml` and `Cargo.lock`, writes `CHANGELOG.md` and `.changenote/releases.json`, and removes consumed notes. Do not edit the generated release tree by hand.
+3. Run `changenote version` only with explicit versioning authorization. It updates `Cargo.toml` and `Cargo.lock`, writes `CHANGELOG.md`, and removes consumed notes without creating `.changenote/releases.json`. The first nonempty release with the new CLI also removes an existing regular legacy batch file. Do not edit the generated release tree by hand.
 4. Run `uv lock --offline` separately to refresh Python dependency metadata. The dynamic Python version is not a configured changenote output and need not appear in `uv.lock`. Inspect the diff for unrelated changes.
 5. Run `changenote status` again and confirm that the consumed notes are no longer pending. Run the local verification commands and review the Linux and macOS Checks jobs and the [Rex compatibility limits](rex-compatibility.md#external-handoff).
-6. Commit only the intended release files, including entry deletions, the saved batch, changelog, manifests, and changed lockfiles. PRs outside the managed Release PR rules use normal package coverage.
+6. Commit only the intended release files, including entry deletions, any legacy batch deletion, changelog, manifests, and changed lockfiles. PRs outside the managed Release PR rules use normal package coverage.
 
 After the release commit is merged and the checkout is clean, create local tags only with separate tag authorization:
 
@@ -196,7 +197,7 @@ After the release commit is merged and the checkout is clean, create local tags 
 changenote tag
 ```
 
-This uses the saved release batch to create an annotated `v<version>` tag. Push only the intended tag after separate publication authorization. For version 0.1.0:
+This finds and verifies the release commit from Git history and creates an annotated `v<version>` tag at that commit. Complete history is required. Do not invent a batch file or restore a deleted legacy file. Push only the intended tag after separate publication authorization. For version 0.1.0:
 
 ```sh
 git push origin refs/tags/v0.1.0
