@@ -60,7 +60,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Manage release
-        uses: changenote/action@992cb488a3c7c8470bdbe904007fc33419b1cb00
+        uses: changenote/action@b5a808ce21642ccc01587dc66fd34ce522b74da9 # v0.4.0
         id: release
         continue-on-error: true
         with:
