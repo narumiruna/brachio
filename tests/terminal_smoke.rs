@@ -269,6 +269,7 @@ enum Termination {
     FilterPaste,
     Signal(libc::c_int),
     FloodSignal(libc::c_int),
+    PasteSignal(libc::c_int, bool),
 }
 
 struct InputFlood {
@@ -312,10 +313,7 @@ fn assert_terminal_cleanup(termination: Termination) {
     assert_terminal_cleanup_with_mock(termination, MockRex::new());
 }
 
-fn assert_terminal_cleanup_with_mock(termination: Termination, mock: MockRex) {
-    let mut pty = Pty::new().expect("open owned PTY");
-    let initial = pty.termios().expect("read initial terminal state");
-    let mut child = pty.spawn(mock.command()).expect("spawn brachio on PTY");
+fn wait_for_terminal_setup(pty: &mut Pty, child: &mut ChildGuard, mock: &MockRex) -> Vec<u8> {
     let mut output = Vec::new();
     let deadline = Instant::now() + DEADLINE;
     loop {
@@ -349,6 +347,14 @@ fn assert_terminal_cleanup_with_mock(termination: Termination, mock: MockRex) {
         thread::sleep(POLL_INTERVAL);
     }
 
+    output
+}
+
+fn assert_terminal_cleanup_with_mock(termination: Termination, mock: MockRex) {
+    let mut pty = Pty::new().expect("open owned PTY");
+    let initial = pty.termios().expect("read initial terminal state");
+    let mut child = pty.spawn(mock.command()).expect("spawn brachio on PTY");
+    let mut output = wait_for_terminal_setup(&mut pty, &mut child, &mock);
     let raw = pty.termios().expect("verify raw mode before termination");
     assert_eq!(raw.c_lflag & (libc::ICANON | libc::ECHO), 0);
     // Ctrl-C must reach the key handler as a byte, not as a tty-generated signal.
@@ -384,8 +390,19 @@ fn assert_terminal_cleanup_with_mock(termination: Termination, mock: MockRex) {
                 .write_all(b"\rq")
                 .expect("apply filter then quit");
         }
-        Termination::Signal(signal) | Termination::FloodSignal(signal) => {
-            if matches!(termination, Termination::FloodSignal(_)) {
+        Termination::Signal(signal)
+        | Termination::FloodSignal(signal)
+        | Termination::PasteSignal(signal, _) => {
+            if matches!(termination, Termination::PasteSignal(_, _)) {
+                pty.master
+                    .write_all(b"\x1b[200~unfinished paste")
+                    .expect("start an incomplete paste");
+                thread::sleep(Duration::from_millis(50));
+            }
+            if matches!(
+                termination,
+                Termination::FloodSignal(_) | Termination::PasteSignal(_, true)
+            ) {
                 flood = Some(InputFlood::start(pty.master.try_clone().unwrap()));
                 thread::sleep(Duration::from_millis(20));
             }
@@ -399,7 +416,7 @@ fn assert_terminal_cleanup_with_mock(termination: Termination, mock: MockRex) {
     }
 
     let deadline = Instant::now()
-        + if flood.is_some() {
+        + if flood.is_some() || matches!(termination, Termination::PasteSignal(_, _)) {
             Duration::from_secs(2)
         } else {
             DEADLINE
@@ -440,6 +457,51 @@ fn assert_terminal_cleanup_with_mock(termination: Termination, mock: MockRex) {
             String::from_utf8_lossy(sequence),
             String::from_utf8_lossy(&output)
         );
+    }
+}
+
+fn assert_terminal_disconnect(input: &[u8]) {
+    let mock = MockRex::new();
+    let mut pty = Pty::new().expect("open owned PTY");
+    let mut child = pty.spawn(mock.command()).expect("spawn brachio on PTY");
+    let mut output = wait_for_terminal_setup(&mut pty, &mut child, &mock);
+    // Wait for an input-driven redraw so closure cannot race terminal startup.
+    pty.master.write_all(b"?").expect("open help");
+    let deadline = Instant::now() + DEADLINE;
+    while !contains(&output, b"wraparound.") {
+        read_available(&mut pty.master, &mut output).expect("read help");
+        assert!(
+            child.try_wait().expect("poll help input").is_none(),
+            "brachio exited before terminal disconnect"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "help redraw timed out: {:?}",
+            String::from_utf8_lossy(&output[..output.len().min(4096)])
+        );
+        thread::sleep(POLL_INTERVAL);
+    }
+    pty.master
+        .write_all(input)
+        .expect("send input before hangup");
+    // Let the input reader consume partial sequences before the terminal closes.
+    thread::sleep(Duration::from_millis(100));
+    drop(pty);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll disconnected brachio") {
+            assert!(
+                status.success() || status.code() == Some(1),
+                "brachio failed unexpectedly after terminal disconnect: {status}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "brachio did not exit after terminal disconnect with input {input:?}"
+        );
+        thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -602,6 +664,36 @@ fn sighup_restores_terminal() {
 #[test]
 fn sigterm_during_input_flood_restores_terminal_without_waiting_for_input_eof() {
     assert_terminal_cleanup(Termination::FloodSignal(libc::SIGTERM));
+}
+
+#[test]
+fn sigterm_during_paused_incomplete_paste_restores_terminal() {
+    assert_terminal_cleanup(Termination::PasteSignal(libc::SIGTERM, false));
+}
+
+#[test]
+fn sigterm_during_incomplete_paste_flood_restores_terminal() {
+    assert_terminal_cleanup(Termination::PasteSignal(libc::SIGTERM, true));
+}
+
+#[test]
+fn terminal_disconnect_while_idle_exits_promptly() {
+    assert_terminal_disconnect(b"");
+}
+
+#[test]
+fn terminal_disconnect_with_incomplete_paste_exits_promptly() {
+    assert_terminal_disconnect(b"\x1b[200~unfinished paste");
+}
+
+#[test]
+fn terminal_disconnect_with_incomplete_mouse_event_exits_promptly() {
+    assert_terminal_disconnect(b"\x1b[<0;");
+}
+
+#[test]
+fn terminal_disconnect_with_queued_keys_exits_promptly() {
+    assert_terminal_disconnect(&[b'j'; 512]);
 }
 
 #[test]

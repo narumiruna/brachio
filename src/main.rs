@@ -1,3 +1,7 @@
+mod input;
+
+use input::Input;
+
 use brachio::model::{plain, valid_id};
 use brachio::process::Runner;
 use brachio::rex::{Rex, find_executable};
@@ -5,8 +9,8 @@ use brachio::tui::{Action, App};
 use brachio::worker::{Update, Worker};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -14,7 +18,7 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -22,6 +26,16 @@ use std::time::Duration;
 static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 struct TerminalGuard;
+
+struct UiTerminal(Terminal<CrosstermBackend<Box<dyn Write>>>);
+
+impl Drop for UiTerminal {
+    fn drop(&mut self) {
+        // TerminalGuard owns cursor restoration. Ratatui's duplicate cleanup
+        // prints to stderr on failure, which panics if stderr is also revoked.
+        *self.0.backend_mut() = CrosstermBackend::new(Box::new(io::sink()));
+    }
+}
 
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
@@ -65,7 +79,8 @@ fn cleanup_terminal() {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("brachio: {}", plain(&error));
+        // A disconnected terminal can also revoke stderr. Reporting must not panic.
+        let _ = writeln!(io::stderr(), "brachio: {}", plain(&error));
         std::process::exit(1);
     }
 }
@@ -130,13 +145,16 @@ fn run() -> Result<(), String> {
         }
         previous_hook(info);
     }));
-    let mut terminal =
-        Terminal::new(CrosstermBackend::new(io::stdout())).map_err(|error| error.to_string())?;
+    let mut input = Input::start(stop.clone())?;
+    let output: Box<dyn Write> = Box::new(io::stdout());
+    let mut terminal = UiTerminal(
+        Terminal::new(CrosstermBackend::new(output)).map_err(|error| error.to_string())?,
+    );
     // Before the first snapshot, the view itself shows that Brachio is connecting.
     let mut app = App::default();
     let mut client_error: Option<String> = None;
-    terminal
-        .draw(|frame| app.draw(frame))
+    input
+        .redraw(|| terminal.0.draw(|frame| app.draw(frame)).map(|_| ()))
         .map_err(|error| error.to_string())?;
     let mut discard_queued_mouse = false;
     while !stop.load(Ordering::Relaxed) {
@@ -150,21 +168,25 @@ fn run() -> Result<(), String> {
                 Duration::from_millis(50),
                 discard_queued_mouse,
                 &stop,
+                &mut input,
             )?,
             InputState::Quit
         ) {
             break;
         }
+        let mut changed = input.take_changed();
         loop {
             let update = match worker.updates.try_recv() {
                 Ok(update) => update,
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    app.connected = false;
-                    app.message = "Background worker stopped; restart Brachio".into();
-                    break;
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    return Err("Background worker stopped; restart Brachio".into());
                 }
             };
+            changed = true;
             match update {
                 Update::Snapshot(Ok(snapshot)) => {
                     // The message holds persistent conditions only; navigation
@@ -188,11 +210,14 @@ fn run() -> Result<(), String> {
                 },
             }
         }
-        terminal
-            .draw(|frame| app.draw(frame))
+        if !changed {
+            continue;
+        }
+        input
+            .redraw(|| terminal.0.draw(|frame| app.draw(frame)).map(|_| ()))
             .map_err(|error| error.to_string())?;
-        // A mouse event queued during a redraw has no frame-generation token.
-        // Discard such mouse-down events instead of guessing which row it meant.
+        // Coordinates have no terminal-provided frame token. Discard queued
+        // mouse-down events conservatively instead of guessing their target.
         discard_queued_mouse = match process_input(
             &mut app,
             &worker,
@@ -200,6 +225,7 @@ fn run() -> Result<(), String> {
             Duration::ZERO,
             true,
             &stop,
+            &mut input,
         )? {
             InputState::Quit => break,
             InputState::Drained => false,
@@ -207,6 +233,8 @@ fn run() -> Result<(), String> {
         };
     }
     stop.store(true, Ordering::Relaxed);
+    drop(input);
+    drop(terminal);
     drop(guard);
     drop(worker);
     if panicked.load(Ordering::Relaxed) {
@@ -240,18 +268,22 @@ fn process_input(
     mut wait: Duration,
     crossed_redraw: bool,
     stop: &AtomicBool,
+    input: &mut Input,
 ) -> Result<InputState, String> {
     // A paste or PTY writer must not starve rendering, refresh, or signal exit.
     for _ in 0..256 {
         if stop.load(Ordering::Relaxed) {
             return Ok(InputState::Quit);
         }
-        if !event::poll(wait).map_err(|error| error.to_string())? {
-            return Ok(InputState::Drained);
+        let received = input.recv(wait);
+        if stop.load(Ordering::Relaxed) {
+            return Ok(InputState::Quit);
         }
+        let Some((event, crossed_input_redraw)) = received? else {
+            return Ok(InputState::Drained);
+        };
         wait = Duration::ZERO;
-        let event = event::read().map_err(|error| error.to_string())?;
-        match route_input(app, event, crossed_redraw) {
+        match route_input(app, event, crossed_redraw || crossed_input_redraw) {
             Some(Action::Quit) => return Ok(InputState::Quit),
             Some(Action::Navigate(entry)) => {
                 if let Some(error) = client_error {
