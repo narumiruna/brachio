@@ -29,7 +29,7 @@ Documentation-only changes, test-only changes, internal refactors, and release-t
 
 ### PR checks
 
-The `notes` job in the Release workflow runs only on pull requests, with read-only permissions and no release credentials. It uses `uvx` without a version constraint to run the latest stable CLI from PyPI, not contributor code. Pending releases and PR check results are printed as JSON in the job logs. The CLI is not pinned; check compatibility with the reviewed configuration schema when changing configuration.
+The `notes` job in the Release workflow runs only on pull requests, with read-only permissions and no release credentials. It uses the pinned `changenote/action/check` Action. The Action installs the latest stable CLI wheel from PyPI and reports PR note coverage and all pending releases. It does not build contributor code. The CLI is not pinned; check compatibility with the reviewed configuration schema when changing configuration.
 
 Manual Release runs skip PR note comparison because `github.base_ref` is unavailable outside PR events. They only manage the Release PR.
 
@@ -48,18 +48,19 @@ The script automatically selects the missing-entry policy from the committed cha
 - Changes only under `docs/`, `tests/`, or `.github/`, plus `.changenote/*.md`, `.changenote/config.json`, `README.md`, `AGENTS.md`, and `prek.toml`, automatically waive the missing-entry requirement.
 - A managed Release PR needs no new entry when all these conditions hold:
   - Its head and base repositories match the current repository, and its base branch matches the comparison branch.
-  - Its head branch is `narumi/chore/changenote-release-<base>`, and its body starts with `<!-- changenote-release-pr -->`.
-  - It changes a regular `.changenote/releases.json` file and changes only that file, `.changenote/*.md`, `Cargo.toml`, `Cargo.lock`, or `CHANGELOG.md`.
+  - Its head branch is `changenote-release/<base>` or the legacy `narumi/chore/changenote-release-<base>`, and its body starts with `<!-- changenote-release-pr -->`.
+  - It has at least one change and changes only `.changenote/*.md`, `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, or the optional legacy `.changenote/releases.json`.
+    - The legacy file need not exist or change. Its deletion during migration is permitted.
 - All other changes use normal package coverage, including source files, manifests, mixed changes, and unknown paths.
 
-The script supplies `--skip-release --reason` automatically for the first two cases. It does not use PR labels or commit messages. Renames include both old and new paths. Configuration, versions, and pending entries are still validated; the release Action remains responsible for batch and generated-tree validation before publication.
+The policy script returns `skip-release` and `reason` as Action outputs for the first two cases. It does not install or run the CLI. The check Action runs even for exempt changes, so configuration, versions, and pending entries are still validated. The policy does not use PR labels or commit messages. Renames include both old and new paths. The root Action remains responsible for release identity and generated-tree validation before publication.
 
 ## Local verification
 
 Install Bash, Git, jq, Rust stable, Cargo, uv, and Python 3.12. Run from the repository root:
 
 ```sh
-bash -n .github/scripts/check-pr-notes.sh
+bash -n .github/scripts/pr-note-policy.sh
 uv run --no-project --with pyyaml==6.0.3 python -m unittest discover -s tests/workflows -v
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
@@ -76,21 +77,21 @@ Use `--allow-dirty` with the Cargo dry run only to check uncommitted local chang
 
 `uv build` builds a source archive and then builds a wheel from that archive. Wheel installs do not need Rust. Source installs need Rust and Cargo. Python package metadata requires Python 3.10 or newer.
 
-The Checks workflow runs release-workflow regression tests, plus Rust tests and source-to-wheel builds on Linux and macOS. Installed wheel version and help checks do not start the TUI or call Rex.
+The Checks workflow runs release-workflow regression tests, plus Rust tests and source-to-wheel builds on Linux and macOS. The check-Action contract test downloads its script from the pinned Action commit and uses the real CLI. On macOS, it mocks only the Linux platform precondition; hosted CI runs it on Linux. Installed wheel version and help checks do not start the TUI or call Rex.
 
 ## Release automation setup
 
-The `.github/workflows/release.yml` workflow contains PR note checks, Release PR management, GitHub publication, validation, wheel builds, and registry uploads. It replaces the separate Changenotes and Publish workflows.
+The `.github/workflows/release.yml` workflow handles PR note checks, Changenote release control, and registry uploads. It calls `.github/workflows/build-release.yml` for Rust validation and native wheel builds. The build workflow accepts only the verified release commit and expected version. It has read-only permissions and receives no release credentials.
 
-The PR note check uses `.github/scripts/check-pr-notes.sh` to inspect the merge-base diff and, for managed releases, the GitHub PR event. The token guard stays inline because it runs before checkout. The installed-wheel check stays inline because a retried release can use an older commit without the script. Simple build and publish commands also stay inline.
+The note policy uses `.github/scripts/pr-note-policy.sh` to inspect the merge-base diff and, for managed releases, the GitHub PR event. The pinned check Action owns CLI setup, note validation, and reporting. The token guard stays inline because it runs before checkout. Build commands and installed-wheel checks stay in the build workflow, not in scripts from a possibly older release commit. Registry jobs stay in `release.yml`, so their workflow identity, environment approvals, and credentials do not change.
 
 The release job uses one `changenote/action` call pinned to a full commit SHA. It omits the CLI `version` input and uses the default `latest` stable PyPI release. The Action installs a prebuilt CLI wheel, prepares project tools and offline caches, and manages the Release PR. Both `push-git-tags` and `create-github-releases` are explicitly enabled for push events. Manual events only manage the PR.
 
-The Action SHA and configuration schema remain pinned to reviewed snapshots; neither pins the installed CLI. The PR notes job also uses an unpinned CLI through `uvx`. Separate jobs and runs can resolve different stable CLI versions.
+Both Changenote Actions and the configuration schema remain pinned to reviewed snapshots. These pins do not pin the installed CLI. The root and check Actions use their default `latest` CLI version. Separate jobs and runs can resolve different stable CLI versions.
 
 The unpinned CLI is an executable in a job with repository-write credentials. A future upstream release can change privileged release behavior without a workflow change. The Action SHA does not remove this supply-chain risk.
 
-The Action can fail after verified GitHub publication if PR management fails. The result check accepts this case only when `ready` and `publication-needed` are `true` and `release-commit` is a lowercase 40-hex commit. It reports the PR management failure as a warning. All other Action failures still fail the release job.
+Any root Action failure fails the release job and blocks artifact builds and registry uploads. There is no `continue-on-error` or custom result override. This rule also applies when PR management fails after tags or GitHub Releases were created. See [Partial failures and recovery](#partial-failures-and-recovery) before retrying that case.
 
 A repository maintainer must add an Actions secret named `PAT_TOKEN` before enabling Release runs:
 
@@ -104,9 +105,9 @@ The release job fails before checkout if `PAT_TOKEN` is absent. It does not fall
 
 PAT-created PRs trigger Checks and the read-only notes job in Release. PR events cannot run the release job or registry uploads. The default `GITHUB_TOKEN` does not trigger checks on its own PR events. The repository setting that permits GitHub Actions to create PRs does not replace the PAT or its permissions.
 
-Registry jobs depend on the release job in the same run. The workflow does not listen for tag pushes, so a PAT-created tag cannot start a duplicate publication run.
+The build call and registry jobs depend on the release job in the same run. The reusable build workflow uploads artifacts to that run; the PyPI job downloads those artifacts without a cross-run lookup. The workflow does not listen for tag pushes, so a PAT-created tag cannot start a duplicate publication run.
 
-Reserve `narumi/chore/changenote-release-main` for the Action. It creates or updates one Release PR from pending notes and never merges it. Before merging that PR:
+Reserve `changenote-release/main` for the Action. It creates or updates one Release PR from pending notes and never merges it. The script also recognizes the legacy `narumi/chore/changenote-release-main` branch for existing PRs. The Action does not rename or close those PRs. Do not merge duplicate Release PRs for the same notes. Before merging a Release PR:
 
 1. Review the version, consumed notes, changelog, and lockfile changes. Do not edit the generated release tree by hand.
 2. Confirm that the script recognizes the managed Release PR automatically and that only generated outputs and consumed entries changed.
@@ -137,7 +138,7 @@ PyPI uses the `PYPI_TOKEN` secret, not Trusted Publishing. Other jobs have only 
 
 ### Release PRs and GitHub publication
 
-On pushes to `main`, the root Action prepares the project tools and caches, manages the Release PR, and inspects the latest validated release batch. It creates missing annotated tags and GitHub Releases. The Action verifies the saved batch and generated tree, and stops if the selected batch changes before publication.
+On pushes to `main`, the root Action prepares the project tools and caches, manages the Release PR, and inspects the latest validated release. It creates missing annotated tags and GitHub Releases. For new releases, the Action finds the release commit from consumed notes and verifies its complete generated tree without a saved `.changenote/releases.json` file. Legacy batches remain supported. The Action stops if the selected release changes before publication.
 
 The Action returns the verified commit even when GitHub publication is already complete. Its `publication-needed` output records whether inspection found incomplete GitHub work before publication. Registry validation requires this output to be `true` and the verified commit to be nonempty. Completed batches do not start registry jobs on later pushes.
 
@@ -147,7 +148,7 @@ Run Release manually only on `main`. Manual dispatch prepares the pending-note e
 
 ### Registry publication
 
-Validation starts only after a successful release job returns a nonempty verified release commit and `publication-needed: 'true'`. PR events, manual dispatches, and pushes without an incomplete batch do not run registry jobs. A failed release job also prevents registry uploads.
+The reusable build workflow starts only after a successful release job returns a nonempty verified release commit and `publication-needed: 'true'`. It runs validation before the native wheel matrix. PR events, manual dispatches, and pushes without an incomplete batch do not run build or registry jobs. A failed release job also prevents registry uploads.
 
 Changenote owns release metadata validation. Rust checks, wheel builds, and Cargo publication use its verified commit. Wheel version checks use the version from the Action's `releases` output. The workflow does not repeat metadata validation or use the triggering branch name as a version tag.
 
@@ -183,12 +184,12 @@ Use this procedure only when preparing a release outside the automatic Release P
 
 To prepare an authorized version change:
 
-1. Start from a clean checkout with committed notes. Run `changenote status` and review the package, bump, summaries, and target version.
+1. Start from a clean checkout with committed notes. Run `uv lock --offline` before versioning. If it changes `uv.lock`, review and commit that change separately. Continue only from a clean checkout. Run `changenote status` and review the package, bump, summaries, and target version.
 2. Populate the package caches with `cargo fetch --locked` and `uv build` before versioning. Changenote refreshes the existing `Cargo.lock` with `cargo update --workspace --offline`.
-3. Run `changenote version` only with explicit versioning authorization. It updates `Cargo.toml` and `Cargo.lock`, writes `CHANGELOG.md` and `.changenote/releases.json`, and removes consumed notes. Do not edit the generated release tree by hand.
-4. Run `uv lock --offline` separately to refresh Python dependency metadata. The dynamic Python version is not a configured changenote output and need not appear in `uv.lock`. Inspect the diff for unrelated changes.
+3. Run `changenote version` only with explicit versioning authorization. It updates `Cargo.toml` and `Cargo.lock`, writes `CHANGELOG.md`, and removes consumed notes without creating `.changenote/releases.json`. The first nonempty release with the new CLI also removes an existing regular legacy batch file. Do not edit the generated release tree by hand.
+4. Run `uv lock --check`. If it fails, stop. Do not add a lockfile refresh to the release commit. This configuration does not generate `uv.lock`. The Action rejects release commits with changes outside the generated release tree.
 5. Run `changenote status` again and confirm that the consumed notes are no longer pending. Run the local verification commands and review the Linux and macOS Checks jobs and the [Rex compatibility limits](rex-compatibility.md#external-handoff).
-6. Commit only the intended release files, including entry deletions, the saved batch, changelog, manifests, and changed lockfiles. PRs outside the managed Release PR rules use normal package coverage.
+6. Commit only Changenote-generated changes: `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, consumed note deletions, and any legacy batch deletion. Do not include `uv.lock` or unrelated changes. PRs outside the managed Release PR rules use normal package coverage.
 
 After the release commit is merged and the checkout is clean, create local tags only with separate tag authorization:
 
@@ -196,7 +197,7 @@ After the release commit is merged and the checkout is clean, create local tags 
 changenote tag
 ```
 
-This uses the saved release batch to create an annotated `v<version>` tag. Push only the intended tag after separate publication authorization. For version 0.1.0:
+This finds and verifies the release commit from Git history and creates an annotated `v<version>` tag at that commit. Complete history is required. Do not invent a batch file or restore a deleted legacy file. Push only the intended tag after separate publication authorization. For version 0.1.0:
 
 ```sh
 git push origin refs/tags/v0.1.0
@@ -208,9 +209,9 @@ Feature-branch pushes and ordinary PRs do not publish. Tag pushes alone do not s
 
 The two registry uploads are not a transaction. One can succeed while the other fails.
 
-For a failed job, use GitHub Actions **Re-run failed jobs** on the same Release run. This retains successful release-job outputs and wheel artifacts and does not repeat a successful registry job.
+After the release job succeeds, use GitHub Actions **Re-run failed jobs** for a failed build or registry job in the same Release run. Keep the successful release-job outputs and original wheel artifacts. Do not repeat a successful registry upload.
 
-If PR management fails after verified GitHub publication, the result check keeps the release job successful and preserves its verified outputs. Failed validation or registry jobs can then be retried without running the release job again. Use manual dispatch later to retry PR management.
+If the root Action fails, builds and registry uploads stay blocked, even if GitHub publication is complete. Inspect which writes completed before retrying. A later Action run can report `publication-needed: false` because the tag and GitHub Release already exist. That result does not recover missing registry packages. Arrange a separately reviewed recovery procedure for the exact release commit; do not treat the failed Action as a success.
 
 Do not use manual dispatch or **Re-run all jobs** to retry registry publication. The root Action can find GitHub publication already complete and skip the downstream jobs. If the original successful release-job outputs or wheel artifacts are unavailable, stop and arrange a separately reviewed recovery procedure for the exact release commit. Hosted writes still require explicit authorization.
 
@@ -226,7 +227,7 @@ Disable Release to stop automatic PR updates, GitHub publication, and registry u
 
 A maintainer must configure `PAT_TOKEN` and review required branch checks for the `notes` job in Release. Update the crates.io Trusted Publisher workflow filename to `release.yml` and allow `main` in both registry environments before merging a Release PR.
 
-Verify that a PAT-created Release PR starts Checks and only the notes job in Release. During an authorized release, verify that validation and uploads follow the verified release commit within the same run, with no second tag-triggered run. Local tests do not establish token permissions, branch rules, deployment approvals, hosted Action behavior, or event delivery.
+Verify that a PAT-created Release PR starts Checks and only the notes job in Release. During an authorized release, verify the reusable build call, all four native targets, and same-run artifact delivery. Builds and uploads must use the verified release commit and must stay blocked after a root Action failure. There must be no second tag-triggered run. Local tests do not establish hosted reusable-workflow retries, token permissions, branch rules, deployment approvals, or event delivery.
 
 Supply the PAT and registry prerequisites before using automation. Implementation and local verification do not authorize a Release dispatch or a publication.
 
